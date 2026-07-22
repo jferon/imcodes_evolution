@@ -1,0 +1,1454 @@
+import { PassThrough } from 'node:stream';
+import { EventEmitter } from 'node:events';
+import { readFile } from 'node:fs/promises';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+const childProcessMock = vi.hoisted(() => {
+  // execFile may be called with (file, args, cb) or (file, args, opts, cb)
+  const execFile = vi.fn((...callArgs: unknown[]) => {
+    const file = callArgs[0] as string;
+    const args = callArgs[1] as string[];
+    const cb = (typeof callArgs[2] === 'function' ? callArgs[2] : callArgs[3]) as
+      | ((err: Error | null, stdout: string, stderr: string) => void)
+      | undefined;
+    // Match either bare 'qwen' or a resolved node + cli.js path
+    const isVersionCall = (file === 'qwen' || file.toLowerCase().endsWith('node.exe') || file.toLowerCase().endsWith('node'))
+      && args.includes('--version');
+    if (isVersionCall) {
+      cb?.(null, '0.13.2\n', '');
+      return {} as never;
+    }
+    if (args.join(' ') === 'mcp list') {
+      cb?.(null, JSON.stringify({ servers: [] }), '');
+      return {} as never;
+    }
+    if (args[0] === 'mcp' && args[1] === 'add') {
+      cb?.(null, '', '');
+      return {} as never;
+    }
+    cb?.(null, '', '');
+    return {} as never;
+  });
+
+  const spawned: Array<{
+    file: string;
+    args: string[];
+    cwd?: string;
+    env?: NodeJS.ProcessEnv;
+    child: EventEmitter & {
+      stdout: PassThrough;
+      stderr: PassThrough;
+      kill: ReturnType<typeof vi.fn>;
+      killed: boolean;
+    };
+  }> = [];
+
+  const spawn = vi.fn((file: string, args: string[], opts: { cwd?: string; env?: NodeJS.ProcessEnv }) => {
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const child = new EventEmitter() as EventEmitter & {
+      stdout: PassThrough;
+      stderr: PassThrough;
+      kill: ReturnType<typeof vi.fn>;
+      killed: boolean;
+    };
+    child.stdout = stdout;
+    child.stderr = stderr;
+    child.killed = false;
+    child.kill = vi.fn(() => { child.killed = true; child.emit('close', null, 'SIGTERM'); return true; });
+    spawned.push({ file, args, cwd: opts.cwd, env: opts.env, child });
+    queueMicrotask(() => child.emit('spawn'));
+    return child as never;
+  });
+
+  return { execFile, spawn, spawned };
+});
+
+vi.mock('node:child_process', () => ({
+  execFile: childProcessMock.execFile,
+  spawn: childProcessMock.spawn,
+}));
+
+vi.mock('../../src/util/logger.js', () => ({
+  default: {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+  },
+}));
+
+import { QwenProvider } from '../../src/agent/providers/qwen.js';
+import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
+import type { ToolCallEvent } from '../../src/agent/transport-provider.js';
+import type { AgentMessage } from '../../shared/agent-message.js';
+import type { ProviderContextPayload } from '../../shared/context-types.js';
+import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
+import {
+  SDK_SUBAGENT_DETAIL_KIND,
+  SDK_SUBAGENT_PROVIDER_KINDS,
+  SDK_SUBAGENT_PROVIDERS,
+  SDK_SUBAGENT_STATUS,
+} from '../../shared/sdk-subagent-status.js';
+import {
+  IMCODES_DAEMON_NAMESPACE_ENV,
+  IMCODES_DAEMON_PROJECT_NAME_ENV,
+  IMCODES_DAEMON_PROJECT_ROOT_ENV,
+  IMCODES_DAEMON_SERVER_ID_ENV,
+  IMCODES_DAEMON_SESSION_NAME_ENV,
+  IMCODES_DAEMON_USER_ID_ENV,
+} from '../../shared/memory-mcp-env.js';
+import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
+import { MEMORY_MCP_STATUS } from '../../shared/memory-ws.js';
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function lastSpawn() {
+  const entry = childProcessMock.spawned.at(-1);
+  if (!entry) throw new Error('No spawned qwen process');
+  return entry;
+}
+
+async function flushIO(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+async function waitForSpawnCount(count: number): Promise<void> {
+  for (let i = 0; i < 80; i += 1) {
+    if (childProcessMock.spawn.mock.calls.length >= count) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${count} qwen spawns`);
+}
+
+describe('QwenProvider', () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+    childProcessMock.execFile.mockClear();
+    childProcessMock.spawn.mockClear();
+    childProcessMock.spawned.length = 0;
+  });
+
+  it('connects by validating qwen CLI', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    // execFile signature is (file, args, opts, cb) — opts contains windowsHide
+    const call = childProcessMock.execFile.mock.calls.find(
+      (c) => Array.isArray(c[1]) && (c[1] as string[]).includes('--version'),
+    );
+    expect(call).toBeDefined();
+    expect(call?.[1]).toContain('--version');
+    expect(provider.capabilities.reasoningEffort).toBe(true);
+    expect(provider.capabilities.supportedEffortLevels).toEqual(['off', 'low', 'medium', 'high']);
+    expect(provider.capabilities.compact).toMatchObject({
+      execution: 'slash-command',
+      providerCommand: '/compress',
+      verified: true,
+      completion: 'command-result',
+      cancellation: 'provider-cancel',
+    });
+    expect(provider.getMemoryMcpStatus()).toMatchObject({
+      providerId: 'qwen',
+      status: MEMORY_MCP_STATUS.READY,
+      connected: true,
+      degradedReasons: [],
+    });
+  });
+
+  it('emits SDK subagent snapshots for Qwen runtime subagent notifications', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-runtime-subagent',
+      cwd: '/tmp/project',
+      agentId: 'qwen3-coder-plus',
+    });
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall((_sessionId, tool) => tools.push(tool));
+
+    await provider.send('sess-runtime-subagent', 'spawn a helper');
+    const spawned = lastSpawn();
+    spawned.child.stdout.write(`${JSON.stringify({
+      type: 'system',
+      subtype: 'subagent_notification',
+      subagent: {
+        agent_path: '019e-qwen-agent',
+        name: 'planner',
+        status: 'running',
+        prompt: 'Check the Qwen handoff',
+        backgrounded: true,
+      },
+    })}\n`);
+    spawned.child.stdout.write(`${JSON.stringify({ type: 'result', is_error: false, result: 'OK' })}\n`);
+    spawned.child.emit('close', 0, null);
+    await flushIO();
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({
+      id: 'qwen:sess-runtime-subagent:runtime:019e-qwen-agent',
+      name: 'Agent',
+      status: 'running',
+      input: { action: 'qwen-runtime-subagent', description: 'Check the Qwen handoff' },
+      detail: {
+        kind: SDK_SUBAGENT_DETAIL_KIND,
+        summary: 'Qwen sub-agent planner',
+        meta: {
+          provider: SDK_SUBAGENT_PROVIDERS.QWEN,
+          providerKind: SDK_SUBAGENT_PROVIDER_KINDS.QWEN_RUNTIME_AGENT,
+          canonicalKey: 'qwen:sess-runtime-subagent:runtime:019e-qwen-agent',
+          normalizedStatus: SDK_SUBAGENT_STATUS.RUNNING,
+          active: true,
+          terminal: false,
+          parentSessionId: 'sess-runtime-subagent',
+          agentPath: '019e-qwen-agent',
+          agentName: 'planner',
+          model: 'qwen3-coder-plus',
+          backgrounded: true,
+        },
+      },
+    });
+  });
+
+  it('writes qwen reasoning settings and switches them per session effort', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-effort',
+      cwd: '/tmp/project',
+      effort: 'low',
+    });
+
+    await provider.send('sess-effort', 'hello');
+    const first = lastSpawn();
+    const firstSettingsPath = first.env?.QWEN_CODE_SYSTEM_SETTINGS_PATH;
+    expect(typeof firstSettingsPath).toBe('string');
+    expect(JSON.parse(await readFile(String(firstSettingsPath), 'utf8'))).toEqual({
+      model: { generationConfig: { reasoning: { effort: 'low' } } },
+    });
+
+    first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-1', content: [{ type: 'text', text: 'Hello' }] } })}\n`);
+    first.child.emit('close', 0, null);
+    await flushIO();
+
+    await provider.setSessionEffort('sess-effort', 'off');
+    await provider.send('sess-effort', 'again');
+    const second = lastSpawn();
+    const secondSettingsPath = second.env?.QWEN_CODE_SYSTEM_SETTINGS_PATH;
+    expect(secondSettingsPath).toBe(firstSettingsPath);
+    expect(JSON.parse(await readFile(String(secondSettingsPath), 'utf8'))).toEqual({
+      model: { generationConfig: { reasoning: false } },
+    });
+  });
+
+  it('preserves compatible API preset settings while forcing high qwen reasoning', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-preset',
+      cwd: '/tmp/project',
+      effort: 'high',
+      agentId: 'MiniMax-M2.7',
+      settings: {
+        security: { auth: { selectedType: 'anthropic' } },
+        model: { name: 'MiniMax-M2.7' },
+        modelProviders: {
+          anthropic: [
+            {
+              id: 'MiniMax-M2.7',
+              envKey: 'ANTHROPIC_API_KEY',
+              baseUrl: 'https://api.minimax.io/anthropic',
+            },
+          ],
+        },
+      },
+    });
+
+    await provider.send('sess-preset', 'hello');
+    const first = lastSpawn();
+    const settingsPath = first.env?.QWEN_CODE_SYSTEM_SETTINGS_PATH;
+    expect(typeof settingsPath).toBe('string');
+    expect(JSON.parse(await readFile(String(settingsPath), 'utf8'))).toEqual({
+      security: { auth: { selectedType: 'anthropic' } },
+      model: {
+        name: 'MiniMax-M2.7',
+        generationConfig: { reasoning: { effort: 'high' } },
+      },
+      modelProviders: {
+        anthropic: [
+          {
+            id: 'MiniMax-M2.7',
+            envKey: 'ANTHROPIC_API_KEY',
+            baseUrl: 'https://api.minimax.io/anthropic',
+          },
+        ],
+      },
+    });
+    // --auth-type must be passed so qwen CLI doesn't fall back to user-level
+    // ~/.qwen/settings.json (which commonly pins selectedType: qwen-oauth).
+    const authTypeIndex = first.args.indexOf('--auth-type');
+    expect(authTypeIndex).toBeGreaterThan(-1);
+    expect(first.args[authTypeIndex + 1]).toBe('anthropic');
+  });
+
+  it('omits --auth-type when no preset settings are provided (preserves default qwen auth)', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-no-preset',
+      cwd: '/tmp/project',
+      effort: 'medium',
+    });
+
+    await provider.send('sess-no-preset', 'hello');
+    const spawned = lastSpawn();
+    // Users without a preset rely on `qwen auth` (coding-plan / api-key / OAuth
+    // choice stored in ~/.qwen/settings.json) — we must not force an auth tier
+    // for them, or we'd override their working configuration.
+    expect(spawned.args.includes('--auth-type')).toBe(false);
+  });
+
+  it('allows the daemon MCP server and passes per-session Memory MCP identity env to qwen', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-mcp',
+      sessionName: 'deck_repo_w1',
+      projectName: 'repo',
+      serverId: 'srv-bound',
+      cwd: '/tmp/project',
+      contextNamespace: {
+        scope: 'user_private',
+        userId: 'user-secret-ish',
+        projectId: 'github.com/acme/project',
+      },
+    });
+
+    await provider.send('sess-mcp', 'hello');
+    const spawned = lastSpawn();
+    const allowedIndex = spawned.args.indexOf('--allowed-mcp-server-names');
+
+    expect(allowedIndex).toBeGreaterThan(-1);
+    expect(spawned.args[allowedIndex + 1]).toBe(IMCODES_MEMORY_MCP_SERVER_NAME);
+    expect(spawned.env).toMatchObject({
+      [IMCODES_DAEMON_USER_ID_ENV]: 'user-secret-ish',
+      [IMCODES_DAEMON_SESSION_NAME_ENV]: 'deck_repo_w1',
+      [IMCODES_DAEMON_PROJECT_NAME_ENV]: 'repo',
+      [IMCODES_DAEMON_PROJECT_ROOT_ENV]: '/tmp/project',
+      [IMCODES_DAEMON_SERVER_ID_ENV]: 'srv-bound',
+    });
+    expect(JSON.parse(String(spawned.env?.[IMCODES_DAEMON_NAMESPACE_ENV]))).toEqual({
+      scope: 'user_private',
+      userId: 'user-secret-ish',
+      projectId: 'github.com/acme/project',
+    });
+  });
+
+  it('ignores settings.security.auth.selectedType that qwen CLI does not recognize', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-unknown-auth',
+      cwd: '/tmp/project',
+      settings: {
+        // e.g. a value from shared/qwen-auth.ts (display-tier), not a CLI value
+        security: { auth: { selectedType: 'coding-plan' } },
+      },
+    });
+
+    await provider.send('sess-unknown-auth', 'hello');
+    const spawned = lastSpawn();
+    // Unknown values must not be forwarded — CLI would reject the spawn.
+    expect(spawned.args.includes('--auth-type')).toBe(false);
+  });
+
+  it('preserves preset settings (security + modelProviders + model.name) when effort changes on subsequent sends', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-preset-effort',
+      cwd: '/tmp/project',
+      effort: 'medium',
+      agentId: 'MiniMax-M2.7',
+      settings: {
+        security: { auth: { selectedType: 'anthropic' } },
+        model: { name: 'MiniMax-M2.7' },
+        modelProviders: {
+          anthropic: [
+            {
+              id: 'MiniMax-M2.7',
+              envKey: 'ANTHROPIC_API_KEY',
+              baseUrl: 'https://api.minimax.io/anthropic',
+            },
+          ],
+        },
+      },
+    });
+
+    // First send — verify full preset config is written
+    await provider.send('sess-preset-effort', 'hello');
+    const first = lastSpawn();
+    const settingsPath = first.env?.QWEN_CODE_SYSTEM_SETTINGS_PATH;
+    expect(typeof settingsPath).toBe('string');
+    expect(JSON.parse(await readFile(String(settingsPath), 'utf8'))).toEqual({
+      security: { auth: { selectedType: 'anthropic' } },
+      model: {
+        name: 'MiniMax-M2.7',
+        generationConfig: { reasoning: { effort: 'high' } },
+      },
+      modelProviders: {
+        anthropic: [
+          {
+            id: 'MiniMax-M2.7',
+            envKey: 'ANTHROPIC_API_KEY',
+            baseUrl: 'https://api.minimax.io/anthropic',
+          },
+        ],
+      },
+    });
+    // --auth-type must still be forwarded on the first send
+    const firstAuthIdx = first.args.indexOf('--auth-type');
+    expect(firstAuthIdx).toBeGreaterThan(-1);
+    expect(first.args[firstAuthIdx + 1]).toBe('anthropic');
+
+    // Complete first send so second send is allowed
+    first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-1', content: [{ type: 'text', text: 'Hi' }] } })}\n`);
+    first.child.emit('close', 0, null);
+    await flushIO();
+
+    // Change effort — this is the bug path: ensureSettingsPath is called again
+    // and must NOT overwrite the temp file with only { model: { generationConfig } }
+    await provider.setSessionEffort('sess-preset-effort', 'high');
+    await provider.send('sess-preset-effort', 'again');
+    const second = lastSpawn();
+    expect(second.env?.QWEN_CODE_SYSTEM_SETTINGS_PATH).toBe(String(settingsPath));
+    // All preset fields must survive the rewrite
+    expect(JSON.parse(await readFile(String(settingsPath), 'utf8'))).toEqual({
+      security: { auth: { selectedType: 'anthropic' } },
+      model: {
+        name: 'MiniMax-M2.7',
+        generationConfig: { reasoning: { effort: 'high' } },
+      },
+      modelProviders: {
+        anthropic: [
+          {
+            id: 'MiniMax-M2.7',
+            envKey: 'ANTHROPIC_API_KEY',
+            baseUrl: 'https://api.minimax.io/anthropic',
+          },
+        ],
+      },
+    });
+    // --auth-type must still be forwarded on the second send too
+    const secondAuthIdx = second.args.indexOf('--auth-type');
+    expect(secondAuthIdx).toBeGreaterThan(-1);
+    expect(second.args[secondAuthIdx + 1]).toBe('anthropic');
+  });
+
+  it('passes session-specific preset env through to the spawned qwen process', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-preset-env',
+      cwd: '/tmp/project',
+      env: {
+        ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+        ANTHROPIC_API_KEY: 'test-token',
+        ANTHROPIC_MODEL: 'MiniMax-M2.7',
+      },
+      settings: {
+        security: { auth: { selectedType: 'anthropic' } },
+        model: { name: 'MiniMax-M2.7' },
+      },
+    });
+
+    await provider.send('sess-preset-env', 'hello');
+    const spawned = lastSpawn();
+    expect(spawned.env).toMatchObject({
+      ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+      ANTHROPIC_API_KEY: 'test-token',
+      ANTHROPIC_MODEL: 'MiniMax-M2.7',
+    });
+    // MiniMax preset ships with selectedType: anthropic — must be forwarded to
+    // qwen CLI so it doesn't fall back to OAuth via user-level settings.
+    const authTypeIndex = spawned.args.indexOf('--auth-type');
+    expect(authTypeIndex).toBeGreaterThan(-1);
+    expect(spawned.args[authTypeIndex + 1]).toBe('anthropic');
+  });
+
+  it('uses --session-id on first send, streams cumulative deltas, then resumes with --resume', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-1',
+      cwd: '/tmp/project',
+      description: 'Be concise',
+      agentId: 'qwen3-coder-plus',
+    });
+
+    const deltas: string[] = [];
+    const completed: string[] = [];
+    provider.onDelta((_sid, delta) => deltas.push(delta.delta));
+    provider.onComplete((_sid, msg) => completed.push(String(msg.content)));
+
+    await provider.send('sess-1', 'hello');
+    const first = lastSpawn();
+    // file may be 'qwen' (Linux/Mac) or node.exe (Windows where qwen is a .cmd shim)
+    expect(first.file === 'qwen' || /node(\.exe)?$/i.test(first.file)).toBe(true);
+    expect(first.cwd).toBe('/tmp/project');
+    expect(first.args).toContain('--session-id');
+    const firstSessionId = first.args[first.args.indexOf('--session-id') + 1];
+    expect(firstSessionId).toMatch(UUID_PATTERN);
+    expect(first.args).not.toContain('--resume');
+    expect(first.args).toContain('--append-system-prompt');
+    expect(first.args).toContain('Be concise');
+    expect(first.args).toContain('--model');
+    expect(first.args).toContain('qwen3-coder-plus');
+
+    first.child.stdout.write(`${JSON.stringify({ type: 'system', subtype: 'session_start', session_id: firstSessionId })}\n`);
+    first.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg-1' } } })}\n`);
+    first.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Hel' } } })}\n`);
+    first.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'lo' } } })}\n`);
+    first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-1', content: [{ type: 'text', text: 'Hello' }] } })}\n`);
+    first.child.emit('close', 0, null);
+    await flushIO();
+
+    expect(deltas).toEqual(['Hel', 'Hello']);
+    expect(completed).toEqual(['Hello']);
+
+    await provider.send('sess-1', 'again');
+    const second = lastSpawn();
+    expect(second.args).toContain('--resume');
+    expect(second.args).toContain(firstSessionId);
+    expect(second.args).not.toContain('--session-id');
+  });
+
+  it('turns an empty zero-exit qwen run into a recoverable terminal error when retry budget is exhausted', async () => {
+    const provider = new QwenProvider();
+    const errors: Array<{ sid: string; error: unknown }> = [];
+    provider.onError((sid, error) => errors.push({ sid, error }));
+
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-empty-zero',
+      cwd: '/tmp/project',
+    });
+
+    await provider.send('sess-empty-zero', 'hello', undefined, undefined, true, 0);
+    const first = lastSpawn();
+    first.child.emit('close', 0, null);
+    await flushIO();
+
+    expect(childProcessMock.spawn).toHaveBeenCalledTimes(1);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatchObject({
+      sid: 'sess-empty-zero',
+      error: {
+        code: 'PROVIDER_ERROR',
+        message: 'Qwen exited without producing a response',
+        recoverable: true,
+      },
+    });
+  });
+
+  it('uses a provided UUID resumeId when restoring qwen sessions', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    const resumeId = 'dd09c62c-4cb2-41be-a2f7-a5682760e3b1';
+    await provider.createSession({
+      sessionKey: 'sess-resume-id',
+      cwd: '/tmp/project',
+      resumeId,
+    });
+
+    await provider.send('sess-resume-id', 'hello');
+    const run = lastSpawn();
+    expect(run.args).toContain('--resume');
+    expect(run.args).toContain(resumeId);
+    expect(run.args).not.toContain('--session-id');
+  });
+
+  it('maps normalized payloads into qwen CLI prompt/system arguments', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-payload',
+      cwd: '/tmp/project',
+      description: 'Legacy description',
+    });
+
+    const payload: ProviderContextPayload = {
+      userMessage: 'ship it',
+      assembledMessage: 'Context block\n\nship it',
+      systemText: 'Normalized system text',
+      messagePreamble: 'Context block',
+      attachments: [],
+      context: {
+        systemText: 'Normalized system text',
+        messagePreamble: 'Context block',
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'sess-payload' },
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    };
+
+    await provider.send('sess-payload', payload);
+    const spawnEntry = lastSpawn();
+    expect(spawnEntry.args).toContain('-p');
+    expect(spawnEntry.args).toContain('Context block\n\nship it');
+    expect(spawnEntry.args).toContain('--append-system-prompt');
+    expect(spawnEntry.args).toContain('Normalized system text');
+  });
+
+  it('translates IM.codes /compact into Qwen CLI /compress without context preambles', async () => {
+    const provider = new QwenProvider();
+    const statuses: Array<{ status: string | null; label?: string | null }> = [];
+    const completed: AgentMessage[] = [];
+    provider.onStatus((_sid, status) => statuses.push(status));
+    provider.onComplete((_sid, message) => completed.push(message));
+
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-compact',
+      cwd: '/tmp/project',
+      description: 'Legacy description must not be appended',
+    });
+
+    await provider.send('sess-compact', {
+      userMessage: ' /compact ',
+      assembledMessage: 'Shared history\n\n/compact',
+      systemText: 'Enterprise standard must not be appended',
+      messagePreamble: 'Shared history',
+      attachments: [],
+      context: {
+        systemText: 'Enterprise standard must not be appended',
+        messagePreamble: 'Shared history',
+        requiredAuthoredContext: ['must not be sent'],
+        advisoryAuthoredContext: ['must not be sent'],
+        appliedDocumentVersionIds: ['doc-1'],
+        diagnostics: ['diag'],
+      },
+      authority: {
+        namespace: { scope: 'project_shared', projectId: 'repo' },
+        authoritySource: 'processed_remote',
+        freshness: 'fresh',
+        fallbackAllowed: false,
+        retryScheduled: false,
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: ['diag'],
+    });
+
+    const run = lastSpawn();
+    const promptIndex = run.args.indexOf('-p');
+    expect(run.args.slice(promptIndex, promptIndex + 2)).toEqual(['-p', '/compress']);
+    expect(run.args).not.toContain('--append-system-prompt');
+    expect(statuses[0]).toEqual({ status: 'compacting', label: 'Compacting conversation...' });
+
+    run.child.stdout.write(`${JSON.stringify({ type: 'result', result: 'Context compressed (100 -> 25).' })}\n`);
+    run.child.emit('close', 0, null);
+    await flushIO();
+
+    expect(completed).toHaveLength(1);
+    expect(completed[0]).toMatchObject({
+      kind: 'system',
+      role: 'system',
+      content: 'Context compressed (100 -> 25).',
+      metadata: {
+        [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact',
+        event: 'session.history.compress',
+        providerCommand: '/compress',
+      },
+    });
+  });
+
+  it('rejects normalized payloads combined with legacy extraSystemPrompt', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-payload',
+      cwd: '/tmp/project',
+    });
+
+    await expect(provider.send('sess-payload', {
+      userMessage: 'ship it',
+      assembledMessage: 'Context block\n\nship it',
+      systemText: 'Normalized system text',
+      messagePreamble: 'Context block',
+      attachments: [],
+      context: {
+        systemText: 'Normalized system text',
+        messagePreamble: 'Context block',
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'sess-payload' },
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    }, undefined, 'legacy raw context')).rejects.toThrow(/legacy extraSystemPrompt/i);
+  });
+
+  it('falls back to a fresh session when --resume points to a missing qwen conversation id', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-resume-fallback',
+      cwd: '/tmp/project',
+    });
+
+    const completed: string[] = [];
+    const resumeIds: string[] = [];
+    provider.onComplete((_sid, msg) => completed.push(String(msg.content)));
+    provider.onSessionInfo?.((_sid, info) => {
+      if (typeof info.resumeId === 'string') resumeIds.push(info.resumeId);
+    });
+
+    await provider.send('sess-resume-fallback', 'hello');
+    const first = lastSpawn();
+    first.child.stdout.write(`${JSON.stringify({ type: 'system', subtype: 'session_start', session_id: 'sess-resume-fallback' })}\n`);
+    first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-1', content: [{ type: 'text', text: 'Hello' }] } })}\n`);
+    first.child.emit('close', 0, null);
+    await flushIO();
+
+    await provider.send('sess-resume-fallback', 'again');
+    const second = childProcessMock.spawned[1];
+    expect(second?.args).toContain('--resume');
+    second?.child.stderr.write('No saved session found with ID sess-resume-fallback\n');
+    second?.child.emit('close', 1, null);
+    await waitForSpawnCount(3);
+
+    const third = childProcessMock.spawned[2];
+    expect(third?.args).toContain('--session-id');
+    expect(third?.args).not.toContain('--resume');
+    const sessionIdIndex = third?.args.indexOf('--session-id') ?? -1;
+    expect(sessionIdIndex).toBeGreaterThanOrEqual(0);
+    expect(third?.args[sessionIdIndex + 1]).not.toBe('sess-resume-fallback');
+    expect(resumeIds).toContain(third?.args[sessionIdIndex + 1]);
+
+    third?.child.stdout.write(`${JSON.stringify({ type: 'system', subtype: 'session_start', session_id: third?.args[sessionIdIndex + 1] })}\n`);
+    third?.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-2', content: [{ type: 'text', text: 'Recovered' }] } })}\n`);
+    third?.child.emit('close', 0, null);
+    await flushIO();
+
+    expect(completed).toContain('Recovered');
+  });
+
+  it('accepts a normalized provider payload', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-payload',
+      cwd: '/tmp/project',
+    });
+
+    await provider.send('sess-payload', {
+      userMessage: 'hello',
+      assembledMessage: 'Shared history\n\nhello',
+      systemText: 'Enterprise standard',
+      messagePreamble: 'Shared history',
+      attachments: undefined,
+      context: {
+        systemText: 'Enterprise standard',
+        messagePreamble: 'Shared history',
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'project_shared', projectId: 'repo' },
+        authoritySource: 'processed_remote',
+        freshness: 'fresh',
+        fallbackAllowed: false,
+        retryScheduled: false,
+        diagnostics: [],
+      },
+      supportClass: 'full-normalized-context-injection',
+      diagnostics: [],
+    });
+
+    const run = lastSpawn();
+    expect(run.args).toContain('-p');
+    expect(run.args).toContain('Shared history\n\nhello');
+    expect(run.args).toContain('--append-system-prompt');
+    expect(run.args).toContain('Enterprise standard');
+  });
+
+  it('injects split stable context only once and keeps per-turn context on later sends', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-split-context',
+      cwd: '/tmp/project',
+    });
+
+    const makePayload = (turnSystemText: string): ProviderContextPayload => ({
+      userMessage: 'hello',
+      assembledMessage: 'Shared history\n\nhello',
+      sessionSystemText: 'Stable IM.codes runtime rules',
+      turnSystemText,
+      systemText: `Stable IM.codes runtime rules\n\n${turnSystemText}`,
+      messagePreamble: 'Shared history',
+      attachments: undefined,
+      context: {
+        sessionSystemText: 'Stable IM.codes runtime rules',
+        turnSystemText,
+        systemText: `Stable IM.codes runtime rules\n\n${turnSystemText}`,
+        messagePreamble: 'Shared history',
+        requiredAuthoredContext: [turnSystemText],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'project_shared', projectId: 'repo' },
+        authoritySource: 'processed_remote',
+        freshness: 'fresh',
+        fallbackAllowed: false,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    });
+
+    await provider.send('sess-split-context', makePayload('Required shared context:\n- First rule'));
+    const first = lastSpawn();
+    const firstPrompt = first.args[first.args.indexOf('--append-system-prompt') + 1];
+    expect(firstPrompt).toContain('Stable IM.codes runtime rules');
+    expect(firstPrompt).toContain('First rule');
+    first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-1', content: [{ type: 'text', text: 'OK' }] } })}\n`);
+    first.child.emit('close', 0, null);
+    await flushIO();
+
+    await provider.send('sess-split-context', makePayload('Required shared context:\n- Second rule'));
+    const second = lastSpawn();
+    const secondPrompt = second.args[second.args.indexOf('--append-system-prompt') + 1];
+    expect(secondPrompt).not.toContain('Stable IM.codes runtime rules');
+    expect(secondPrompt).toContain('Second rule');
+  });
+
+  it('does not fall back to the session description after split stable context is injected', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-split-stable-only',
+      cwd: '/tmp/project',
+      description: 'Legacy description must not repeat after split injection',
+    });
+
+    const payload: ProviderContextPayload = {
+      userMessage: 'hello',
+      assembledMessage: 'hello',
+      sessionSystemText: 'Stable IM.codes runtime rules',
+      systemText: 'Stable IM.codes runtime rules',
+      messagePreamble: undefined,
+      attachments: undefined,
+      context: {
+        sessionSystemText: 'Stable IM.codes runtime rules',
+        systemText: 'Stable IM.codes runtime rules',
+        messagePreamble: undefined,
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'project_shared', projectId: 'repo' },
+        authoritySource: 'processed_remote',
+        freshness: 'fresh',
+        fallbackAllowed: false,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    };
+
+    await provider.send('sess-split-stable-only', payload);
+    const first = lastSpawn();
+    expect(first.args).toContain('--append-system-prompt');
+    expect(first.args).toContain('Stable IM.codes runtime rules');
+    first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-1', content: [{ type: 'text', text: 'OK' }] } })}\n`);
+    first.child.emit('close', 0, null);
+    await flushIO();
+
+    await provider.send('sess-split-stable-only', payload);
+    const second = lastSpawn();
+    expect(second.args).not.toContain('--append-system-prompt');
+    expect(second.args).not.toContain('Legacy description must not repeat after split injection');
+  });
+
+  it('keeps the legacy description fallback for raw string sends', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-legacy-description',
+      cwd: '/tmp/project',
+      description: 'Legacy description fallback',
+    });
+
+    await provider.send('sess-legacy-description', 'hello');
+    const run = lastSpawn();
+    expect(run.args).toContain('--append-system-prompt');
+    expect(run.args).toContain('Legacy description fallback');
+  });
+
+  it('normalizes Windows cwd before spawning qwen', async () => {
+    const origPlatform = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+
+    try {
+      const provider = new QwenProvider();
+      await provider.connect({});
+      await provider.createSession({
+        sessionKey: 'sess-win',
+        cwd: 'C:\\Users\\admin\\project',
+      });
+
+      await provider.send('sess-win', 'hello');
+      const run = lastSpawn();
+      expect(run.cwd).toBe('C:/Users/admin/project');
+      expect(run.cwd).not.toContain('\\');
+    } finally {
+      Object.defineProperty(process, 'platform', { value: origPlatform });
+    }
+  });
+
+  it('keeps the streaming message id for final completion when qwen emits a different assistant id', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-2', cwd: '/tmp/project' });
+
+    const completeIds: string[] = [];
+    const metadata: Array<Record<string, unknown> | undefined> = [];
+    provider.onComplete((_sid, msg) => { completeIds.push(msg.id); metadata.push(msg.metadata); });
+
+    await provider.send('sess-2', 'hello');
+    const run = lastSpawn();
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'stream-msg-1' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Hello' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'assistant-msg-2', model: 'qwen3.5-plus', usage: { input_tokens: 10, output_tokens: 4, cache_read_input_tokens: 2 }, content: [{ type: 'text', text: 'Hello' }] } })}\n`);
+    run.child.emit('close', 0, null);
+    await flushIO();
+
+    expect(completeIds).toEqual(['stream-msg-1']);
+    expect(metadata[0]).toEqual({
+      model: 'qwen3.5-plus',
+      usage: { input_tokens: 10, output_tokens: 4, cache_read_input_tokens: 2 },
+    });
+  });
+
+  it('prefers assistant per-turn usage over cumulative result usage for ctx display', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-usage', cwd: '/tmp/project', agentId: 'coder-model' });
+
+    const metadata: Array<Record<string, unknown> | undefined> = [];
+    provider.onComplete((_sid, msg) => { metadata.push(msg.metadata); });
+
+    await provider.send('sess-usage', 'hello');
+    const run = lastSpawn();
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'stream-msg-usage' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({
+      type: 'assistant',
+      message: {
+        id: 'assistant-msg-usage',
+        model: 'coder-model',
+        usage: { input_tokens: 321, output_tokens: 12, cache_read_input_tokens: 45 },
+        content: [{ type: 'text', text: 'Hello' }],
+      },
+    })}\n`);
+    run.child.stdout.write(`${JSON.stringify({
+      type: 'result',
+      is_error: false,
+      result: 'Hello',
+      usage: { input_tokens: 11_000_000, output_tokens: 12, cache_read_input_tokens: 500_000 },
+    })}\n`);
+    run.child.emit('close', 0, null);
+    await flushIO();
+
+    expect(metadata[0]).toEqual({
+      model: 'coder-model',
+      usage: { input_tokens: 321, output_tokens: 12, cache_read_input_tokens: 45 },
+    });
+  });
+
+
+  it('queued messages batch-drain after the active turn completes', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    const runtime = new TransportSessionRuntime(provider, 'sess-queue');
+    await runtime.initialize({ sessionKey: 'sess-queue', cwd: '/tmp/project' });
+
+    // First send dispatches immediately
+    runtime.send('first');
+    await waitForSpawnCount(1);
+    const first = lastSpawn();
+    first.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg-queue-1' } } })}\n`);
+    first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'assistant-queue-1', content: [{ type: 'text', text: 'Still running' }] } })}\n`);
+    await flushIO();
+
+    // Second send queues (runtime is busy)
+    const result = runtime.send('second');
+    expect(result).toBe('queued');
+    expect(runtime.pendingCount).toBe(1);
+    await flushIO();
+    expect(childProcessMock.spawn).toHaveBeenCalledTimes(1);
+
+    // Complete first turn → pending drains as merged turn
+    first.child.emit('close', 0, null);
+    await waitForSpawnCount(2);
+
+    expect(childProcessMock.spawn).toHaveBeenCalledTimes(2);
+    expect(runtime.pendingCount).toBe(0);
+  });
+
+  it('drains queued messages from a terminal qwen result even when the process close is missing', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    const runtime = new TransportSessionRuntime(provider, 'sess-queue-close-gate');
+    await runtime.initialize({ sessionKey: 'sess-queue-close-gate', cwd: '/tmp/project' });
+
+    const errors: string[] = [];
+    provider.onError((_sid, err) => errors.push(err.message));
+
+    runtime.send('first');
+    await waitForSpawnCount(1);
+    const first = lastSpawn();
+    vi.useFakeTimers();
+    first.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg-queue-close-1' } } })}\n`);
+    first.child.stdout.write(`${JSON.stringify({ type: 'result', is_error: false, result: 'done' })}\n`);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(runtime.send('second')).toBe('queued');
+    expect(runtime.pendingCount).toBe(1);
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(childProcessMock.spawn).toHaveBeenCalledTimes(1);
+    expect(runtime.pendingCount).toBe(1);
+    expect(errors).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(first.child.kill).toHaveBeenCalledWith('SIGTERM');
+    vi.useRealTimers();
+    await waitForSpawnCount(2);
+    expect(childProcessMock.spawn).toHaveBeenCalledTimes(2);
+    expect(runtime.pendingCount).toBe(0);
+    expect(errors).toEqual([]);
+  });
+
+  it('emits provider error on result is_error payload', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-err', cwd: '/tmp/project' });
+
+    const errors: string[] = [];
+    provider.onError((_sid, err) => errors.push(err.message));
+
+    await provider.send('sess-err', 'fail');
+    const run = lastSpawn();
+    run.child.stdout.write(`${JSON.stringify({ type: 'result', is_error: true, error: { message: 'bad request' } })}\n`);
+    await flushIO();
+
+    expect(errors).toEqual(['bad request']);
+  });
+
+  it('surfaces qwen synthetic API auth failures as AUTH_FAILED errors', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-auth-fail', cwd: '/tmp/project' });
+
+    const errors: Array<{ code: string; message: string }> = [];
+    const completed: string[] = [];
+    provider.onError((_sid, err) => errors.push({ code: err.code, message: err.message }));
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+    await provider.send('sess-auth-fail', 'hello');
+    const run = lastSpawn();
+    run.child.stdout.write(`${JSON.stringify({
+      type: 'assistant',
+      message: {
+        id: 'msg-auth-fail',
+        content: [{ type: 'text', text: '[API Error: 401 invalid access token or token expired]' }],
+      },
+    })}\n`);
+    run.child.stdout.write(`${JSON.stringify({
+      type: 'result',
+      is_error: false,
+      result: '[API Error: 401 invalid access token or token expired]',
+    })}\n`);
+    run.child.emit('close', 0, null);
+    await flushIO();
+    await flushIO();
+
+    expect(completed).toEqual([]);
+    expect(errors).toEqual([{
+      code: 'AUTH_FAILED',
+      message: '401 invalid access token or token expired',
+    }]);
+  });
+
+  it('retries a transient Premature close once before surfacing an error', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-transient-retry', cwd: '/tmp/project' });
+
+    const errors: string[] = [];
+    const completed: string[] = [];
+    provider.onError((_sid, err) => errors.push(err.message));
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+    await provider.send('sess-transient-retry', 'retry me');
+    await waitForSpawnCount(1);
+    const first = lastSpawn();
+    first.child.stdout.write(`${JSON.stringify({ type: 'result', is_error: true, error: { message: 'API Error: Premature close' } })}\n`);
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    await waitForSpawnCount(2);
+    first.child.emit('close', 0, null);
+
+    const second = lastSpawn();
+    second.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-retry-ok', content: [{ type: 'text', text: 'OK' }] } })}\n`);
+    await flushIO();
+    second.child.emit('close', 0, null);
+    await flushIO();
+    await flushIO();
+
+    const retryMeSpawns = childProcessMock.spawn.mock.calls.filter(
+      (call) => (call[1] as string[]).includes('retry me'),
+    );
+    expect(retryMeSpawns).toHaveLength(2);
+    expect(completed).toEqual(['OK']);
+    expect(errors).toEqual([]);
+  });
+
+  it('retries qwen reasoning_content replay errors in a fresh high-thinking conversation', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-reasoning-replay-error',
+      cwd: '/tmp/project',
+      effort: 'high',
+    });
+
+    const errors: string[] = [];
+    const completed: string[] = [];
+    provider.onError((_sid, err) => errors.push(err.message));
+    provider.onComplete((_sid, msg) => completed.push(String(msg.content)));
+
+    await provider.send('sess-reasoning-replay-error', 'first turn');
+    await waitForSpawnCount(1);
+    const first = lastSpawn();
+    const settingsPath = first.env?.QWEN_CODE_SYSTEM_SETTINGS_PATH;
+    expect(JSON.parse(await readFile(String(settingsPath), 'utf8'))).toEqual({
+      model: { generationConfig: { reasoning: { effort: 'high' } } },
+    });
+    first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-first-ok', content: [{ type: 'text', text: 'First OK' }] } })}\n`);
+    first.child.emit('close', 0, null);
+    await flushIO();
+
+    await provider.send('sess-reasoning-replay-error', 'retry with a fresh conversation');
+    await waitForSpawnCount(2);
+    const second = lastSpawn();
+    expect(second.args).toContain('--resume');
+
+    second.child.stdout.write(`${JSON.stringify({
+      type: 'result',
+      is_error: true,
+      error: {
+        message: 'API Error: 400 {"error":{"code":"400","message":"Param Incorrect","param":"The reasoning_content in the thinking mode must be passed back to the API.","type":""}}',
+      },
+    })}\n`);
+    await waitForSpawnCount(3);
+
+    const third = lastSpawn();
+    expect(third.args).toContain('--session-id');
+    expect(third.args).not.toContain('--resume');
+    expect(third.env?.QWEN_CODE_SYSTEM_SETTINGS_PATH).toBe(String(settingsPath));
+    expect(JSON.parse(await readFile(String(settingsPath), 'utf8'))).toEqual({
+      model: { generationConfig: { reasoning: { effort: 'high' } } },
+    });
+    third.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-reasoning-fallback-ok', content: [{ type: 'text', text: 'OK' }] } })}\n`);
+    third.child.emit('close', 0, null);
+    await flushIO();
+    await flushIO();
+
+    expect(childProcessMock.spawn).toHaveBeenCalledTimes(3);
+    expect(completed).toEqual(['First OK', 'OK']);
+    expect(errors).toEqual([]);
+  });
+
+  it('retries qwen tool-call history replay errors in a fresh conversation', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({
+      sessionKey: 'sess-tool-history-replay-error',
+      cwd: '/tmp/project',
+      agentId: 'qwen3-coder-plus',
+    });
+
+    const errors: string[] = [];
+    const completed: string[] = [];
+    provider.onError((_sid, err) => errors.push(err.message));
+    provider.onComplete((_sid, msg) => completed.push(String(msg.content)));
+
+    await provider.send('sess-tool-history-replay-error', 'first turn');
+    await waitForSpawnCount(1);
+    const first = lastSpawn();
+    first.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-first-tool-ok', content: [{ type: 'text', text: 'First OK' }] } })}\n`);
+    first.child.emit('close', 0, null);
+    await flushIO();
+
+    await provider.send('sess-tool-history-replay-error', 'retry after malformed tool history');
+    await waitForSpawnCount(2);
+    const second = lastSpawn();
+    expect(second.args).toContain('--resume');
+
+    const apiErrorText = '[API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"invalid params, tool call result does not follow tool call (2013)"}}]';
+    second.child.stdout.write(`${JSON.stringify({
+      type: 'stream_event',
+      event: { type: 'message_start', message: { id: 'msg-api-error-stream' } },
+    })}\n`);
+    second.child.stdout.write(`${JSON.stringify({
+      type: 'stream_event',
+      event: { type: 'content_block_delta', delta: { type: 'text_delta', text: apiErrorText } },
+    })}\n`);
+    second.child.stdout.write(`${JSON.stringify({
+      type: 'result',
+      is_error: false,
+      result: apiErrorText,
+    })}\n`);
+    await waitForSpawnCount(3);
+
+    const third = lastSpawn();
+    expect(third.args).toContain('--session-id');
+    expect(third.args).not.toContain('--resume');
+    third.child.stdout.write(`${JSON.stringify({ type: 'assistant', message: { id: 'msg-tool-history-fallback-ok', content: [{ type: 'text', text: 'OK' }] } })}\n`);
+    third.child.emit('close', 0, null);
+    await flushIO();
+    await flushIO();
+
+    expect(childProcessMock.spawn).toHaveBeenCalledTimes(3);
+    expect(completed).toEqual(['First OK', 'OK']);
+    expect(errors).toEqual([]);
+  });
+
+  it('does not retry transient errors after partial output has streamed', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-transient-partial', cwd: '/tmp/project' });
+
+    const errors: string[] = [];
+    provider.onError((_sid, err) => errors.push(err.message));
+
+    await provider.send('sess-transient-partial', 'partial first');
+    await waitForSpawnCount(1);
+    const run = lastSpawn();
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg-partial' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Par' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'result', is_error: true, error: { message: 'API Error: Premature close' } })}\n`);
+    await flushIO();
+    await flushIO();
+
+    expect(childProcessMock.spawn).toHaveBeenCalledTimes(1);
+    expect(errors).toEqual(['API Error: Premature close']);
+  });
+
+  it('cancel() terminates the child and emits a cancelled error', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-cancel', cwd: '/tmp/project' });
+
+    const errors: Array<{ code: string; message: string }> = [];
+    provider.onError((_sid, err) => errors.push({ code: err.code, message: err.message }));
+
+    await provider.send('sess-cancel', 'cancel me');
+    const run = lastSpawn();
+    await provider.cancel?.('sess-cancel');
+    await flushIO();
+
+    expect(run.child.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(errors).toEqual([{ code: 'CANCELLED', message: 'Cancelled' }]);
+  });
+
+  it('suppresses buffered qwen output after cancel so stop cannot leak assistant text', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-cancel-buffered', cwd: '/tmp/project' });
+
+    const deltas: string[] = [];
+    const completions: string[] = [];
+    const errors: Array<{ code: string; message: string }> = [];
+    provider.onDelta((_sid, delta) => deltas.push(delta.delta));
+    provider.onComplete((_sid, message) => completions.push(message.content));
+    provider.onError((_sid, err) => errors.push({ code: err.code, message: err.message }));
+
+    await provider.send('sess-cancel-buffered', 'cancel me');
+    const run = lastSpawn();
+    await provider.cancel?.('sess-cancel-buffered');
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg-after-cancel' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'should not leak' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'result', is_error: false, result: 'should not complete' })}\n`);
+    await flushIO();
+    await flushIO();
+
+    expect(run.child.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(deltas).toEqual([]);
+    expect(completions).toEqual([]);
+    expect(errors).toEqual([{ code: 'CANCELLED', message: 'Cancelled' }]);
+  });
+
+  it('emits tool.call and tool.result events for qwen tool blocks', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-tool', cwd: '/tmp/project' });
+
+    const tools: ToolCallEvent[] = [];
+    provider.onToolCall?.((_sid, tool) => tools.push(tool));
+
+    await provider.send('sess-tool', 'use a tool');
+    const run = lastSpawn();
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'tool-1', name: 'list_directory' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{\"path\":\"/tmp/project\"}' } } })}\n`);
+    await flushIO();
+    expect(provider.getActiveWorkSnapshot('sess-tool')).toMatchObject({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+    });
+    run.child.stdout.write(`${JSON.stringify({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'ok', is_error: false }] } })}\n`);
+    await flushIO();
+    expect(provider.getActiveWorkSnapshot('sess-tool')).toMatchObject({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 0,
+      busyReasons: ['provider_wait'],
+    });
+    run.child.emit('close', 0, null);
+    await flushIO();
+    expect(provider.getActiveWorkSnapshot('sess-tool')).toMatchObject({
+      status: 'current',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+    });
+
+    expect(tools).toEqual([
+      {
+        id: 'tool-1',
+        name: 'list_directory',
+        status: 'running',
+        input: { path: '/tmp/project' },
+        detail: {
+          kind: 'tool_use',
+          summary: 'list_directory',
+          input: { path: '/tmp/project' },
+          raw: { id: 'tool-1', name: 'list_directory', input: { path: '/tmp/project' }, partialJson: '{"path":"/tmp/project"}' },
+        },
+      },
+      {
+        id: 'tool-1',
+        name: 'list_directory',
+        status: 'complete',
+        output: 'ok',
+        detail: {
+          kind: 'tool_result',
+          summary: 'list_directory',
+          output: 'ok',
+          raw: { type: 'tool_result', tool_use_id: 'tool-1', content: 'ok', is_error: false },
+        },
+      },
+    ]);
+  });
+
+  it('emits thinking status from qwen thinking blocks and clears it on text output', async () => {
+    const provider = new QwenProvider();
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-thinking', cwd: '/tmp/project' });
+
+    const statuses: Array<{ status: string | null; label?: string | null }> = [];
+    provider.onStatus?.((_sid, status) => statuses.push(status));
+
+    await provider.send('sess-thinking', 'think');
+    const run = lastSpawn();
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'msg-thinking' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'thinking' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'Analyzing...' } } })}\n`);
+    run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: 'Done' } } })}\n`);
+    run.child.emit('close', 0, null);
+    await flushIO();
+
+    expect(statuses).toEqual([
+      { status: null, label: null },
+      { status: 'thinking', label: 'Thinking...' },
+      { status: null, label: null },
+    ]);
+  });
+
+  describe('cross-message streaming accumulator', () => {
+    it('resets the streaming accumulator at each message_start so a second message is not prefixed with the first', async () => {
+      // REGRESSION LOCK: Qwen streams cumulative text in state.currentText and
+      // emits it as a MessageDelta { messageId, delta } that the relay renders by
+      // replacing the bubble for that messageId. When a NEW assistant message
+      // (new message.id) begins mid-turn, state.currentText MUST reset to '' on
+      // the message_start event — otherwise message 2's deltas render prefixed
+      // with message 1's full text (visible cross-message bleed).
+      const provider = new QwenProvider();
+      await provider.connect({});
+      await provider.createSession({ sessionKey: 'sess-bleed', cwd: '/tmp/project' });
+
+      const deltas: Array<{ id: string; text: string }> = [];
+      provider.onDelta((_sid, delta) => deltas.push({ id: delta.messageId, text: delta.delta }));
+
+      await provider.send('sess-bleed', 'hello');
+      const run = lastSpawn();
+
+      // ── Message 1 ──
+      run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'm1' } } })}\n`);
+      run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Let me check.' } } })}\n`);
+      // ── A new assistant message begins mid-turn (e.g. after a tool round) ──
+      run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'message_start', message: { id: 'm2' } } })}\n`);
+      run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'The answer' } } })}\n`);
+      run.child.stdout.write(`${JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ' is 42.' } } })}\n`);
+      run.child.stdout.write(`${JSON.stringify({ type: 'result', is_error: false, result: 'The answer is 42.' })}\n`);
+      run.child.emit('close', 0, null);
+      await flushIO();
+
+      // Message 1 accumulated only its own text.
+      const m1Deltas = deltas.filter((d) => d.id === 'm1').map((d) => d.text);
+      expect(m1Deltas).toEqual(['Let me check.']);
+
+      // Message 2's deltas must be its OWN cumulative text only — never prefixed
+      // with message 1's text. This is the lock.
+      const m2Deltas = deltas.filter((d) => d.id === 'm2').map((d) => d.text);
+      expect(m2Deltas).toEqual(['The answer', 'The answer is 42.']);
+
+      // Guard: no emitted delta may ever concatenate the two messages.
+      expect(deltas.every((d) => !d.text.includes('Let me check.The answer'))).toBe(true);
+    });
+  });
+});

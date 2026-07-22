@@ -1,0 +1,14 @@
+{
+  "owner": "hud",
+  "pid": 70703,
+  "cwd": "/Users/mac/imcodes_evolution",
+  "heartbeat_at": "2026-07-22T08:57:29.690Z",
+  "cooldown_ms": 5000,
+  "jitter_ms": 150,
+  "skip_count": 127,
+  "last_status": "skipped",
+  "last_reason": "rate_limited",
+  "last_spawn_at": "2026-07-22T08:57:25.673Z",
+  "last_skip_at": "2026-07-22T08:57:29.690Z",
+  "next_allowed_at": "2026-07-22T08:57:30.823Z"
+}

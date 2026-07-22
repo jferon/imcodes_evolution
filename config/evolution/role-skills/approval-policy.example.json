@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "requiredApprovals": 2,
+  "approvers": ["product-owner", "tech-lead", "qa-owner"]
+}

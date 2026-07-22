@@ -1,0 +1,1 @@
+{"timestamp":"2026-07-22T08:55:16.223Z","type":"native_hook_dispatch_error","hook_event_name":"SessionStart","session_id":"019f8909-0dd3-74f2-b133-aaa239aac4c0","error":"ENOENT: no such file or directory, open '/Users/mac/imcodes_evolution/.git/info/exclude'"}

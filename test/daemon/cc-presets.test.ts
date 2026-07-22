@@ -1,0 +1,200 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const state = vi.hoisted(() => ({
+  home: '',
+}));
+
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>();
+  return {
+    ...actual,
+    homedir: () => state.home,
+  };
+});
+
+describe('cc presets', () => {
+  beforeEach(async () => {
+    state.home = await mkdtemp(join(tmpdir(), 'imcodes-cc-presets-'));
+    await mkdir(join(state.home, '.imcodes'), { recursive: true });
+    await writeFile(
+      join(state.home, '.imcodes', 'cc-presets.json'),
+      JSON.stringify([
+        {
+          name: 'minimax',
+          env: {
+            ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+            ANTHROPIC_AUTH_TOKEN: 'test-token',
+            ANTHROPIC_MODEL: 'MiniMax-M2.7',
+          },
+          contextWindow: 200000,
+        },
+      ]),
+      'utf8',
+    );
+  });
+
+  afterEach(async () => {
+    vi.resetModules();
+    if (state.home) await rm(state.home, { recursive: true, force: true });
+    state.home = '';
+  });
+
+  it('matches preset names case-insensitively', async () => {
+    const { getPreset } = await import('../../src/daemon/cc-presets.js');
+
+    await expect(getPreset('minimax')).resolves.toMatchObject({ name: 'minimax' });
+    await expect(getPreset('MiniMax')).resolves.toMatchObject({ name: 'minimax' });
+  });
+
+  it('resolves env and context hints for mixed-case preset names', async () => {
+    const { resolvePresetEnv } = await import('../../src/daemon/cc-presets.js');
+
+    await expect(resolvePresetEnv('MiniMax')).resolves.toMatchObject({
+      ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+      ANTHROPIC_AUTH_TOKEN: 'test-token',
+      ANTHROPIC_API_KEY: 'test-token',
+      ANTHROPIC_MODEL: 'MiniMax-M2.7',
+      ANTHROPIC_SMALL_FAST_MODEL: 'MiniMax-M2.7',
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'MiniMax-M2.7',
+      ANTHROPIC_DEFAULT_OPUS_MODEL: 'MiniMax-M2.7',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'MiniMax-M2.7',
+      IMCODES_CONTEXT_WINDOW: '200000',
+    });
+  });
+
+  it('builds qwen transport config for anthropic-compatible presets', async () => {
+    const { getQwenPresetTransportConfig } = await import('../../src/daemon/cc-presets.js');
+
+    const result = await getQwenPresetTransportConfig('MiniMax');
+    expect(result).toMatchObject({
+      env: {
+        ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+        ANTHROPIC_API_KEY: 'test-token',
+        ANTHROPIC_MODEL: 'MiniMax-M2.7',
+        // qwen CLI reads OPENAI_BASE_URL / OPENAI_API_KEY for --auth-type anthropic
+        OPENAI_BASE_URL: 'https://api.minimax.io/anthropic',
+        OPENAI_API_KEY: 'test-token',
+      },
+      model: 'MiniMax-M2.7',
+      settings: {
+        security: { auth: { selectedType: 'anthropic' } },
+        model: { name: 'MiniMax-M2.7' },
+        modelProviders: {
+          anthropic: [
+            {
+              id: 'MiniMax-M2.7',
+              name: 'MiniMax-M2.7',
+              envKey: 'ANTHROPIC_API_KEY',
+              baseUrl: 'https://api.minimax.io/anthropic',
+              generationConfig: {
+                contextWindowSize: 200000,
+              },
+            },
+          ],
+        },
+      },
+    });
+    // Identity-override systemPrompt must pin the authoritative model and
+    // explicitly deny the Qwen identity baked into the qwen CLI wrapper.
+    expect(result.systemPrompt).toBeDefined();
+    expect(result.systemPrompt).toContain('MiniMax-M2.7');
+    expect(result.systemPrompt).toContain('https://api.minimax.io/anthropic');
+    expect(result.systemPrompt).toMatch(/not running on Qwen/i);
+  });
+
+  it('uses discovered compatible-api models when building qwen transport config', async () => {
+    const { savePresets, getQwenPresetTransportConfig } = await import('../../src/daemon/cc-presets.js');
+
+    await savePresets([
+      {
+        name: 'minimax',
+        env: {
+          ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+          ANTHROPIC_AUTH_TOKEN: 'test-token',
+          ANTHROPIC_MODEL: 'MiniMax-M2.7',
+        },
+        defaultModel: 'MiniMax-M2.7',
+        availableModels: [
+          { id: 'MiniMax-M2.7', name: 'MiniMax M2.7' },
+          { id: 'MiniMax-Text-01' },
+        ],
+      },
+    ]);
+
+    const result = await getQwenPresetTransportConfig('minimax');
+    expect(result.model).toBe('MiniMax-M2.7');
+    expect(result.availableModels).toEqual(['MiniMax-M2.7', 'MiniMax-Text-01']);
+    expect(result.settings).toMatchObject({
+      model: { name: 'MiniMax-M2.7' },
+      modelProviders: {
+        anthropic: [
+          expect.objectContaining({ id: 'MiniMax-M2.7', name: 'MiniMax M2.7' }),
+          expect.objectContaining({ id: 'MiniMax-Text-01', name: 'MiniMax-Text-01' }),
+        ],
+      },
+    });
+  });
+
+  it('keeps the preset-pinned model authoritative when discovered models are stale', async () => {
+    const { savePresets, getQwenPresetTransportConfig, getPresetAvailableModelIds } = await import('../../src/daemon/cc-presets.js');
+
+    await savePresets([
+      {
+        name: 'minimax',
+        env: {
+          ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+          ANTHROPIC_AUTH_TOKEN: 'test-token',
+          ANTHROPIC_MODEL: 'MiniMax-M2.7',
+        },
+        defaultModel: 'stale-discovered-default',
+        availableModels: [
+          { id: 'stale-discovered-default' },
+          { id: 'MiniMax-Text-01' },
+        ],
+      },
+    ]);
+
+    const result = await getQwenPresetTransportConfig('MiniMax');
+    expect(getPresetAvailableModelIds({
+      env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+      defaultModel: 'stale-discovered-default',
+      availableModels: [{ id: 'MiniMax-Text-01' }],
+    })).toEqual(['MiniMax-M2.7', 'stale-discovered-default', 'MiniMax-Text-01']);
+    expect(result.model).toBe('MiniMax-M2.7');
+    expect(result.availableModels).toEqual(['MiniMax-M2.7', 'stale-discovered-default', 'MiniMax-Text-01']);
+    expect(result.settings).toMatchObject({
+      model: { name: 'MiniMax-M2.7' },
+      modelProviders: {
+        anthropic: [
+          expect.objectContaining({ id: 'MiniMax-M2.7' }),
+          expect.objectContaining({ id: 'stale-discovered-default' }),
+          expect.objectContaining({ id: 'MiniMax-Text-01' }),
+        ],
+      },
+    });
+  });
+
+  it('deduplicates preset names case-insensitively and keeps the last saved reference', async () => {
+    const { savePresets, loadPresets, getPreset } = await import('../../src/daemon/cc-presets.js');
+
+    await savePresets([
+      {
+        name: 'minimax',
+        env: { ANTHROPIC_BASE_URL: 'https://old.example', ANTHROPIC_MODEL: 'old-model' },
+      },
+      {
+        name: 'MiniMax',
+        env: { ANTHROPIC_BASE_URL: 'https://new.example', ANTHROPIC_MODEL: 'new-model' },
+      },
+    ]);
+
+    expect(await loadPresets()).toHaveLength(1);
+    await expect(getPreset('minimax')).resolves.toMatchObject({
+      name: 'MiniMax',
+      env: { ANTHROPIC_BASE_URL: 'https://new.example', ANTHROPIC_MODEL: 'new-model' },
+    });
+  });
+});

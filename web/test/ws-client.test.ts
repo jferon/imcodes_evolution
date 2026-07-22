@@ -1,0 +1,1738 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { WsClient } from '../src/ws-client.js';
+import { DAEMON_MSG } from '@shared/daemon-events.js';
+import { P2P_WORKFLOW_MSG, isP2pWorkflowRequestId } from '@shared/p2p-workflow-messages.js';
+import { TRANSPORT_MSG } from '@shared/transport-events.js';
+import { REPO_MSG } from '@shared/repo-types.js';
+import { TIMELINE_MESSAGES } from '@shared/timeline-protocol.js';
+import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
+import type { MessageHandler } from '../src/ws-client.js';
+
+// Mock WebSocket implementation
+class MockWebSocket {
+  static CONNECTING = 0;
+  static OPEN = 1;
+  static CLOSING = 2;
+  static CLOSED = 3;
+
+  readyState = MockWebSocket.CONNECTING;
+  url: string;
+  private listeners: Record<string, Array<(ev: unknown) => void>> = {};
+
+  constructor(url: string) {
+    this.url = url;
+  }
+
+  addEventListener(type: string, fn: (ev: unknown) => void) {
+    if (!this.listeners[type]) this.listeners[type] = [];
+    this.listeners[type].push(fn);
+  }
+
+  send = vi.fn();
+
+  close(code?: number, reason?: string) {
+    this.readyState = MockWebSocket.CLOSED;
+    this.emit('close', { code, reason });
+  }
+
+  /** Test helper: trigger an event */
+  emit(type: string, data?: unknown) {
+    if (type === 'open') this.readyState = MockWebSocket.OPEN;
+    if (type === 'close') this.readyState = MockWebSocket.CLOSED;
+    for (const fn of this.listeners[type] ?? []) fn(data);
+  }
+}
+
+/** Flush the microtask queue so the async openSocket() completes after the mocked fetch. */
+const flushAsync = () => new Promise<void>((r) => setTimeout(r, 0));
+
+let lastWs: MockWebSocket | null;
+
+function setDocumentVisibility(state: DocumentVisibilityState): void {
+  Object.defineProperty(document, 'visibilityState', {
+    configurable: true,
+    get: () => state,
+  });
+}
+
+async function connectClient(): Promise<WsClient> {
+  const client = new WsClient('http://localhost:8787', 'srv-1');
+  client.connect();
+  await flushAsync();
+  lastWs!.emit('open');
+  return client;
+}
+
+describe('WsClient', () => {
+  let MockWS: typeof MockWebSocket;
+
+  beforeEach(() => {
+    lastWs = null;
+    setDocumentVisibility('visible');
+    MockWS = class extends MockWebSocket {
+      constructor(url: string) {
+        super(url);
+        lastWs = this;
+      }
+    };
+    vi.stubGlobal('WebSocket', MockWS);
+
+    // openSocket() fetches a ws-ticket before creating the WebSocket.
+    // Provide a minimal mock so the fetch resolves immediately.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ ticket: 'test-ticket' }),
+      }),
+    );
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.clearAllTimers();
+  });
+
+  it('can be instantiated with baseUrl and serverId', () => {
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    expect(client).toBeInstanceOf(WsClient);
+  });
+
+  it('starts disconnected before connect() is called', () => {
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    expect(client.connected).toBe(false);
+  });
+
+  it('opens a WebSocket on connect()', async () => {
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await flushAsync();
+    expect(lastWs).not.toBeNull();
+  });
+
+  it('builds the correct WebSocket URL with ws:// and ticket', async () => {
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await flushAsync();
+    expect(lastWs!.url).toContain('ws://localhost:8787');
+    expect(lastWs!.url).toContain('/api/server/srv-1/ws');
+    expect(lastWs!.url).toContain('ticket=test-ticket');
+  });
+
+  it('sets connected=true after WebSocket open event', async () => {
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await flushAsync();
+    lastWs!.emit('open');
+    expect(client.connected).toBe(true);
+  });
+
+  it('dispatches terminal.diff messages to registered handlers', async () => {
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    const handler = vi.fn<Parameters<MessageHandler>>();
+    client.onMessage(handler);
+    client.connect();
+    await flushAsync();
+    lastWs!.emit('open');
+
+    // open dispatches a synthetic session.event — clear it
+    handler.mockClear();
+
+    const msg = { type: 'terminal.diff', diff: { sessionName: 's1', timestamp: 1, lines: [], cols: 80, rows: 24 } };
+    lastWs!.emit('message', { data: JSON.stringify(msg) });
+
+    expect(handler).toHaveBeenCalledOnce();
+    expect(handler).toHaveBeenCalledWith(msg);
+  });
+
+  it('does not dispatch pong messages to handlers', async () => {
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    const handler = vi.fn();
+    client.onMessage(handler);
+    client.connect();
+    await flushAsync();
+    lastWs!.emit('open');
+
+    // open dispatches a synthetic session.event — clear it
+    handler.mockClear();
+
+    lastWs!.emit('message', { data: JSON.stringify({ type: 'pong' }) });
+
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('unregisters a handler when the returned cleanup is called', async () => {
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    const handler = vi.fn();
+    const unsub = client.onMessage(handler);
+    unsub();
+
+    client.connect();
+    await flushAsync();
+    lastWs!.emit('open');
+    lastWs!.emit('message', { data: JSON.stringify({ type: 'session.event', event: 'x', session: 's', state: 'idle' }) });
+
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('disconnect() sets connected=false and closes the socket', async () => {
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await flushAsync();
+    lastWs!.emit('open');
+    expect(client.connected).toBe(true);
+
+    client.disconnect();
+    expect(client.connected).toBe(false);
+  });
+
+  it('schedules reconnect after WebSocket closes', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    // Flush the fetch promise with fake timers active
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+
+    const firstWs = lastWs;
+    firstWs!.emit('close');
+
+    // After close, reconnectAttempt should increment and a new socket opens after delay
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(lastWs).not.toBe(firstWs);
+
+    vi.useRealTimers();
+  });
+
+  it('keeps connecting=true while the browser WebSocket is still CONNECTING', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(lastWs).not.toBeNull();
+    expect(lastWs!.readyState).toBe(MockWebSocket.CONNECTING);
+    expect(client.connected).toBe(false);
+    expect(client.connecting).toBe(true);
+
+    lastWs!.emit('open');
+    expect(client.connected).toBe(true);
+    expect(client.connecting).toBe(false);
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('times out a hung ws-ticket request and retries instead of staying connecting forever', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        const err = new Error('aborted');
+        err.name = 'AbortError';
+        reject(err);
+      });
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    expect(client.connecting).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(client.connected).toBe(false);
+    // The first hung ticket attempt has yielded to a reconnect timer.
+    expect(client.connecting).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('times out a WebSocket that never opens and schedules a fresh connection', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    const firstWs = lastWs!;
+
+    expect(firstWs.readyState).toBe(MockWebSocket.CONNECTING);
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    expect(firstWs.readyState).toBe(MockWebSocket.CLOSED);
+    expect(client.connected).toBe(false);
+    expect(client.connecting).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastWs).not.toBe(firstWs);
+    expect(lastWs!.readyState).toBe(MockWebSocket.CONNECTING);
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('does not stack multiple reconnect timers for the same outage', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    const internal = client as unknown as { scheduleReconnect: () => void };
+
+    internal.scheduleReconnect();
+    internal.scheduleReconnect();
+    internal.scheduleReconnect();
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(lastWs).not.toBeNull();
+    const fetchMock = fetch as unknown as ReturnType<typeof vi.fn>;
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('jitters the reconnect backoff so weak-network drops do not reconnect in lockstep', async () => {
+    vi.useFakeTimers();
+    // First attempt: ceiling = min(1000 * 2^0, 30000) = 1000ms. Equal jitter
+    // picks a delay in [ceiling/2, ceiling]; Math.random()=0 → the 500ms floor.
+    // The un-jittered backoff fired at a fixed 1000ms, so a reconnect that fires
+    // at 500ms (and not before) proves the jitter is applied.
+    const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    const internal = client as unknown as { scheduleReconnect: () => void };
+    const fetchMock = fetch as unknown as ReturnType<typeof vi.fn>;
+
+    internal.scheduleReconnect();
+
+    await vi.advanceTimersByTimeAsync(499);
+    expect(fetchMock).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    randomSpy.mockRestore();
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('reconnectNow(false) closes a stale CONNECTING socket before opening another one', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    const firstWs = lastWs!;
+
+    expect(firstWs.readyState).toBe(MockWebSocket.CONNECTING);
+    client.reconnectNow(false);
+    expect(firstWs.readyState).toBe(MockWebSocket.CLOSED);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastWs).not.toBe(firstWs);
+    expect(lastWs!.readyState).toBe(MockWebSocket.CONNECTING);
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('resumeConnection(true) force-reconnects a stale open socket with no confirmed pong', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const firstWs = lastWs!;
+
+    client.resumeConnection(true);
+    expect(firstWs.readyState).toBe(MockWebSocket.CLOSED);
+    expect(client.connected).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastWs).not.toBe(firstWs);
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+
+  it('force reconnect refreshes a stale-open socket and replays subscriptions', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    const handler = vi.fn();
+    client.onMessage(handler);
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const firstWs = lastWs!;
+    handler.mockClear();
+
+    client.subscribeTerminal('chat-session', false);
+    client.subscribeTransportSession('transport-session');
+    firstWs.send.mockClear();
+
+    client.reconnectNow(true);
+    expect(client.connected).toBe(false);
+    expect(handler).toHaveBeenCalledWith({
+      type: 'session.event',
+      event: 'disconnected',
+      session: '',
+      state: 'disconnected',
+      reason: 'socket_closed',
+    });
+    // Stale-socket window: send() drops the message (no delivery) but must NOT
+    // throw — an uncaught throw here crashes the ChatView via the ErrorBoundary.
+    expect(() => client.send({ type: 'session.send', sessionName: 's', text: 'lost guard' })).not.toThrow();
+    await vi.advanceTimersByTimeAsync(0);
+
+    const secondWs = lastWs!;
+    expect(secondWs).not.toBe(firstWs);
+    secondWs.emit('open');
+    await vi.advanceTimersByTimeAsync(200);
+
+    expect(secondWs.send).toHaveBeenCalledWith(expect.stringContaining('"type":"terminal.subscribe"'));
+    expect(secondWs.send).toHaveBeenCalledWith(expect.stringContaining('"type":"chat.subscribe"'));
+
+    // Late close from the stale socket must not tear down the fresh connection.
+    firstWs.emit('close');
+    expect(client.connected).toBe(true);
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('foreground probe blocks direct sends without tearing down live UI subscriptions', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    const handler = vi.fn();
+    client.onMessage(handler);
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+    handler.mockClear();
+    socket.send.mockClear();
+
+    client.probeConnection();
+
+    expect(client.connected).toBe(false);
+    expect(handler).toHaveBeenCalledWith({
+      type: 'session.event',
+      event: 'probing',
+      session: '',
+      state: 'probing',
+      reason: 'probe_start',
+    });
+    expect(handler).not.toHaveBeenCalledWith(expect.objectContaining({ event: 'disconnected' }));
+    expect(JSON.parse(socket.send.mock.calls[0][0] as string)).toEqual({ type: 'ping' });
+    // During the probe window send() must NOT deliver (no extra socket.send)
+    // and must NOT throw (an uncaught throw here crashes the ChatView).
+    const callsBeforeGuarded = socket.send.mock.calls.length;
+    expect(() => client.send({ type: 'session.send', sessionName: 's', text: 'guarded' })).not.toThrow();
+    expect(socket.send.mock.calls.length).toBe(callsBeforeGuarded);
+
+    socket.emit('message', { data: JSON.stringify({ type: 'pong' }) });
+    expect(client.connected).toBe(true);
+    expect(handler).toHaveBeenCalledWith({
+      type: 'session.event',
+      event: 'connected',
+      session: '',
+      state: 'connected',
+      reason: 'probe_recovered',
+    });
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('repairs already-sent transport subscriptions after foreground probe recovery without history replay', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+
+    client.subscribeTerminal('live-session', false);
+    await vi.advanceTimersByTimeAsync(60);
+    client.subscribeTransportSession('live-session');
+    socket.send.mockClear();
+
+    client.probeConnection();
+    expect(JSON.parse(socket.send.mock.calls[0][0] as string)).toEqual({ type: 'ping' });
+    socket.send.mockClear();
+
+    socket.emit('message', { data: JSON.stringify({ type: 'pong' }) });
+    await vi.advanceTimersByTimeAsync(0);
+
+    const messages = socket.send.mock.calls.map((call) => JSON.parse(call[0] as string));
+    expect(messages).toContainEqual({ type: 'chat.subscribe', sessionId: 'live-session', forceHistory: false });
+    expect(messages).not.toContainEqual({ type: 'terminal.subscribe', session: 'live-session', raw: false });
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('sends live subscriptions created while foreground probe is pending', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+    socket.send.mockClear();
+
+    client.probeConnection();
+    expect(JSON.parse(socket.send.mock.calls[0][0] as string)).toEqual({ type: 'ping' });
+    socket.send.mockClear();
+
+    client.subscribeTerminal('pending-session', true);
+    client.subscribeTransportSession('pending-session');
+    expect(socket.send).not.toHaveBeenCalled();
+
+    socket.emit('message', { data: JSON.stringify({ type: 'pong' }) });
+    await vi.advanceTimersByTimeAsync(0);
+
+    const messages = socket.send.mock.calls.map((call) => JSON.parse(call[0] as string));
+    expect(messages).toContainEqual({ type: 'chat.subscribe', sessionId: 'pending-session', forceHistory: true });
+    expect(messages).toContainEqual({ type: 'terminal.subscribe', session: 'pending-session', raw: true });
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('sends pending live unsubscriptions after foreground probe recovery', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+
+    client.subscribeTerminal('gone-session', false);
+    await vi.advanceTimersByTimeAsync(60);
+    client.subscribeTransportSession('gone-session');
+    socket.send.mockClear();
+
+    client.probeConnection();
+    socket.send.mockClear();
+
+    client.unsubscribeTerminal('gone-session');
+    client.unsubscribeTransportSession('gone-session');
+    expect(socket.send).not.toHaveBeenCalled();
+
+    socket.emit('message', { data: JSON.stringify({ type: 'pong' }) });
+    await vi.advanceTimersByTimeAsync(0);
+
+    const messages = socket.send.mock.calls.map((call) => JSON.parse(call[0] as string));
+    expect(messages).toContainEqual({ type: 'chat.unsubscribe', sessionId: 'gone-session' });
+    expect(messages).toContainEqual({ type: 'terminal.unsubscribe', session: 'gone-session' });
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('does not run reconnect history refresh on foreground probe recovery', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+
+    client.subscribeTransportSession('history-session');
+    client.onMessage((msg) => {
+      if (msg.type === 'session.event' && msg.event === 'connected') {
+        if (msg.reason === 'probe_recovered') return;
+        client.sendTimelineHistoryRequest('history-session', 25);
+      }
+    });
+    socket.send.mockClear();
+
+    client.probeConnection();
+    socket.send.mockClear();
+    socket.emit('message', { data: JSON.stringify({ type: 'pong' }) });
+
+    const messages = socket.send.mock.calls.map((call) => JSON.parse(call[0] as string));
+    expect(messages).toEqual([{ type: 'chat.subscribe', sessionId: 'history-session', forceHistory: false }]);
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('foreground probe force-reconnects after two missed pongs', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const firstWs = lastWs!;
+    firstWs.send.mockClear();
+
+    client.probeConnection();
+    // First watchdog window (8s): no pong yet — still on the same socket.
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(firstWs.readyState).toBe(MockWebSocket.OPEN);
+    expect(lastWs).toBe(firstWs);
+
+    // Second watchdog window also misses → force reconnect.
+    await vi.advanceTimersByTimeAsync(8_000);
+    for (let i = 0; i < 5; i++) await vi.advanceTimersByTimeAsync(0);
+
+    expect(firstWs.readyState).toBe(MockWebSocket.CLOSED);
+    expect(lastWs).not.toBe(firstWs);
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('probeConnection short-circuits when a recent pong already proved liveness', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    const handler = vi.fn();
+    client.onMessage(handler);
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+
+    // Heartbeat pong arrives — socket is provably alive.
+    socket.emit('message', { data: JSON.stringify({ type: 'pong' }) });
+    handler.mockClear();
+    socket.send.mockClear();
+
+    // A foreground probe immediately after should be a no-op:
+    //   - no extra ping is sent
+    //   - the socket is NOT marked disconnected (no UI flash)
+    client.probeConnection();
+    expect(client.connected).toBe(true);
+    expect(socket.send).not.toHaveBeenCalled();
+    expect(handler).not.toHaveBeenCalledWith(expect.objectContaining({ event: 'disconnected' }));
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('probeConnection coalesces back-to-back calls into a single in-flight probe', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+    socket.send.mockClear();
+
+    // First probe: sends one ping.
+    client.probeConnection();
+    const pingsAfterFirst = socket.send.mock.calls.filter(
+      (c) => JSON.parse(c[0] as string).type === 'ping',
+    ).length;
+    expect(pingsAfterFirst).toBe(1);
+
+    // Stacking more probes from focus/pageshow/visibilitychange must not pile
+    // up extra pings while the first probe's watchdog is still armed.
+    client.probeConnection();
+    client.probeConnection();
+    const pingsAfterStacked = socket.send.mock.calls.filter(
+      (c) => JSON.parse(c[0] as string).type === 'ping',
+    ).length;
+    expect(pingsAfterStacked).toBe(1);
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('send() is a safe no-op when not connected (does not throw)', () => {
+    // Fire-and-forget transport must never throw to React effects/listeners —
+    // an uncaught throw crashes the ChatView via the ErrorBoundary.
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    expect(() => client.send({ type: 'ping' })).not.toThrow();
+  });
+
+  it('skips Claude weekly quota opt-in without throwing while disconnected', () => {
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    expect(() => client.setClaudeWeeklyQuotaOptIn(true)).not.toThrow();
+  });
+
+  describe('dead-socket detection (pong timeout)', () => {
+    it('force-reconnects a new socket after two missed heartbeat pongs', async () => {
+      // Regression: mobile OS commonly half-closes the TCP on background
+      // eviction without propagating close() to the WebView — the old client
+      // believed it was "connected" indefinitely while no events arrived.
+      // Now we ping every HEARTBEAT_MS (10s) and force-reconnect if two
+      // consecutive 8s watchdog windows miss their pongs.
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const firstWs = lastWs!;
+
+      // Initial ping fires on open; assert we sent one.
+      const initialPings = firstWs.send.mock.calls.filter(
+        (c) => JSON.parse(c[0] as string).type === 'ping',
+      );
+      expect(initialPings.length).toBeGreaterThanOrEqual(1);
+
+      // Walk past the first 8s watchdog without ever sending a pong.
+      await vi.advanceTimersByTimeAsync(8_000);
+      expect(firstWs.readyState).toBe(MockWebSocket.OPEN);
+      expect(lastWs).toBe(firstWs);
+
+      // The confirming ping also missed; now the client reconnects.
+      await vi.advanceTimersByTimeAsync(8_000);
+      // reconnectNow(true) fires synchronously, but openSocket() awaits a
+      // ticket fetch Promise — flush several microtask turns so the new
+      // MockWebSocket is constructed before we assert.
+      for (let i = 0; i < 5; i++) await vi.advanceTimersByTimeAsync(0);
+      expect(firstWs.readyState).toBe(MockWebSocket.CLOSED);
+      expect(lastWs).not.toBe(firstWs);
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('does NOT reconnect while pongs keep arriving', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const firstWs = lastWs!;
+
+      // Simulate a healthy server that pongs immediately after each ping.
+      for (let i = 0; i < 5; i++) {
+        firstWs.emit('message', { data: JSON.stringify({ type: 'pong' }) });
+        await vi.advanceTimersByTimeAsync(10_000); // one heartbeat interval
+        firstWs.emit('message', { data: JSON.stringify({ type: 'pong' }) });
+      }
+
+      // Still on the same socket — the watchdog was cleared by each pong.
+      expect(lastWs).toBe(firstWs);
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('does not force-reconnect from the heartbeat watchdog while the tab is hidden', async () => {
+      vi.useFakeTimers();
+      let visibilityState: DocumentVisibilityState = 'visible';
+      Object.defineProperty(document, 'visibilityState', {
+        configurable: true,
+        get: () => visibilityState,
+      });
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const firstWs = lastWs!;
+
+      visibilityState = 'hidden';
+      document.dispatchEvent(new Event('visibilitychange'));
+
+      await vi.advanceTimersByTimeAsync(32_000);
+      for (let i = 0; i < 5; i++) await vi.advanceTimersByTimeAsync(0);
+
+      expect(lastWs).toBe(firstWs);
+      expect(firstWs.readyState).toBe(MockWebSocket.OPEN);
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+  });
+
+  describe('terminal subscription modes', () => {
+    it('subscribeTerminal sends an explicit raw flag', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      lastWs!.send.mockClear();
+
+      client.subscribeTerminal('chat-session', false);
+      client.subscribeTerminal('terminal-session', true);
+
+      expect(lastWs!.send).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(lastWs!.send.mock.calls[0][0] as string)).toEqual({
+        type: 'terminal.subscribe',
+        session: 'terminal-session',
+        raw: true,
+      });
+      await vi.advanceTimersByTimeAsync(200);
+
+      expect(lastWs!.send).toHaveBeenCalledTimes(2);
+      expect(JSON.parse(lastWs!.send.mock.calls[1][0] as string)).toEqual({
+        type: 'terminal.subscribe',
+        session: 'chat-session',
+        raw: false,
+      });
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('keeps raw mode while a raw hold is active despite passive resubscribe', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      lastWs!.send.mockClear();
+
+      client.subscribeTerminal('shell-card', false);
+      await vi.advanceTimersByTimeAsync(80);
+      expect(JSON.parse(lastWs!.send.mock.calls.at(-1)?.[0] as string)).toEqual({
+        type: 'terminal.subscribe',
+        session: 'shell-card',
+        raw: false,
+      });
+
+      const release = client.holdTerminalRaw('shell-card');
+      await vi.advanceTimersByTimeAsync(80);
+      expect(JSON.parse(lastWs!.send.mock.calls.at(-1)?.[0] as string)).toEqual({
+        type: 'terminal.subscribe',
+        session: 'shell-card',
+        raw: true,
+      });
+
+      const callsBeforePassiveResubscribe = lastWs!.send.mock.calls.length;
+      client.subscribeTerminal('shell-card', false);
+      await vi.advanceTimersByTimeAsync(80);
+      expect(lastWs!.send).toHaveBeenCalledTimes(callsBeforePassiveResubscribe);
+
+      release();
+      await vi.advanceTimersByTimeAsync(80);
+      expect(JSON.parse(lastWs!.send.mock.calls.at(-1)?.[0] as string)).toEqual({
+        type: 'terminal.subscribe',
+        session: 'shell-card',
+        raw: false,
+      });
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('debounces rapid passive terminal subscribe/unsubscribe churn to the final state', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      lastWs!.send.mockClear();
+
+      client.subscribeTerminal('storm-session', false);
+      client.unsubscribeTerminal('storm-session');
+      client.subscribeTerminal('storm-session', false);
+      client.unsubscribeTerminal('empty-session');
+
+      expect(lastWs!.send).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(120);
+
+      const messages = lastWs!.send.mock.calls.map((call) => JSON.parse(call[0] as string));
+      expect(messages).toEqual([
+        { type: 'terminal.subscribe', session: 'storm-session', raw: false },
+      ]);
+
+      lastWs!.send.mockClear();
+      client.unsubscribeTerminal('storm-session');
+      client.subscribeTerminal('storm-session', false);
+      await vi.advanceTimersByTimeAsync(120);
+
+      expect(lastWs!.send).not.toHaveBeenCalled();
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('sends raw terminal subscriptions immediately even behind a passive backlog', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      lastWs!.send.mockClear();
+
+      for (let i = 0; i < 25; i++) {
+        client.subscribeTerminal(`passive-${i}`, false);
+      }
+      expect(lastWs!.send).not.toHaveBeenCalled();
+
+      client.subscribeTerminal('deck_sub_shell', true);
+
+      expect(lastWs!.send).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(lastWs!.send.mock.calls[0][0] as string)).toEqual({
+        type: 'terminal.subscribe',
+        session: 'deck_sub_shell',
+        raw: true,
+      });
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('replays remembered terminal subscriptions after reconnect', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const firstWs = lastWs!;
+
+      client.subscribeTerminal('chat-session', false);
+      client.subscribeTerminal('terminal-session', true);
+      firstWs.send.mockClear();
+
+      firstWs.emit('close');
+      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(0);
+
+      const secondWs = lastWs!;
+      expect(secondWs).not.toBe(firstWs);
+
+      secondWs.emit('open');
+
+      await vi.advanceTimersByTimeAsync(200);
+
+      expect(secondWs.send).toHaveBeenCalledTimes(3);
+      expect(JSON.parse(secondWs.send.mock.calls[0][0] as string)).toEqual({ type: 'ping' });
+      expect(JSON.parse(secondWs.send.mock.calls[1][0] as string)).toEqual({
+        type: 'terminal.subscribe',
+        session: 'chat-session',
+        raw: false,
+      });
+      expect(JSON.parse(secondWs.send.mock.calls[2][0] as string)).toEqual({
+        type: 'terminal.subscribe',
+        session: 'terminal-session',
+        raw: true,
+      });
+
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('recovers from terminal.stream_reset by requesting a fresh snapshot (no resubscribe needed)', async () => {
+      // The server keeps the subscription alive across an overflow stream_reset
+      // (it just clears its per-(session, ws) queue and notifies the client).
+      // So the client only needs to request a snapshot — re-subscribing was
+      // the OLD design and could leave the terminal frozen during the
+      // exponential backoff. New contract: a single snapshot request, no
+      // backoff, no resubscribe, never frozen.
+      const client = await connectClient();
+      vi.useFakeTimers();
+      lastWs!.send.mockClear();
+
+      try {
+        lastWs!.emit('message', {
+          data: JSON.stringify({
+            type: 'terminal.stream_reset',
+            session: 'stream-session',
+            reason: 'reset',
+          }),
+        });
+
+        // Snapshot fires synchronously on receipt; advance timers a generous
+        // amount and verify no resubscribe ever follows.
+        await vi.advanceTimersByTimeAsync(20_000);
+        const sendCalls = lastWs!.send.mock.calls.map((c: [string]) => {
+          try { return JSON.parse(c[0] as string) as Record<string, unknown>; } catch { return {}; }
+        });
+        expect(sendCalls.some((m) => m.type === 'terminal.snapshot_request' && m.sessionName === 'stream-session')).toBe(true);
+        expect(sendCalls.some((m) => m.type === 'terminal.subscribe')).toBe(false);
+      } finally {
+        client.disconnect();
+        vi.useRealTimers();
+      }
+    });
+
+    it('on terminal.stream_reset: synchronously requests a snapshot for fast recovery', async () => {
+      // Regression: server-side overflow no longer unsubscribes, so the
+      // client only needs a fresh snapshot to recover the dropped frames.
+      // The snapshot request must fire IMMEDIATELY (synchronously) on
+      // receipt of stream_reset — without it, the user stares at frozen
+      // terminal content for the duration of the resubscribe backoff
+      // (1s minimum) even though the subscription is healthy.
+      const client = await connectClient();
+      vi.useFakeTimers();
+      lastWs!.send.mockClear();
+
+      try {
+        lastWs!.emit('message', {
+          data: JSON.stringify({
+            type: 'terminal.stream_reset',
+            session: 'snap-session',
+            reason: 'backpressure',
+          }),
+        });
+
+        // Snapshot request must have fired synchronously (no timers needed).
+        const sendCalls = lastWs!.send.mock.calls.map((c: [string]) => {
+          try { return JSON.parse(c[0] as string) as Record<string, unknown>; } catch { return {}; }
+        });
+        const snapshotRequests = sendCalls.filter((m) => m.type === 'terminal.snapshot_request');
+        expect(snapshotRequests).toHaveLength(1);
+        expect(snapshotRequests[0]).toEqual({
+          type: 'terminal.snapshot_request',
+          sessionName: 'snap-session',
+        });
+      } finally {
+        client.disconnect();
+        vi.useRealTimers();
+      }
+    });
+
+    it('rate-limits snapshot requests during a reset burst (one snapshot per 500ms window)', async () => {
+      // A burst of stream_reset events (e.g. heavy output overflowing the
+      // server queue several times in a single tick) must NOT result in a
+      // snapshot request per reset — that would hammer the server. Instead
+      // the client collapses bursts into one snapshot per 500ms window. A
+      // pending snapshot is scheduled at the end of the window so the
+      // terminal is GUARANTEED to recover even after the burst settles.
+      const client = await connectClient();
+      vi.useFakeTimers();
+      try {
+        // 8 resets in the same tick → exactly ONE synchronous snapshot, the
+        // remaining 7 collapse into a single deferred snapshot at end of
+        // window.
+        for (let i = 0; i < 8; i++) {
+          lastWs!.emit('message', {
+            data: JSON.stringify({
+              type: 'terminal.stream_reset',
+              session: 'burst-session',
+              reason: 'backpressure',
+            }),
+          });
+        }
+        let sendCalls = lastWs!.send.mock.calls.map((c: [string]) => {
+          try { return JSON.parse(c[0] as string) as Record<string, unknown>; } catch { return {}; }
+        });
+        let snapshots = sendCalls.filter((m) => m.type === 'terminal.snapshot_request');
+        expect(snapshots).toHaveLength(1);
+
+        // Advance past the rate-limit window — the deferred snapshot fires
+        // exactly once and the terminal is recovered.
+        await vi.advanceTimersByTimeAsync(600);
+        sendCalls = lastWs!.send.mock.calls.map((c: [string]) => {
+          try { return JSON.parse(c[0] as string) as Record<string, unknown>; } catch { return {}; }
+        });
+        snapshots = sendCalls.filter((m) => m.type === 'terminal.snapshot_request');
+        expect(snapshots).toHaveLength(2);
+      } finally {
+        client.disconnect();
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe('transport chat subscriptions', () => {
+    it('subscribeTransportSession sends chat.subscribe and replays on reconnect', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const firstWs = lastWs!;
+
+      client.subscribeTransportSession('transport-session');
+      expect(JSON.parse(firstWs.send.mock.calls.at(-1)[0] as string)).toEqual({
+        type: 'chat.subscribe',
+        sessionId: 'transport-session',
+        forceHistory: true,
+      });
+
+      firstWs.send.mockClear();
+      firstWs.emit('close');
+      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(0);
+      const secondWs = lastWs!;
+      secondWs.emit('open');
+
+      expect(secondWs.send).toHaveBeenCalledWith(expect.stringContaining('"forceHistory":true'));
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('supports live-only passive transport subscriptions without history replay', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const firstWs = lastWs!;
+
+      client.subscribeTransportSession('passive-session', { replayHistory: false });
+      expect(JSON.parse(firstWs.send.mock.calls.at(-1)[0] as string)).toEqual({
+        type: 'chat.subscribe',
+        sessionId: 'passive-session',
+        forceHistory: false,
+      });
+
+      firstWs.send.mockClear();
+      firstWs.emit('close');
+      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(0);
+      const secondWs = lastWs!;
+      secondWs.emit('open');
+
+      expect(secondWs.send).toHaveBeenCalledWith(expect.stringContaining('"forceHistory":false'));
+      expect(secondWs.send).not.toHaveBeenCalledWith(expect.stringContaining('"forceHistory":true'));
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('can upgrade a live-only transport subscription to request history once', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      const socket = lastWs!;
+
+      client.subscribeTransportSession('passive-session', { replayHistory: false });
+      socket.send.mockClear();
+
+      client.subscribeTransportSession('passive-session');
+      expect(JSON.parse(socket.send.mock.calls.at(-1)[0] as string)).toEqual({
+        type: 'chat.subscribe',
+        sessionId: 'passive-session',
+        forceHistory: true,
+      });
+
+      socket.send.mockClear();
+      client.subscribeTransportSession('passive-session', { replayHistory: false });
+      expect(socket.send).toHaveBeenCalledWith(expect.stringContaining('"forceHistory":false'));
+      expect(socket.send).not.toHaveBeenCalledWith(expect.stringContaining('"forceHistory":true'));
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('respondTransportApproval sends chat.approval_response', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+
+      client.respondTransportApproval('transport-session', 'req-1', true);
+
+      expect(JSON.parse(lastWs!.send.mock.calls[0][0] as string)).toEqual({
+        type: TRANSPORT_MSG.APPROVAL_RESPONSE,
+        sessionId: 'transport-session',
+        requestId: 'req-1',
+        approved: true,
+      });
+      client.disconnect();
+    });
+  });
+
+  it('stages reconnect-storm work without delaying timeline gap-fill requests', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    lastWs!.send.mockClear();
+
+    client.subscribeTerminal('deck_storm_brain', false);
+    client.unsubscribeTerminal('deck_storm_brain');
+    client.subscribeTerminal('deck_storm_brain', true);
+    const historyRequestId = client.sendTimelineHistoryRequest('deck_storm_brain', 300, 999);
+    const replayRequestId = client.sendTimelineReplayRequest('deck_storm_brain', 42, 7);
+    const fsRequestId = client.fsListDir('/tmp/deck_storm_project');
+    const gitRequestId = client.fsGitStatus('/tmp/deck_storm_project');
+    client.send({
+      type: 'transport.list_models',
+      agentType: 'codex-sdk',
+      requestId: 'models-storm',
+    });
+
+    let messages = lastWs!.send.mock.calls.map((call) => JSON.parse(call[0] as string));
+    expect(messages).toEqual([
+      { type: 'terminal.subscribe', session: 'deck_storm_brain', raw: true },
+      {
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName: 'deck_storm_brain',
+        requestId: historyRequestId,
+        limit: 300,
+        afterTs: 999,
+      },
+      {
+        type: TIMELINE_MESSAGES.REPLAY_REQUEST,
+        sessionName: 'deck_storm_brain',
+        requestId: replayRequestId,
+        afterSeq: 42,
+        epoch: 7,
+      },
+    ]);
+
+    await vi.advanceTimersByTimeAsync(120);
+    messages = lastWs!.send.mock.calls.map((call) => JSON.parse(call[0] as string));
+    expect(messages).toContainEqual({ type: 'terminal.subscribe', session: 'deck_storm_brain', raw: true });
+    expect(messages.some((msg) => msg.type === 'fs.ls')).toBe(false);
+    expect(messages.some((msg) => msg.type === 'fs.git_status')).toBe(false);
+    expect(messages.some((msg) => msg.type === 'transport.list_models')).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(400);
+    messages = lastWs!.send.mock.calls.map((call) => JSON.parse(call[0] as string));
+    expect(messages).toContainEqual({
+      type: 'fs.ls',
+      path: '/tmp/deck_storm_project',
+      requestId: fsRequestId,
+      includeFiles: false,
+      includeMetadata: false,
+    });
+    expect(messages).toContainEqual({
+      type: 'fs.git_status',
+      path: '/tmp/deck_storm_project',
+      requestId: gitRequestId,
+    });
+    expect(messages).toContainEqual({
+      type: 'transport.list_models',
+      agentType: 'codex-sdk',
+      requestId: 'models-storm',
+    });
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  describe('repo helpers', () => {
+    it('sends checkout with session binding and force-capable branch/commit requests', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+
+      const checkoutId = client.repoCheckoutBranch('/repo/project', 'feature/a', { sessionId: 'deck_proj_brain' });
+      const branchesId = client.repoListBranches('/repo/project', { force: true });
+      const commitsId = client.repoListCommits('/repo/project', { branch: 'feature/a', page: 2, force: true });
+      const messages = lastWs!.send.mock.calls.map((call) => JSON.parse(call[0] as string));
+
+      expect(messages).toEqual([
+        {
+          type: REPO_MSG.CHECKOUT_BRANCH,
+          requestId: checkoutId,
+          projectDir: '/repo/project',
+          branch: 'feature/a',
+          sessionId: 'deck_proj_brain',
+        },
+        {
+          type: REPO_MSG.LIST_BRANCHES,
+          requestId: branchesId,
+          projectDir: '/repo/project',
+          force: true,
+        },
+        {
+          type: REPO_MSG.LIST_COMMITS,
+          requestId: commitsId,
+          projectDir: '/repo/project',
+          branch: 'feature/a',
+          page: 2,
+          force: true,
+        },
+      ]);
+      client.disconnect();
+    });
+  });
+
+  describe('P2P workflow helpers', () => {
+    it('p2pStatus sends a request-scoped status payload without runId', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+
+      const requestId = client.p2pStatus();
+      const msg = JSON.parse(lastWs!.send.mock.calls[0][0] as string);
+
+      expect(isP2pWorkflowRequestId(requestId)).toBe(true);
+      expect(msg).toEqual({
+        type: P2P_WORKFLOW_MSG.STATUS,
+        requestId,
+      });
+      client.disconnect();
+    });
+
+    it('p2pStatus includes runId when provided', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+
+      const requestId = client.p2pStatus('run-123', { sessionName: 'deck_proj_brain' });
+      const msg = JSON.parse(lastWs!.send.mock.calls[0][0] as string);
+
+      expect(isP2pWorkflowRequestId(requestId)).toBe(true);
+      expect(msg).toEqual({
+        type: P2P_WORKFLOW_MSG.STATUS,
+        requestId,
+        runId: 'run-123',
+        sessionName: 'deck_proj_brain',
+      });
+      client.disconnect();
+    });
+
+    it('p2pListDiscussions sends a request-scoped list payload', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+
+      client.subscribeTerminal('deck_proj_brain', false);
+      lastWs!.send.mockClear();
+      const requestId = client.p2pListDiscussions({ projectDir: '/repo/project' });
+      const msg = JSON.parse(lastWs!.send.mock.calls[0][0] as string);
+
+      expect(isP2pWorkflowRequestId(requestId)).toBe(true);
+      expect(msg).toEqual({
+        type: P2P_WORKFLOW_MSG.LIST_DISCUSSIONS,
+        requestId,
+        sessionName: 'deck_proj_brain',
+        projectDir: '/repo/project',
+      });
+      client.disconnect();
+    });
+
+    it('p2pReadDiscussion sends a request-scoped read payload', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+
+      client.setP2pWorkflowRequestScope({ sessionName: 'deck_proj_w1', cwd: '/repo/project' });
+      const requestId = client.p2pReadDiscussion('discussion-1');
+      const msg = JSON.parse(lastWs!.send.mock.calls[0][0] as string);
+
+      expect(isP2pWorkflowRequestId(requestId)).toBe(true);
+      expect(msg).toEqual({
+        type: P2P_WORKFLOW_MSG.READ_DISCUSSION,
+        requestId,
+        id: 'discussion-1',
+        sessionName: 'deck_proj_w1',
+        cwd: '/repo/project',
+      });
+      client.disconnect();
+    });
+
+    it('cleans pending P2P workflow requests on response, timeout, and disconnect', async () => {
+      const client = await connectClient();
+      vi.useFakeTimers();
+      lastWs!.send.mockClear();
+
+      const listRequestId = client.p2pListDiscussions();
+      expect((client as any).p2pWorkflowPendingRequests.has(listRequestId)).toBe(true);
+      lastWs!.emit('message', {
+        data: JSON.stringify({
+          type: P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE,
+          requestId: listRequestId,
+          discussions: [],
+        }),
+      });
+      expect((client as any).p2pWorkflowPendingRequests.has(listRequestId)).toBe(false);
+
+      const statusRequestId = client.p2pStatus();
+      expect((client as any).p2pWorkflowPendingRequests.has(statusRequestId)).toBe(true);
+      vi.advanceTimersByTime(30_000);
+      expect((client as any).p2pWorkflowPendingRequests.has(statusRequestId)).toBe(false);
+
+      const readRequestId = client.p2pReadDiscussion('discussion-1');
+      expect((client as any).p2pWorkflowPendingRequests.has(readRequestId)).toBe(true);
+      client.disconnect();
+      expect((client as any).p2pWorkflowPendingRequests.size).toBe(0);
+    });
+  });
+
+  // ── daemon.disconnected / daemon.reconnected dispatch ──────────────────
+
+  describe('daemon lifecycle messages', () => {
+    async function connectClient(): Promise<WsClient> {
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await flushAsync();
+      lastWs!.emit('open');
+      return client;
+    }
+
+    it('dispatches daemon.disconnected to handlers', async () => {
+      const client = await connectClient();
+      const handler = vi.fn();
+      client.onMessage(handler);
+      handler.mockClear();
+
+      lastWs!.emit('message', { data: JSON.stringify({ type: DAEMON_MSG.DISCONNECTED }) });
+      expect(handler).toHaveBeenCalledWith({ type: DAEMON_MSG.DISCONNECTED });
+      client.disconnect();
+    });
+
+    it('dispatches daemon.reconnected to handlers', async () => {
+      const client = await connectClient();
+      const handler = vi.fn();
+      client.onMessage(handler);
+      handler.mockClear();
+
+      lastWs!.emit('message', { data: JSON.stringify({ type: DAEMON_MSG.RECONNECTED }) });
+      expect(handler).toHaveBeenCalledWith({ type: DAEMON_MSG.RECONNECTED });
+      client.disconnect();
+    });
+
+    it('stays connected (browser WS alive) even when daemon.disconnected arrives', async () => {
+      const client = await connectClient();
+      lastWs!.emit('message', { data: JSON.stringify({ type: DAEMON_MSG.DISCONNECTED }) });
+      // The browser WebSocket should still be connected
+      expect(client.connected).toBe(true);
+      client.disconnect();
+    });
+
+    it('dispatches daemon.upgrade_blocked to handlers', async () => {
+      const client = await connectClient();
+      const handler = vi.fn();
+      client.onMessage(handler);
+      handler.mockClear();
+
+      lastWs!.emit('message', { data: JSON.stringify({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: 'p2p_active', activeRunIds: ['run_1'] }) });
+      expect(handler).toHaveBeenCalledWith({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: 'p2p_active', activeRunIds: ['run_1'] });
+      client.disconnect();
+    });
+
+    it('dispatches daemon.upgrade_blocked transport_busy to handlers', async () => {
+      const client = await connectClient();
+      const handler = vi.fn();
+      client.onMessage(handler);
+      handler.mockClear();
+
+      lastWs!.emit('message', { data: JSON.stringify({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: 'transport_busy', activeSessionNames: ['deck_proj_brain'] }) });
+      expect(handler).toHaveBeenCalledWith({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: 'transport_busy', activeSessionNames: ['deck_proj_brain'] });
+      client.disconnect();
+    });
+  });
+
+  // ── fsListDir ─────────────────────────────────────────────────────────
+
+  describe('fsListDir', () => {
+    async function connectClient(): Promise<WsClient> {
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await flushAsync();
+      lastWs!.emit('open');
+      return client;
+    }
+
+    it('sends fs.ls message with path and requestId', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      lastWs!.send.mockClear();
+      const requestId = client.fsListDir('/home/user/projects');
+      await vi.advanceTimersByTimeAsync(300);
+      expect(lastWs!.send).toHaveBeenCalled();
+      const msg = JSON.parse(lastWs!.send.mock.calls.at(-1)[0]);
+      expect(msg.type).toBe('fs.ls');
+      expect(msg.path).toBe('/home/user/projects');
+      expect(msg.requestId).toBe(requestId);
+      expect(msg.includeFiles).toBe(false);
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('sets includeFiles=true when requested', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      lastWs!.send.mockClear();
+      client.fsListDir('/home/user', true);
+      await vi.advanceTimersByTimeAsync(300);
+      const msg = JSON.parse(lastWs!.send.mock.calls.at(-1)[0]);
+      expect(msg.includeFiles).toBe(true);
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('can request OpenSpec task stats for directory listings', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      lastWs!.send.mockClear();
+      client.fsListDir('/repo/openspec/changes', false, false, { includeOpenSpecTaskStats: true });
+      await vi.advanceTimersByTimeAsync(300);
+      const msg = JSON.parse(lastWs!.send.mock.calls.at(-1)[0]);
+      expect(msg).toMatchObject({
+        type: 'fs.ls',
+        path: '/repo/openspec/changes',
+        includeFiles: false,
+        includeMetadata: false,
+        includeOpenSpecTaskStats: true,
+      });
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
+    it('returns a unique UUID as requestId', async () => {
+      const client = await connectClient();
+      const id1 = client.fsListDir('/home/user/a');
+      const id2 = client.fsListDir('/home/user/b');
+      expect(id1).not.toBe(id2);
+      expect(typeof id1).toBe('string');
+      client.disconnect();
+    });
+
+    it('fs.ls_response is dispatched to onMessage handlers', async () => {
+      const client = await connectClient();
+      const handler = vi.fn();
+      client.onMessage(handler);
+      const requestId = client.fsListDir('/home/user');
+      const responseMsg = {
+        type: 'fs.ls_response',
+        requestId,
+        path: '/home/user',
+        resolvedPath: '/home/user',
+        status: 'ok',
+        entries: [{ name: 'projects', isDir: true, hidden: false }],
+      };
+      lastWs!.emit('message', { data: JSON.stringify(responseMsg) });
+      expect(handler).toHaveBeenCalledWith(expect.objectContaining({ type: 'fs.ls_response', requestId }));
+      client.disconnect();
+    });
+  });
+
+  describe('fs rename/delete', () => {
+    it('includes the owning session when renaming', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+      const requestId = client.fsRename('/home/user/project/a.txt', '/home/user/project/b.txt', 'deck_proj_brain');
+      const msg = JSON.parse(lastWs!.send.mock.calls.at(-1)[0]);
+      expect(msg).toMatchObject({
+        type: FS_TRANSPORT_MSG.RENAME,
+        requestId,
+        path: '/home/user/project/a.txt',
+        newPath: '/home/user/project/b.txt',
+        sessionName: 'deck_proj_brain',
+      });
+      client.disconnect();
+    });
+
+    it('includes the owning session when deleting', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+      const requestId = client.fsDelete('/home/user/project/a.txt', 'deck_proj_brain');
+      const msg = JSON.parse(lastWs!.send.mock.calls.at(-1)[0]);
+      expect(msg).toMatchObject({
+        type: FS_TRANSPORT_MSG.DELETE,
+        requestId,
+        path: '/home/user/project/a.txt',
+        sessionName: 'deck_proj_brain',
+      });
+      client.disconnect();
+    });
+  });
+
+  describe('urgent send (stop / cancel high-priority path)', () => {
+    // Pins the user-reported "stop button stopped working again" regression.
+    // probeConnection() flips `_connected = false` for ~50-200 ms on every
+    // visibility/focus tick while it pings the server. During that window the
+    // regular `send()` is gated and drops the message (it no-ops rather than
+    // throwing — throwing crashed the ChatView), so a stop tap landing in that
+    // window would otherwise vanish.
+    // sendUrgent / sendSessionCommandUrgent bypass the probe gate (still
+    // checking the OS-level readyState). Caller HTTP-fallback handles the
+    // genuinely-dead-socket case.
+
+    it('sendUrgent succeeds when readyState is OPEN even if _connected=false', async () => {
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await flushAsync();
+      lastWs!.emit('open');
+      expect(client.connected).toBe(true);
+
+      const sentMessages: string[] = [];
+      const origSend = lastWs!.send.bind(lastWs);
+      lastWs!.send = (data: string) => { sentMessages.push(data); origSend(data); };
+
+      // Simulate the probe-state flip — _connected=false but socket still
+      // OPEN at the OS level (the exact regression window).
+      (client as unknown as { _connected: boolean })._connected = false;
+
+      // Regular send() is gated during the probe window — no delivery — but
+      // must NOT throw (an uncaught throw crashes the ChatView).
+      expect(() => client.send({ type: 'session.send', text: 'normal' })).not.toThrow();
+      expect(sentMessages).toHaveLength(0);
+
+      // sendUrgent goes through.
+      expect(() => client.sendUrgent({ type: 'session.send', text: '/stop' })).not.toThrow();
+      expect(sentMessages).toHaveLength(1);
+      expect(JSON.parse(sentMessages[0])).toEqual({ type: 'session.send', text: '/stop' });
+
+      client.disconnect();
+    });
+
+    it('sendUrgent still throws when the socket is genuinely closed', async () => {
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await flushAsync();
+      lastWs!.emit('open');
+      lastWs!.emit('close', { code: 1006, reason: 'lost' });
+      // Socket is gone; even urgent send must throw so the caller falls
+      // back to HTTP rather than silently dropping.
+      expect(() => client.sendUrgent({ type: 'session.send', text: '/stop' })).toThrow('WebSocket not connected');
+    });
+
+    it('sendSessionCommandUrgent maps cancel to session.cancel without /stop text', async () => {
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await flushAsync();
+      lastWs!.emit('open');
+
+      const sentMessages: string[] = [];
+      const origSend = lastWs!.send.bind(lastWs);
+      lastWs!.send = (data: string) => { sentMessages.push(data); origSend(data); };
+
+      (client as unknown as { _connected: boolean })._connected = false;
+      client.sendSessionCommandUrgent('cancel', { sessionName: 'deck_brain', commandId: 'cmd-1' });
+      expect(JSON.parse(sentMessages[0])).toEqual({
+        type: 'session.cancel',
+        sessionName: 'deck_brain',
+        commandId: 'cmd-1',
+      });
+
+      client.disconnect();
+    });
+  });
+
+  describe('eager probe on interaction (zombie-socket recovery)', () => {
+    const PING = JSON.stringify({ type: 'ping' });
+
+    it('probes the socket when subscribing after the liveness window lapses', async () => {
+      const client = await connectClient();
+      const events: Array<{ event?: string }> = [];
+      client.onMessage((m) => events.push(m as { event?: string }));
+      // Saw a pong long ago, socket still reports OPEN → classic zombie.
+      (client as unknown as { _lastPongAt: number })._lastPongAt = Date.now() - 20_000;
+      lastWs!.send.mockClear();
+
+      client.subscribeTerminal('deck_sub_zombie', false);
+
+      // A verification ping fires immediately instead of stalling until the
+      // heartbeat watchdog (~36s) or a manual tab switch.
+      expect(lastWs!.send).toHaveBeenCalledWith(PING);
+      // And it's surfaced as a soft "probing", not a hard disconnect.
+      expect(events.some((e) => e?.event === 'probing')).toBe(true);
+
+      client.disconnect();
+    });
+
+    it('does NOT probe when a recent pong already proved the socket alive', async () => {
+      const client = await connectClient();
+      const events: Array<{ event?: string }> = [];
+      client.onMessage((m) => events.push(m as { event?: string }));
+      (client as unknown as { _lastPongAt: number })._lastPongAt = Date.now(); // fresh
+      lastWs!.send.mockClear();
+
+      client.subscribeTerminal('deck_sub_healthy', false);
+
+      expect(lastWs!.send).not.toHaveBeenCalledWith(PING);
+      expect(events.some((e) => e?.event === 'probing')).toBe(false);
+
+      client.disconnect();
+    });
+
+    it('does NOT probe immediately after connect (no pong observed yet)', async () => {
+      const client = await connectClient(); // _lastPongAt is still 0
+      lastWs!.send.mockClear();
+
+      client.subscribeTerminal('deck_sub_fresh', false);
+
+      expect(lastWs!.send).not.toHaveBeenCalledWith(PING);
+
+      client.disconnect();
+    });
+
+    it('holdTerminalRaw also recovers a stalled socket', async () => {
+      const client = await connectClient();
+      (client as unknown as { _lastPongAt: number })._lastPongAt = Date.now() - 20_000;
+      lastWs!.send.mockClear();
+
+      const release = client.holdTerminalRaw('deck_sub_shell');
+      expect(lastWs!.send).toHaveBeenCalledWith(PING);
+      release();
+
+      client.disconnect();
+    });
+
+    it('sendTimelineHistoryRequest also recovers a stalled socket', async () => {
+      const client = await connectClient();
+      (client as unknown as { _lastPongAt: number })._lastPongAt = Date.now() - 20_000;
+      lastWs!.send.mockClear();
+
+      client.sendTimelineHistoryRequest('deck_sub_chat');
+      expect(lastWs!.send).toHaveBeenCalledWith(PING);
+
+      client.disconnect();
+    });
+
+    it('is a safe no-op when never connected', async () => {
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      expect(() => client.subscribeTerminal('s', false)).not.toThrow();
+      expect(lastWs).toBeNull();
+    });
+  });
+
+  describe('send() never throws on a disconnected socket (ChatView crash guard)', () => {
+    // Regression: send() is called from React effects / document listeners
+    // (focus/visibility → requestSessionList, discussionList). When the socket
+    // is momentarily down, an uncaught "WebSocket not connected" throw bubbled
+    // to the ErrorBoundary and crashed the whole ChatView.
+    it('does not throw when never connected', () => {
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      expect(client.connected).toBe(false);
+      expect(() => client.send({ type: 'get_sessions' })).not.toThrow();
+      expect(() => client.requestSessionList()).not.toThrow();
+      expect(() => client.discussionList()).not.toThrow();
+    });
+
+    it('does not throw after the socket closes', async () => {
+      const client = await connectClient();
+      expect(client.connected).toBe(true);
+      lastWs!.emit('close', { code: 1006 });
+      expect(client.connected).toBe(false);
+      expect(() => client.send({ type: 'get_sessions' })).not.toThrow();
+      expect(() => client.requestSessionList()).not.toThrow();
+      expect(() => client.discussionList()).not.toThrow();
+    });
+
+    it('still forwards to the socket while connected', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+      client.send({ type: 'get_sessions' });
+      expect(lastWs!.send).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(lastWs!.send.mock.calls[0]![0] as string)).toMatchObject({ type: 'get_sessions' });
+    });
+
+    it('sendUrgent() STILL throws when disconnected (preserves HTTP fallback)', () => {
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      expect(() => client.sendUrgent({ type: 'session.stop', sessionName: 's' })).toThrow(/not connected/i);
+    });
+  });
+
+  describe('codex reset credits', () => {
+    it('sends codex.reset_credits.list with the requestId', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+      client.listCodexResetCredits('req-1');
+      expect(JSON.parse(lastWs!.send.mock.calls[0]![0] as string)).toEqual({
+        type: 'codex.reset_credits.list',
+        requestId: 'req-1',
+      });
+    });
+
+    it('sends codex.reset_credits.consume with requestId + idempotencyKey', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+      client.consumeCodexResetCredit('req-2', 'idem-abc');
+      expect(JSON.parse(lastWs!.send.mock.calls[0]![0] as string)).toEqual({
+        type: 'codex.reset_credits.consume',
+        requestId: 'req-2',
+        idempotencyKey: 'idem-abc',
+      });
+    });
+
+    it('does not send consume without an idempotencyKey', async () => {
+      const client = await connectClient();
+      lastWs!.send.mockClear();
+      client.consumeCodexResetCredit('req-3', '');
+      expect(lastWs!.send).not.toHaveBeenCalled();
+    });
+  });
+});

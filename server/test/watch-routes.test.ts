@@ -1,0 +1,918 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { Hono } from 'hono';
+import type { Env } from '../src/env.js';
+import { IMCODES_POD_HEADER } from '../../shared/http-header-names.js';
+import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
+import { TIMELINE_DETAIL_FIELD_PATHS } from '../../shared/timeline-protocol.js';
+
+const mockResolveServerRole = vi.fn<() => Promise<string>>().mockResolvedValue('owner');
+const mockGetServersByUserId = vi.fn();
+const mockGetDbSessionsByServer = vi.fn();
+const mockGetSubSessionsByServer = vi.fn();
+const mockGetUserPref = vi.fn();
+const mockGetSessionTextTailCache = vi.fn();
+const mockReplaceSessionTextTailCache = vi.fn();
+const mockRequestTimelineHistory = vi.fn();
+const mockGetRecentText = vi.fn();
+const mockGetRecentTextForWatch = vi.fn();
+const mockGetActiveMainSessions = vi.fn();
+const mockHasReceivedActiveMainSessionSnapshot = vi.fn();
+const mockSendToDaemon = vi.fn();
+const mockGetPodIdentity = vi.fn(() => 'pod-a');
+const mockDbQueryOne = vi.fn();
+const mockResolveHttpShareAccess = vi.fn();
+
+vi.mock('../src/security/authorization.js', () => ({
+  requireAuth: () => async (c: { set: (key: string, value: string) => void }, next: () => Promise<void>) => {
+    c.set('userId', 'user-1');
+    c.set('role', 'member');
+    await next();
+  },
+  resolveServerRole: (...args: unknown[]) => mockResolveServerRole(...args as []),
+}));
+
+vi.mock('../src/db/queries.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/db/queries.js')>();
+  return {
+    ...actual,
+    getServersByUserId: (...args: unknown[]) => mockGetServersByUserId(...args),
+    getDbSessionsByServer: (...args: unknown[]) => mockGetDbSessionsByServer(...args),
+    getSubSessionsByServer: (...args: unknown[]) => mockGetSubSessionsByServer(...args),
+    getUserPref: (...args: unknown[]) => mockGetUserPref(...args),
+    getSessionTextTailCache: (...args: unknown[]) => mockGetSessionTextTailCache(...args),
+    replaceSessionTextTailCache: (...args: unknown[]) => mockReplaceSessionTextTailCache(...args),
+    getServerById: vi.fn(async () => ({ id: 'srv-1' })),
+  };
+});
+
+vi.mock('../src/ws/bridge.js', () => ({
+  WsBridge: {
+    get: () => ({
+      requestTimelineHistory: (...args: unknown[]) => mockRequestTimelineHistory(...args),
+      getRecentText: (...args: unknown[]) => mockGetRecentText(...args),
+      getRecentTextForWatch: (...args: unknown[]) => mockGetRecentTextForWatch(...args),
+      getActiveMainSessions: (...args: unknown[]) => mockGetActiveMainSessions(...args),
+      hasReceivedActiveMainSessionSnapshot: (...args: unknown[]) => mockHasReceivedActiveMainSessionSnapshot(...args),
+      sendToDaemon: (...args: unknown[]) => mockSendToDaemon(...args),
+    }),
+  },
+}));
+
+vi.mock('../src/util/pod-identity.js', () => ({
+  getPodIdentity: () => mockGetPodIdentity(),
+}));
+
+vi.mock('../src/routes/share-http-auth.js', () => ({
+  resolveHttpShareAccess: (...args: unknown[]) => mockResolveHttpShareAccess(...args),
+}));
+
+function makeEnv(): Env {
+  return {
+    DB: {
+      queryOne: (...args: unknown[]) => mockDbQueryOne(...args),
+    } as never,
+    JWT_SIGNING_KEY: 'test-signing-key-32chars-padding!!',
+    BOT_ENCRYPTION_KEY: 'abcdef0123456789'.repeat(2),
+    SERVER_URL: 'https://app.im.codes',
+    ALLOWED_ORIGINS: '',
+    TRUSTED_PROXIES: '',
+    BIND_HOST: '127.0.0.1',
+    PORT: '3000',
+    NODE_ENV: 'test',
+    GITHUB_CLIENT_ID: '',
+    GITHUB_CLIENT_SECRET: '',
+    DATABASE_URL: '',
+  } as Env;
+}
+
+async function buildTestApp() {
+  const { watchRoutes } = await import('../src/routes/watch.js');
+  const { sessionMgmtRoutes } = await import('../src/routes/session-mgmt.js');
+
+  const app = new Hono<{ Bindings: Env }>();
+  app.use('*', async (c, next) => {
+    if (!c.env) (c as unknown as { env: Env }).env = {} as Env;
+    Object.assign(c.env, makeEnv());
+    await next();
+  });
+  app.route('/api', watchRoutes);
+  app.route('/api/server', sessionMgmtRoutes);
+  return app;
+}
+
+describe('Watch routes', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetPodIdentity.mockReturnValue('pod-a');
+    mockResolveServerRole.mockResolvedValue('owner');
+    mockResolveHttpShareAccess.mockImplementation(async () => {
+      const role = await mockResolveServerRole();
+      return role === 'none'
+        ? { membership: 'none', actor: { kind: 'none' } }
+        : { membership: role, actor: { kind: 'server-member', effectiveActorRole: role === 'member' ? 'server-member' : 'server-manager' } };
+    });
+    mockGetServersByUserId.mockResolvedValue([]);
+    mockGetDbSessionsByServer.mockResolvedValue([]);
+    mockGetSubSessionsByServer.mockResolvedValue([]);
+    mockGetUserPref.mockResolvedValue(null);
+    mockGetSessionTextTailCache.mockResolvedValue([]);
+    mockReplaceSessionTextTailCache.mockResolvedValue(undefined);
+    mockGetRecentText.mockReturnValue([]);
+    mockGetRecentTextForWatch.mockResolvedValue([]);
+    mockGetActiveMainSessions.mockReturnValue([]);
+    mockHasReceivedActiveMainSessionSnapshot.mockReturnValue(false);
+    mockRequestTimelineHistory.mockResolvedValue({ epoch: 7, events: [] });
+    mockDbQueryOne.mockImplementation(async (sql: string, params: unknown[]) => {
+      if (sql.includes('FROM sessions')) {
+        return { exists: params[1] === 'deck_proj_brain' };
+      }
+      if (sql.includes('FROM sub_sessions')) {
+        return { exists: params[1] === 'abc123' };
+      }
+      return null;
+    });
+  });
+
+  it('GET /api/watch/servers returns visible servers with baseUrl', async () => {
+    mockGetServersByUserId.mockResolvedValue([
+      { id: 'srv-1', name: 'Alpha' },
+      { id: 'srv-2', name: 'Beta' },
+    ]);
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/watch/servers');
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      servers: [
+        { id: 'srv-1', name: 'Alpha', baseUrl: 'https://app.im.codes' },
+        { id: 'srv-2', name: 'Beta', baseUrl: 'https://app.im.codes' },
+      ],
+    });
+  });
+
+  it('GET /api/watch/sessions returns main and sub-session rows with recentText', async () => {
+    mockGetDbSessionsByServer.mockResolvedValue([
+      {
+        name: 'deck_proj_brain',
+        project_name: 'proj',
+        label: 'Main',
+        state: 'running',
+        agent_type: 'claude-code',
+      },
+    ]);
+    mockGetSubSessionsByServer.mockResolvedValue([
+      {
+        id: 'abc123',
+        type: 'codex',
+        label: 'Worker 1',
+        parent_session: 'deck_proj_brain',
+        closed_at: null,
+      },
+    ]);
+    mockGetRecentTextForWatch.mockImplementation(async (sessionName: string) => (
+      sessionName === 'deck_proj_brain'
+        ? [{ eventId: 'e1', type: 'assistant.text', text: 'latest assistant text', ts: 100 }]
+        : [{ eventId: 'e2', type: 'user.message', text: 'worker text', ts: 200 }]
+    ));
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/watch/sessions?serverId=srv-1');
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      serverId: 'srv-1',
+      sessions: [
+        {
+          serverId: 'srv-1',
+          sessionName: 'deck_proj_brain',
+          title: 'Main',
+          state: 'working',
+          agentBadge: 'cc',
+          isSubSession: false,
+          parentTitle: undefined,
+          parentSessionName: undefined,
+          isPinned: false,
+          previewText: 'latest assistant text',
+          previewUpdatedAt: 100,
+          recentText: [{ eventId: 'e1', type: 'assistant.text', text: 'latest assistant text', ts: 100 }],
+        },
+        {
+          serverId: 'srv-1',
+          sessionName: 'deck_sub_abc123',
+          title: 'Worker 1',
+          state: 'working',
+          agentBadge: 'cx',
+          isSubSession: true,
+          parentTitle: 'Main',
+          parentSessionName: 'deck_proj_brain',
+          isPinned: false,
+          previewText: 'worker text',
+          previewUpdatedAt: 200,
+          recentText: [{ eventId: 'e2', type: 'user.message', text: 'worker text', ts: 200 }],
+        },
+      ],
+    });
+  });
+
+  it('GET /api/watch/sessions prefers live active sessions, prunes stale DB rows, and orders pinned tabs first', async () => {
+    mockHasReceivedActiveMainSessionSnapshot.mockReturnValue(true);
+    mockGetActiveMainSessions.mockReturnValue([
+      { name: 'deck_proj_two', project: 'proj-two', state: 'idle', agentType: 'codex', label: 'Two' },
+      { name: 'deck_proj_one', project: 'proj-one', state: 'running', agentType: 'claude-code', label: 'One' },
+    ]);
+    mockGetDbSessionsByServer.mockResolvedValue([
+      { name: 'deck_proj_old', project_name: 'old', label: 'Old', state: 'idle', agent_type: 'codex' },
+    ]);
+    mockGetSubSessionsByServer.mockResolvedValue([
+      { id: 'sub-1', type: 'codex', label: 'Worker 1', parent_session: 'deck_proj_one', closed_at: null },
+      { id: 'sub-old', type: 'codex', label: 'Old Worker', parent_session: 'deck_proj_old', closed_at: null },
+    ]);
+    mockGetUserPref.mockImplementation(async (_db: unknown, _userId: string, key: string) => {
+      if (key === 'tab_order') return JSON.stringify({ v: ['deck_proj_one', 'deck_proj_two'], t: 1 });
+      if (key === 'tab_pinned') return JSON.stringify({ v: ['deck_proj_two'], t: 1 });
+      return null;
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/watch/sessions?serverId=srv-1');
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as { sessions: Array<{ sessionName: string; isPinned?: boolean; parentSessionName?: string | null }> };
+    expect(body.sessions.map((row) => row.sessionName)).toEqual([
+      'deck_proj_two',
+      'deck_proj_one',
+      'deck_sub_sub-1',
+    ]);
+    expect(body.sessions[0]?.isPinned).toBe(true);
+    expect(body.sessions[1]?.isPinned).toBe(false);
+    expect(body.sessions[2]?.parentSessionName).toBe('deck_proj_one');
+  });
+
+  it('GET /api/watch/sessions backfills recent text for list previews when hot cache is empty', async () => {
+    mockGetDbSessionsByServer.mockResolvedValue([
+      {
+        name: 'deck_proj_brain',
+        project_name: 'proj',
+        label: 'Main',
+        state: 'running',
+        agent_type: 'claude-code',
+      },
+    ]);
+    mockGetSubSessionsByServer.mockResolvedValue([]);
+    mockGetRecentTextForWatch.mockResolvedValue([
+      { eventId: 'e-latest', type: 'assistant.text', text: 'backfilled summary', ts: 123 },
+    ]);
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/watch/sessions?serverId=srv-1');
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as { sessions: Array<{ previewText?: string; recentText?: Array<{ text: string }> }> };
+    expect(body.sessions[0]?.previewText).toBe('backfilled summary');
+    expect(body.sessions[0]?.recentText?.[0]?.text).toBe('backfilled summary');
+    expect(mockGetRecentTextForWatch).toHaveBeenCalledWith('deck_proj_brain');
+  });
+
+  it('GET /api/server/:id/timeline/history preserves event identity and pagination metadata', async () => {
+    const events = [
+      { eventId: 'e-old', sessionId: 'deck_proj_brain', ts: 100, type: 'user.message', payload: { text: 'older' } },
+      { eventId: 'e-new', sessionId: 'deck_proj_brain', ts: 200, type: 'assistant.text', payload: { text: 'newer' } },
+    ];
+    const cursor = { epoch: 9, beforeTs: 100, direction: 'older' };
+    mockRequestTimelineHistory.mockResolvedValue({
+      epoch: 9,
+      events,
+      nextCursor: cursor,
+      actualPayloadBytes: expect.any(Number),
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/history?sessionName=deck_proj_brain&limit=2');
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get(IMCODES_POD_HEADER)).toBe('pod-a');
+    await expect(res.json()).resolves.toEqual({
+      sessionName: 'deck_proj_brain',
+      epoch: 9,
+      events,
+      actualPayloadBytes: expect.any(Number),
+      timelineCursor: cursor,
+      hasMore: true,
+      nextCursor: cursor,
+      earliestTs: 100,
+      legacyBeforeTs: 100,
+    });
+    expect(mockRequestTimelineHistory).toHaveBeenCalledWith(expect.objectContaining({
+      sessionName: 'deck_proj_brain',
+      limit: 2,
+      budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE,
+      abortSignal: expect.any(AbortSignal),
+    }));
+  });
+
+  it('GET /api/server/:id/timeline/history strips non-watch-safe payload fields instead of failing decode', async () => {
+    const sharedActor = {
+      actorUserId: 'user-shared',
+      actorDisplayName: 'Ada Shared',
+      effectiveActorRole: 'participant',
+      origin: 'shared-tab',
+      actionId: 'share-send-1',
+      authorizedAt: 1,
+      primaryShareId: 'share-1',
+      snapshot: {
+        target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        authorizedAt: 1,
+        primaryShareId: 'share-1',
+        coveringShareIds: ['share-1'],
+        nextCoverageRecheckAt: null,
+      },
+    };
+    mockRequestTimelineHistory.mockResolvedValue({
+      epoch: 9,
+      events: [
+        {
+          eventId: 'e-1',
+          sessionId: 'deck_proj_brain',
+          ts: 100,
+          type: 'assistant.text',
+          payload: { text: 'hello', nested: { complex: ['shape'] } },
+          source: 'daemon',
+        },
+        {
+          eventId: 'e-2',
+          sessionId: 'deck_proj_brain',
+          ts: 110,
+          type: 'user.message',
+          payload: { text: 'shared prompt', sharedActor, nested: { raw: 'dropped' } },
+        },
+        {
+          bad: 'row',
+        },
+      ],
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/history?sessionName=deck_proj_brain&limit=50');
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      sessionName: 'deck_proj_brain',
+      epoch: 9,
+      events: [
+        { eventId: 'e-1', sessionId: 'deck_proj_brain', ts: 100, type: 'assistant.text', payload: { text: 'hello' } },
+        { eventId: 'e-2', sessionId: 'deck_proj_brain', ts: 110, type: 'user.message', payload: { text: 'shared prompt', sharedActor } },
+      ],
+      actualPayloadBytes: expect.any(Number),
+      hasMore: false,
+      nextCursor: null,
+      earliestTs: 100,
+      legacyBeforeTs: null,
+    });
+  });
+
+  it('GET /api/server/:id/timeline/history enforces the final HTTP envelope budget', async () => {
+    mockRequestTimelineHistory.mockResolvedValue({
+      epoch: 9,
+      events: Array.from({ length: 8 }, (_, index) => ({
+        eventId: `e-${index}`,
+        sessionId: 'deck_proj_brain',
+        ts: 100 + index,
+        type: 'assistant.text',
+        payload: { text: `synthetic-${index}-${'x'.repeat(64 * 1024)}` },
+      })),
+      detailRefs: Array.from({ length: 8 }, (_, index) => ({
+        eventId: `e-${index}`,
+        fieldPath: TIMELINE_DETAIL_FIELD_PATHS.PAYLOAD_TEXT,
+        detailId: `detail-${index}`,
+      })),
+      hasMore: false,
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/history?sessionName=deck_proj_brain&limit=8');
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as { actualPayloadBytes: number; payloadTruncated?: boolean; events: Array<{ eventId: string }>; detailRefs?: Array<{ eventId: string }> };
+    expect(body.actualPayloadBytes).toBeLessThanOrEqual(TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE);
+    expect(body.payloadTruncated).toBe(true);
+    expect(body.events.length).toBeLessThan(8);
+    const eventIds = new Set(body.events.map((event) => event.eventId));
+    expect((body.detailRefs ?? []).every((ref) => eventIds.has(ref.eventId))).toBe(true);
+  });
+
+  it('GET /api/server/:id/timeline/history forwards beforeTs and reports no more history when the page is short', async () => {
+    const events = [
+      { eventId: 'e-1', sessionId: 'deck_proj_brain', ts: 90, type: 'assistant.text', payload: { text: 'only one' } },
+    ];
+    mockRequestTimelineHistory.mockResolvedValue({ epoch: 10, events });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/history?sessionName=deck_proj_brain&limit=50&beforeTs=200');
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get(IMCODES_POD_HEADER)).toBe('pod-a');
+    await expect(res.json()).resolves.toEqual({
+      sessionName: 'deck_proj_brain',
+      epoch: 10,
+      events,
+      actualPayloadBytes: expect.any(Number),
+      hasMore: false,
+      nextCursor: null,
+      earliestTs: 90,
+      legacyBeforeTs: null,
+    });
+    expect(mockRequestTimelineHistory).toHaveBeenCalledWith(expect.objectContaining({
+      sessionName: 'deck_proj_brain',
+      limit: 50,
+      budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE,
+      beforeTs: 200,
+      abortSignal: expect.any(AbortSignal),
+    }));
+  });
+
+  it('GET /api/server/:id/timeline/history preserves share-scoped history before invite time', async () => {
+    mockResolveServerRole.mockResolvedValue('none');
+    mockResolveHttpShareAccess.mockResolvedValue({
+      membership: 'none',
+      actor: {
+        kind: 'share',
+        effectiveActorRole: 'viewer',
+        coverage: {
+          target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+          effectiveRole: 'viewer',
+          historyCutoffAt: 1_000,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: ['share-1'],
+          primaryShareId: 'share-1',
+          authorizedAt: 2_000,
+        },
+      },
+    });
+    mockRequestTimelineHistory.mockResolvedValue({
+      epoch: 11,
+      events: [
+        { eventId: 'before-share', sessionId: 'deck_proj_brain', ts: 999, type: 'assistant.text', payload: { text: 'old' } },
+        { eventId: 'visible', sessionId: 'deck_proj_brain', ts: 1_001, type: 'assistant.text', payload: { text: 'new' } },
+      ],
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/history?sessionName=deck_proj_brain&afterTs=500');
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as { events: Array<{ eventId: string }> };
+    expect(body.events).toEqual([
+      { eventId: 'before-share', sessionId: 'deck_proj_brain', ts: 999, type: 'assistant.text', payload: { text: 'old' } },
+      { eventId: 'visible', sessionId: 'deck_proj_brain', ts: 1_001, type: 'assistant.text', payload: { text: 'new' } },
+    ]);
+    expect(mockRequestTimelineHistory).toHaveBeenCalledWith(expect.objectContaining({
+      sessionName: 'deck_proj_brain',
+      afterTs: 500,
+    }));
+  });
+
+  it('GET /api/server/:id/timeline/history returns 503 when daemon is offline', async () => {
+    mockRequestTimelineHistory.mockRejectedValue(new Error('daemon_offline'));
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/history?sessionName=deck_proj_brain');
+    expect(res.status).toBe(503);
+    await expect(res.json()).resolves.toEqual({ error: 'daemon_offline' });
+  });
+
+  it('GET /api/server/:id/timeline/history/full preserves structured cursor and payload metadata', async () => {
+    const cursor = { epoch: 11, beforeTs: 500, direction: 'older' };
+    const events = [
+      { eventId: 'e-full', sessionId: 'deck_proj_brain', ts: 500, type: 'tool.result', payload: { output: 'full shape' } },
+    ];
+    mockRequestTimelineHistory.mockResolvedValue({
+      epoch: 11,
+      events,
+      hasMore: true,
+      nextCursor: cursor,
+      actualPayloadBytes: expect.any(Number),
+      payloadBytes: 400,
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&limit=1');
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      sessionName: 'deck_proj_brain',
+      epoch: 11,
+      events,
+      payloadBytes: 400,
+      actualPayloadBytes: expect.any(Number),
+      timelineCursor: cursor,
+      hasMore: true,
+      nextCursor: cursor,
+      earliestTs: 500,
+      legacyBeforeTs: 500,
+    });
+    expect(mockRequestTimelineHistory).toHaveBeenCalledWith(expect.objectContaining({
+      sessionName: 'deck_proj_brain',
+      limit: 1,
+      budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL,
+      includeDetails: true,
+      abortSignal: expect.any(AbortSignal),
+    }));
+  });
+
+  it('GET /api/server/:id/timeline/history/full preserves share-scoped full history and detail refs before invite time', async () => {
+    mockResolveServerRole.mockResolvedValue('none');
+    mockResolveHttpShareAccess.mockResolvedValue({
+      membership: 'none',
+      actor: {
+        kind: 'share',
+        effectiveActorRole: 'viewer',
+        coverage: {
+          target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+          effectiveRole: 'viewer',
+          historyCutoffAt: 1_000,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: ['share-1'],
+          primaryShareId: 'share-1',
+          authorizedAt: 2_000,
+        },
+      },
+    });
+    mockRequestTimelineHistory.mockResolvedValue({
+      epoch: 12,
+      events: [
+        { eventId: 'before-share', sessionId: 'deck_proj_brain', ts: 999, type: 'tool.result', payload: { output: 'old secret' } },
+        { eventId: 'visible', sessionId: 'deck_proj_brain', ts: 1_001, type: 'tool.result', payload: { output: 'visible' } },
+      ],
+      detailRefs: [
+        { eventId: 'before-share', fieldPath: TIMELINE_DETAIL_FIELD_PATHS.PAYLOAD_TEXT, detailId: 'detail-before-share' },
+        { eventId: 'visible', fieldPath: TIMELINE_DETAIL_FIELD_PATHS.PAYLOAD_TEXT, detailId: 'detail-visible' },
+      ],
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&afterTs=500');
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as { events: Array<{ eventId: string }>; detailRefs?: Array<{ eventId: string }> };
+    expect(body.events).toEqual([
+      { eventId: 'before-share', sessionId: 'deck_proj_brain', ts: 999, type: 'tool.result', payload: { output: 'old secret' } },
+      { eventId: 'visible', sessionId: 'deck_proj_brain', ts: 1_001, type: 'tool.result', payload: { output: 'visible' } },
+    ]);
+    expect(body.detailRefs).toEqual([
+      { eventId: 'before-share', fieldPath: TIMELINE_DETAIL_FIELD_PATHS.PAYLOAD_TEXT, detailId: 'detail-before-share' },
+      { eventId: 'visible', fieldPath: TIMELINE_DETAIL_FIELD_PATHS.PAYLOAD_TEXT, detailId: 'detail-visible' },
+    ]);
+    expect(mockRequestTimelineHistory).toHaveBeenCalledWith(expect.objectContaining({
+      sessionName: 'deck_proj_brain',
+      afterTs: 500,
+      includeDetails: true,
+    }));
+  });
+
+  it('GET /api/server/:id/timeline/history/full enforces the final HTTP explicit-page budget', async () => {
+    mockRequestTimelineHistory.mockResolvedValue({
+      epoch: 11,
+      events: Array.from({ length: 5 }, (_, index) => ({
+        eventId: `full-${index}`,
+        sessionId: 'deck_proj_brain',
+        ts: 500 + index,
+        type: 'tool.result',
+        payload: { output: `synthetic-full-${index}-${'y'.repeat(320 * 1024)}` },
+      })),
+      hasMore: false,
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&limit=5');
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as { actualPayloadBytes: number; payloadTruncated?: boolean; events: unknown[] };
+    expect(body.actualPayloadBytes).toBeLessThanOrEqual(TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL);
+    expect(body.payloadTruncated).toBe(true);
+    expect(body.events.length).toBeLessThan(5);
+  });
+
+  it('timeline HTTP routes reject sessions not owned by the current server before daemon/cache work', async () => {
+    mockDbQueryOne.mockResolvedValue(null);
+    const app = await buildTestApp();
+
+    const historyRes = await app.request('/api/server/srv-1/timeline/history?sessionName=deck_other_brain');
+    const fullRes = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_other_brain');
+    const tailRes = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_other_brain');
+
+    expect(historyRes.status).toBe(403);
+    expect(fullRes.status).toBe(403);
+    expect(tailRes.status).toBe(403);
+    expect(mockRequestTimelineHistory).not.toHaveBeenCalled();
+    expect(mockGetSessionTextTailCache).not.toHaveBeenCalled();
+  });
+
+  it('GET /api/server/:id/timeline/text-tail returns cached entries', async () => {
+    mockGetSessionTextTailCache.mockResolvedValue([
+      { eventId: 'e1', ts: 100, type: 'user.message', text: 'hi' },
+      { eventId: 'e2', ts: 200, type: 'assistant.text', text: 'hello', source: 'daemon', confidence: 'high' },
+    ]);
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_proj_brain');
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get(IMCODES_POD_HEADER)).toBe('pod-a');
+    await expect(res.json()).resolves.toEqual({
+      sessionName: 'deck_proj_brain',
+      events: [
+        { eventId: 'e1', ts: 100, type: 'user.message', text: 'hi' },
+        { eventId: 'e2', ts: 200, type: 'assistant.text', text: 'hello', source: 'daemon', confidence: 'high' },
+      ],
+      actualPayloadBytes: expect.any(Number),
+      textTailTruncated: false,
+    });
+  });
+
+  it('GET /api/server/:id/timeline/text-tail preserves cached and backfilled text before invite time', async () => {
+    mockResolveServerRole.mockResolvedValue('none');
+    mockResolveHttpShareAccess.mockResolvedValue({
+      membership: 'none',
+      actor: {
+        kind: 'share',
+        effectiveActorRole: 'viewer',
+        coverage: {
+          target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_proj_brain' },
+          effectiveRole: 'viewer',
+          historyCutoffAt: 1_000,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: ['share-1'],
+          primaryShareId: 'share-1',
+          authorizedAt: 2_000,
+        },
+      },
+    });
+    mockGetSessionTextTailCache.mockResolvedValue([
+      { eventId: 'cached-old', ts: 999, type: 'assistant.text', text: 'old cached secret' },
+      { eventId: 'cached-visible', ts: 1_001, type: 'assistant.text', text: 'cached visible' },
+    ]);
+    mockRequestTimelineHistory.mockResolvedValue({
+      epoch: 1,
+      events: [
+        { eventId: 'backfill-old', sessionId: 'deck_proj_brain', ts: 990, type: 'user.message', payload: { text: 'old backfill secret' } },
+        { eventId: 'backfill-visible', sessionId: 'deck_proj_brain', ts: 1_010, type: 'assistant.text', payload: { text: 'backfill visible' } },
+      ],
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_proj_brain');
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      sessionName: 'deck_proj_brain',
+      events: [
+        { eventId: 'backfill-old', ts: 990, type: 'user.message', text: 'old backfill secret' },
+        { eventId: 'cached-old', ts: 999, type: 'assistant.text', text: 'old cached secret' },
+        { eventId: 'cached-visible', ts: 1_001, type: 'assistant.text', text: 'cached visible' },
+        { eventId: 'backfill-visible', ts: 1_010, type: 'assistant.text', text: 'backfill visible' },
+      ],
+      actualPayloadBytes: expect.any(Number),
+      textTailTruncated: false,
+    });
+    expect(mockReplaceSessionTextTailCache).toHaveBeenCalledWith(expect.anything(), 'srv-1', 'deck_proj_brain', [
+      { eventId: 'backfill-old', ts: 990, type: 'user.message', text: 'old backfill secret' },
+      { eventId: 'cached-old', ts: 999, type: 'assistant.text', text: 'old cached secret' },
+      { eventId: 'cached-visible', ts: 1_001, type: 'assistant.text', text: 'cached visible' },
+      { eventId: 'backfill-visible', ts: 1_010, type: 'assistant.text', text: 'backfill visible' },
+    ]);
+  });
+
+  it('GET /api/server/:id/timeline/text-tail backfills missing recent text from daemon history and rewrites cache', async () => {
+    mockGetSessionTextTailCache.mockResolvedValue([
+      { eventId: 'e-old', ts: 100, type: 'user.message', text: 'old cached' },
+    ]);
+    mockRequestTimelineHistory.mockResolvedValue({
+      epoch: 1,
+      events: [
+        { eventId: 'e-old', sessionId: 'deck_proj_brain', ts: 100, type: 'user.message', payload: { text: 'old cached' } },
+        { eventId: 'e-new', sessionId: 'deck_proj_brain', ts: 200, type: 'assistant.text', payload: { text: 'new live text' } },
+        { eventId: 'e-stream', sessionId: 'deck_proj_brain', ts: 210, type: 'assistant.text', payload: { text: 'ignore me', streaming: true } },
+      ],
+    });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_proj_brain');
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      sessionName: 'deck_proj_brain',
+      events: [
+        { eventId: 'e-old', ts: 100, type: 'user.message', text: 'old cached' },
+        { eventId: 'e-new', ts: 200, type: 'assistant.text', text: 'new live text' },
+      ],
+      actualPayloadBytes: expect.any(Number),
+      textTailTruncated: false,
+    });
+    expect(mockReplaceSessionTextTailCache).toHaveBeenCalledWith(
+      expect.anything(),
+      'srv-1',
+      'deck_proj_brain',
+      [
+        { eventId: 'e-old', ts: 100, type: 'user.message', text: 'old cached' },
+        { eventId: 'e-new', ts: 200, type: 'assistant.text', text: 'new live text' },
+      ],
+    );
+  });
+
+  it('GET /api/server/:id/timeline/text-tail paginates daemon history until it collects 50 recent text events', async () => {
+    mockGetSessionTextTailCache.mockResolvedValue([]);
+
+    const pageOne = Array.from({ length: 500 }, (_, index) => {
+      const ts = 1000 + index;
+      if (index >= 475) {
+        return {
+          eventId: `text-${index - 475}`,
+          sessionId: 'deck_proj_brain',
+          ts,
+          type: index % 2 === 0 ? 'user.message' : 'assistant.text',
+          payload: { text: `page-one-${index - 475}` },
+        };
+      }
+      return {
+        eventId: `tool-${index}`,
+        sessionId: 'deck_proj_brain',
+        ts,
+        type: 'tool.result',
+        payload: { output: `tool-${index}` },
+      };
+    });
+    const pageTwo = Array.from({ length: 500 }, (_, index) => {
+      const ts = 500 + index;
+      if (index >= 470) {
+        return {
+          eventId: `older-${index - 470}`,
+          sessionId: 'deck_proj_brain',
+          ts,
+          type: index % 2 === 0 ? 'assistant.text' : 'user.message',
+          payload: { text: `page-two-${index - 470}` },
+        };
+      }
+      return {
+        eventId: `state-${index}`,
+        sessionId: 'deck_proj_brain',
+        ts,
+        type: 'session.state',
+        payload: { state: 'idle' },
+      };
+    });
+
+    mockRequestTimelineHistory
+      .mockResolvedValueOnce({ epoch: 1, events: pageOne })
+      .mockResolvedValueOnce({ epoch: 1, events: pageTwo });
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_proj_brain');
+
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.sessionName).toBe('deck_proj_brain');
+    expect(body.events).toHaveLength(50);
+    expect(body.events[0]).toEqual({ eventId: 'older-5', ts: 975, type: 'user.message', text: 'page-two-5' });
+    expect(body.events.at(-1)).toEqual({ eventId: 'text-24', ts: 1499, type: 'assistant.text', text: 'page-one-24' });
+    expect(mockRequestTimelineHistory).toHaveBeenCalledTimes(2);
+    expect(mockRequestTimelineHistory).toHaveBeenNthCalledWith(1, {
+      sessionName: 'deck_proj_brain',
+      limit: 500,
+      timeoutMs: 1500,
+      budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE,
+    });
+    expect(mockRequestTimelineHistory).toHaveBeenNthCalledWith(2, {
+      sessionName: 'deck_proj_brain',
+      limit: 500,
+      timeoutMs: 1500,
+      budgetBytes: TIMELINE_PAYLOAD_BUDGET_BYTES.DEFAULT_ENVELOPE,
+      beforeTs: 1001,
+    });
+    expect(mockReplaceSessionTextTailCache).toHaveBeenCalledWith(
+      expect.anything(),
+      'srv-1',
+      'deck_proj_brain',
+      expect.arrayContaining([
+        { eventId: 'older-25', ts: 995, type: 'user.message', text: 'page-two-25' },
+        { eventId: 'text-24', ts: 1499, type: 'assistant.text', text: 'page-one-24' },
+      ]),
+    );
+  });
+
+  it('GET /api/server/:id/timeline/text-tail returns empty list when no cache exists', async () => {
+    mockGetSessionTextTailCache.mockResolvedValue([]);
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_proj_brain');
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      sessionName: 'deck_proj_brain',
+      events: [],
+      actualPayloadBytes: expect.any(Number),
+      textTailTruncated: false,
+    });
+  });
+
+  it('GET /api/server/:id/timeline/text-tail isolates cache read failures', async () => {
+    mockGetSessionTextTailCache.mockRejectedValue(new Error('db down'));
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_proj_brain');
+
+    expect(res.status).toBe(500);
+    await expect(res.json()).resolves.toEqual({ error: 'cache_read_failed' });
+  });
+
+  it('GET /api/server/:id/timeline/text-tail falls back to cached entries when daemon history backfill fails', async () => {
+    mockGetSessionTextTailCache.mockResolvedValue([
+      { eventId: 'e1', ts: 100, type: 'user.message', text: 'cached only' },
+    ]);
+    mockRequestTimelineHistory.mockRejectedValue(new Error('daemon_offline'));
+
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_proj_brain');
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({
+      sessionName: 'deck_proj_brain',
+      events: [{ eventId: 'e1', ts: 100, type: 'user.message', text: 'cached only' }],
+      actualPayloadBytes: expect.any(Number),
+      textTailTruncated: false,
+    });
+    expect(mockReplaceSessionTextTailCache).not.toHaveBeenCalled();
+  });
+
+  it('watch routes return 403 when the user has no access to the server', async () => {
+    mockResolveServerRole.mockResolvedValue('none');
+    const app = await buildTestApp();
+
+    const sessionsRes = await app.request('/api/watch/sessions?serverId=srv-1');
+    const historyRes = await app.request('/api/server/srv-1/timeline/history?sessionName=deck_proj_brain');
+    const tailRes = await app.request('/api/server/srv-1/timeline/text-tail?sessionName=deck_proj_brain');
+    const sendRes = await app.request('/api/server/srv-1/session/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionName: 'deck_proj_brain', text: 'hello' }),
+    });
+
+    expect(sessionsRes.status).toBe(403);
+    await expect(sessionsRes.json()).resolves.toEqual({ error: 'forbidden' });
+
+    expect(historyRes.status).toBe(403);
+    await expect(historyRes.json()).resolves.toEqual({ error: 'forbidden' });
+
+    expect(tailRes.status).toBe(403);
+    await expect(tailRes.json()).resolves.toEqual({ error: 'forbidden' });
+
+    expect(sendRes.status).toBe(403);
+    await expect(sendRes.json()).resolves.toEqual({
+      error: 'forbidden',
+      reason: 'not_authorized_for_server',
+    });
+  });
+
+  it('GET /api/server/:id/timeline/history returns 504 when relay times out', async () => {
+    mockRequestTimelineHistory.mockRejectedValue(new Error('timeout'));
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/history?sessionName=deck_proj_brain');
+    expect(res.status).toBe(504);
+    await expect(res.json()).resolves.toEqual({ error: 'timeline_timeout' });
+  });
+
+  it('POST /api/server/:id/session/send keeps commandId passthrough', async () => {
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/session/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionName: 'deck_proj_brain', text: 'hello', commandId: 'cmd-1' }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get(IMCODES_POD_HEADER)).toBe('pod-a');
+    expect(mockSendToDaemon).toHaveBeenCalledWith(JSON.stringify({
+      type: 'session.send',
+      sessionName: 'deck_proj_brain',
+      text: 'hello',
+      commandId: 'cmd-1',
+    }));
+  });
+
+  it('live send/history routes expose the same pod identity header', async () => {
+    mockRequestTimelineHistory.mockResolvedValue({ epoch: 9, events: [] });
+    const app = await buildTestApp();
+    const historyRes = await app.request('/api/server/srv-1/timeline/history?sessionName=deck_proj_brain');
+    const sendRes = await app.request('/api/server/srv-1/session/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionName: 'deck_proj_brain', text: 'smoke', commandId: 'cmd-2' }),
+    });
+
+    expect(historyRes.status).toBe(200);
+    expect(sendRes.status).toBe(200);
+    expect(historyRes.headers.get(IMCODES_POD_HEADER)).toBe('pod-a');
+    expect(sendRes.headers.get(IMCODES_POD_HEADER)).toBe('pod-a');
+  });
+});

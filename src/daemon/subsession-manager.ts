@@ -1,0 +1,612 @@
+/**
+ * Sub-session manager — creates/stops/rebuilds tmux sessions for sub-sessions.
+ */
+
+import { newSession, killSession, sessionExists } from '../agent/tmux.js';
+import { getDriver, getTransportRuntime, launchTransportSession, stopTransportRuntimeSession } from '../agent/session-manager.js';
+import type { AgentType } from '../agent/detect.js';
+import { isTransportAgent } from '../agent/detect.js';
+import { timelineStore } from './timeline-store.js';
+import { timelineEmitter } from './timeline-emitter.js';
+import { upsertSession, getSession, removeSession, type SessionRecord } from '../store/session-store.js';
+import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
+import { existsSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { resolveStructuredSessionBootstrap } from '../agent/structured-session-bootstrap.js';
+import type { TransportEffortLevel } from '../../shared/effort-levels.js';
+
+import logger from '../util/logger.js';
+import { getAgentVersion } from '../agent/agent-version.js';
+import { closeSingleSession, type CloseFailure, type CloseTreeResult } from '../agent/session-close.js';
+import { emitSessionInlineError } from './session-error.js';
+
+export interface SubSessionRecord {
+  id: string;
+  type: string;
+  shellBin?: string | null;
+  cwd?: string | null;
+  label?: string | null;
+  ccSessionId?: string | null;
+  codexSessionId?: string | null;
+  codexModel?: string | null;
+  geminiSessionId?: string | null;
+  opencodeSessionId?: string | null;
+  runtimeType?: 'process' | 'transport' | null;
+  providerId?: string | null;
+  providerSessionId?: string | null;
+  requestedModel?: string | null;
+  activeModel?: string | null;
+  /** Qwen model ID — threaded into launchTransportSession so the Qwen family
+   *  doesn't fall back to its OAuth default when a clone/restore record only
+   *  carries qwenModel. */
+  qwenModel?: string | null;
+  transportConfig?: Record<string, unknown> | null;
+  parentSession?: string | null;
+  /** CC env preset name (e.g. "MiniMax", "DeepSeek"). Resolves to env vars at launch. */
+  ccPreset?: string | null;
+  /** Extra init prompt injected after session starts. */
+  ccInitPrompt?: string | null;
+  /** Session description/persona — injected as background info on start and respawn. */
+  description?: string | null;
+  effort?: TransportEffortLevel;
+  fresh?: boolean;
+  _fileSnapshot?: Set<string>;
+  _onGeminiDiscovered?: (sessionId: string) => void;
+}
+
+export function subSessionName(id: string): string { return `deck_sub_${id}`; }
+
+function parentProjectName(sub: SubSessionRecord, fallbackSessionName: string): string {
+  const parentName = typeof sub.parentSession === 'string' && sub.parentSession.trim()
+    ? sub.parentSession.trim()
+    : undefined;
+  const parent = parentName ? getSession(parentName) : undefined;
+  return parent?.projectName ?? parentName ?? fallbackSessionName;
+}
+
+export function normalizeShellBinForHost(shellBin?: string | null): string | undefined {
+  if (!shellBin) return undefined;
+
+  if (process.platform === 'win32') {
+    // On Windows accept bare commands (pwsh.exe, cmd.exe) and existing paths.
+    if (!/[\\/]/.test(shellBin)) return shellBin;
+    return existsSync(shellBin) ? shellBin : undefined;
+  }
+
+  // Unix/macOS: never try to execute Windows-style paths or .exe binaries.
+  if (/^[a-zA-Z]:[\\/]/.test(shellBin)) return undefined;
+  if (shellBin.includes('\\')) return undefined;
+  if (/\.exe$/i.test(shellBin)) return undefined;
+
+  // Absolute/relative unix path: keep only if it exists locally.
+  if (shellBin.includes('/')) {
+    return existsSync(shellBin) ? shellBin : undefined;
+  }
+
+  // Bare command name (fish, zsh, bash, pwsh, etc.) is allowed.
+  return shellBin;
+}
+
+export async function startSubSession(sub: SubSessionRecord): Promise<void> {
+  const sessionName = subSessionName(sub.id);
+  const agentType = sub.type as AgentType;
+  const projectName = parentProjectName(sub, sessionName);
+
+  // Provider-family-independent forced-fresh flag. When a record explicitly
+  // requests `fresh:true` (e.g. an execution clone), the launch path MUST start
+  // a brand-new provider/CLI session and MUST NOT carry any stored runtime
+  // identity (provider/CLI session ids, resume tokens, bind keys) for ANY
+  // provider family. This is computed once and gates both the transport and
+  // process branches below.
+  const forceFresh = sub.fresh === true;
+
+  if (isTransportAgent(agentType)) {
+    if (await getTransportRuntime(sessionName)) return;
+    if (forceFresh) {
+      // Forced fresh: never bind/resume an existing provider session. No
+      // identity ids reach the launch layer for any transport family (qwen,
+      // cursor-headless, copilot-sdk, gemini-sdk, openclaw, *-sdk). A brand-new
+      // provider session is created (skipCreate:false), and claude-code-sdk
+      // still needs a freshly generated ccSessionId.
+      await launchTransportSession({
+        name: sessionName,
+        projectName,
+        role: 'w1',
+        agentType,
+        projectDir: sub.cwd ?? process.cwd(),
+        label: sub.label ?? undefined,
+        description: sub.description ?? undefined,
+        requestedModel: sub.requestedModel ?? undefined,
+        qwenModel: sub.qwenModel ?? undefined,
+        transportConfig: sub.transportConfig ?? undefined,
+        skipCreate: false,
+        fresh: true,
+        ...(agentType === 'claude-code-sdk' ? { ccSessionId: randomUUID() } : {}),
+        ...(sub.effort ? { effort: sub.effort } : {}),
+        ...(sub.ccPreset ? { ccPreset: sub.ccPreset } : {}),
+        userCreated: true,
+        parentSession: sub.parentSession ?? undefined,
+      });
+      return;
+    }
+    await launchTransportSession({
+      name: sessionName,
+      projectName,
+      role: 'w1',
+      agentType,
+      projectDir: sub.cwd ?? process.cwd(),
+      label: sub.label ?? undefined,
+      description: sub.description ?? undefined,
+      requestedModel: sub.requestedModel ?? undefined,
+      qwenModel: sub.qwenModel ?? undefined,
+      transportConfig: sub.transportConfig ?? undefined,
+      bindExistingKey: sub.providerSessionId ?? undefined,
+      skipCreate: !!sub.providerSessionId,
+      ...(sub.providerSessionId ? { ccSessionId: sub.ccSessionId ?? undefined, codexSessionId: sub.codexSessionId ?? undefined, fresh: sub.fresh } : {}),
+      ...(!sub.providerSessionId && agentType === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
+      ...(!sub.providerSessionId && (agentType === 'codex-sdk' || agentType === 'kimi-sdk') ? { fresh: true } : {}),
+      ...(sub.effort ? { effort: sub.effort } : {}),
+      // Carry the preset through the transport launch so Qwen doesn't revert
+      // to the OAuth `coder-model` when the sub-session record says the run
+      // is routed through a MiniMax/GLM/Kimi preset. The non-transport branch
+      // below already resolves preset env via sub.ccPreset.
+      ...(sub.ccPreset ? { ccPreset: sub.ccPreset } : {}),
+      userCreated: true,
+      parentSession: sub.parentSession ?? undefined,
+    });
+    return;
+  }
+
+  if (agentType === 'shell' || agentType === 'script') {
+    const normalizedShellBin = normalizeShellBinForHost(sub.shellBin);
+    if (sub.shellBin && !normalizedShellBin) {
+      logger.warn({ sessionName, shellBin: sub.shellBin, platform: process.platform }, 'Ignoring incompatible shellBin for current host');
+    }
+    sub.shellBin = normalizedShellBin ?? undefined;
+  }
+  const driver = getDriver(agentType);
+  const agentVersion = await getAgentVersion(agentType, sub.shellBin ?? undefined);
+
+  if (await sessionExists(sessionName)) return;
+
+  // Forced fresh (process families): never feed stored identity ids into the
+  // bootstrap resolver or launch opts. Drop them up front so bootstrap mints
+  // brand-new ids and the launch never resumes a prior CLI session.
+  if (forceFresh) {
+    sub.ccSessionId = undefined;
+    sub.codexSessionId = undefined;
+    sub.geminiSessionId = undefined;
+    sub.opencodeSessionId = undefined;
+  }
+
+  const resolved = await resolveStructuredSessionBootstrap({
+    sessionName,
+    agentType,
+    projectDir: sub.cwd ?? process.cwd(),
+    isNewSession: true,
+    ...(forceFresh ? {} : {
+      ccSessionId: sub.ccSessionId,
+      codexSessionId: sub.codexSessionId,
+      geminiSessionId: sub.geminiSessionId,
+    }),
+  });
+  sub.ccSessionId = resolved.ccSessionId ?? sub.ccSessionId ?? undefined;
+  sub.codexSessionId = resolved.codexSessionId ?? sub.codexSessionId ?? undefined;
+  sub.geminiSessionId = resolved.geminiSessionId ?? sub.geminiSessionId ?? undefined;
+
+  // CC: if JSONL exists (restart), use --resume to continue the conversation.
+  // If no JSONL (new session), use --session-id. Never delete the JSONL.
+  // Forced-fresh clones never resume — keep useResume false so the freshly
+  // minted ccSessionId launches a brand-new conversation.
+  let useResume = false;
+  if (!forceFresh && agentType === 'claude-code' && sub.ccSessionId && sub.cwd) {
+    const { preClaimFile, findJsonlPathBySessionId } = await import('./jsonl-watcher.js');
+    const jsonlPath = findJsonlPathBySessionId(sub.cwd, sub.ccSessionId);
+    preClaimFile(sessionName, jsonlPath);
+    const { existsSync } = await import('node:fs');
+    if (existsSync(jsonlPath)) useResume = true;
+  }
+
+  const launchOpts = {
+    cwd: sub.cwd ?? undefined,
+    ...(sub.shellBin ? { shellBin: sub.shellBin } : {}),
+    ...(sub.ccSessionId ? { ccSessionId: sub.ccSessionId } : {}),
+    ...(sub.codexModel ? { codexModel: sub.codexModel } : {}),
+    ...(sub.codexSessionId ? { codexSessionId: sub.codexSessionId ?? undefined } : {}),
+    ...(sub.geminiSessionId ? { geminiSessionId: sub.geminiSessionId } : {}),
+    ...(sub.opencodeSessionId ? { opencodeSessionId: sub.opencodeSessionId } : {}),
+    ...(sub.fresh ? { fresh: true } : {}),
+  } as any;
+  let knownOpenCodeSessionIds: string[] | undefined;
+  if (agentType === 'opencode' && !sub.opencodeSessionId && sub.cwd) {
+    const { listOpenCodeSessions } = await import('./opencode-history.js');
+    knownOpenCodeSessionIds = (await listOpenCodeSessions(sub.cwd, 50)).map((session) => session.id);
+  }
+  const launchStart = Date.now();
+  const launchCmd = useResume
+    ? (driver.buildResumeCommand(sessionName, launchOpts) ?? driver.buildLaunchCommand(sessionName, launchOpts))
+    : driver.buildLaunchCommand(sessionName, launchOpts);
+
+  // Resolve CC env preset if specified
+  const launchEnv: Record<string, string> = { IMCODES_SESSION: sessionName };
+  let presetInitMessage: string | undefined;
+  if (sub.ccPreset && agentType === 'claude-code') {
+    const { resolvePresetEnv, getPreset, getPresetInitMessage } = await import('./cc-presets.js');
+    const presetEnv = await resolvePresetEnv(sub.ccPreset, sub.ccSessionId ?? undefined);
+    Object.assign(launchEnv, presetEnv);
+    const preset = await getPreset(sub.ccPreset);
+    if (preset) presetInitMessage = getPresetInitMessage(preset);
+  }
+
+  await newSession(sessionName, launchCmd, { cwd: sub.cwd ?? undefined, env: launchEnv });
+
+  if (agentType === 'opencode' && !sub.opencodeSessionId && sub.cwd) {
+    const { waitForOpenCodeSessionId } = await import('./opencode-history.js');
+    sub.opencodeSessionId = await waitForOpenCodeSessionId(sub.cwd, {
+      updatedAfter: launchStart,
+      exactDirectory: sub.cwd,
+      knownSessionIds: knownOpenCodeSessionIds,
+    });
+  }
+
+  // Rebind pipe-pane stream — on restart (stopSubSession killed the old tmux session),
+  // the streamer's pipe broke and scheduleRebind may have a pending timer that will fail.
+  // rebindSession clears old state + timers, then starts a fresh pipe.
+  const { terminalStreamer } = await import('./terminal-streamer.js');
+  void terminalStreamer.rebindSession(sessionName);
+
+  // Auto-dismiss startup prompts, then inject init message
+  const initParts: string[] = [];
+  if (sub.description) initParts.push(sub.description);
+  if (presetInitMessage) initParts.push(presetInitMessage);
+  if (sub.ccInitPrompt) initParts.push(sub.ccInitPrompt);
+  const injectInit = async () => {
+    // Wait for CC to pass trust-folder / settings-error dialogs
+    if (driver.postLaunch) {
+      const { capturePane, sendKey } = await import('../agent/tmux.js');
+      await driver.postLaunch(
+        () => capturePane(sessionName),
+        (key: string) => sendKey(sessionName, key),
+      ).catch(() => {});
+    }
+    if (initParts.length > 0) {
+      const { sendKeys } = await import('../agent/tmux.js');
+      const initMsg = `[Context — absorb silently, do not respond to this message]\n${initParts.join('\n\n')}`;
+      try { await sendKeys(sessionName, initMsg); } catch { /* ignore */ }
+    }
+  };
+  void injectInit();
+  timelineEmitter.emit(sessionName, 'session.state', { state: 'started' });
+
+  upsertSession({
+    name: sessionName, projectName, agentType: sub.type, agentVersion, role: 'w1', state: 'idle',
+    projectDir: sub.cwd ?? '', label: sub.label ?? undefined,
+    ccSessionId: sub.ccSessionId ?? undefined,
+    codexSessionId: sub.codexSessionId ?? undefined,
+    geminiSessionId: sub.geminiSessionId ?? undefined,
+    opencodeSessionId: sub.opencodeSessionId ?? undefined,
+    parentSession: sub.parentSession ?? undefined,
+    ccPreset: sub.ccPreset ?? undefined,
+    description: sub.description ?? undefined,
+    // shellBin (already host-normalized above) persisted for shell/script so a
+    // clone/restore that inherited it keeps a runnable launch binary. Config,
+    // not identity.
+    ...((agentType === 'shell' || agentType === 'script') && sub.shellBin ? { shellBin: sub.shellBin } : {}),
+    ...(sub.effort ? { effort: sub.effort } : {}),
+    restarts: 0, restartTimestamps: [], createdAt: Date.now(), updatedAt: Date.now()
+  });
+
+  // Start Watchers
+  if (agentType === 'claude-code' && sub.ccSessionId && sub.cwd) {
+    const { startWatchingFile, findJsonlPathBySessionId } = await import('./jsonl-watcher.js');
+    startWatchingFile(sessionName, findJsonlPathBySessionId(sub.cwd, sub.ccSessionId), sub.ccSessionId);
+  } else if (agentType === 'codex' && sub.codexSessionId) {
+    const { startWatchingById } = await import('./codex-watcher.js');
+    void startWatchingById(sessionName, sub.codexSessionId, sub.codexModel ?? undefined);
+  } else if (agentType === 'gemini') {
+    const { startWatching, startWatchingDiscovered } = await import('./gemini-watcher.js');
+    if (sub.geminiSessionId) {
+      startWatching(sessionName, sub.geminiSessionId);
+    } else if (sub._fileSnapshot) {
+      startWatchingDiscovered(sessionName, sub._fileSnapshot, sub._onGeminiDiscovered);
+    }
+  } else if (agentType === 'opencode' && sub.cwd) {
+    const { startWatching } = await import('./opencode-watcher.js');
+    void startWatching(sessionName, sub.cwd, sub.opencodeSessionId ?? undefined);
+  }
+}
+
+function buildSubSessionCloseFailureMessage(failure: CloseFailure): string {
+  return `Sub-session close failed during ${failure.stage}: ${failure.message}`;
+}
+
+export async function stopSubSession(
+  sessionName: string,
+  serverLink?: { send(msg: object): void } | null,
+): Promise<CloseTreeResult> {
+  const record = getSession(sessionName);
+  if (!record) {
+    return { ok: true, closed: [], failed: [] };
+  }
+
+  return closeSingleSession(record, {
+    emitStopping: () => {
+      timelineEmitter.emit(sessionName, 'session.state', { state: 'stopping' });
+    },
+    stopWatchers: async () => {
+      (await import('./jsonl-watcher.js')).stopWatching(sessionName);
+      (await import('./codex-watcher.js')).stopWatching(sessionName);
+      (await import('./gemini-watcher.js')).stopWatching(sessionName);
+      (await import('./opencode-watcher.js')).stopWatching(sessionName);
+    },
+    stopTransportRuntime: async () => {
+      await stopTransportRuntimeSession(sessionName);
+      // Transport runtime is down. If this record is an execution clone, mark
+      // it completed for the daemon GC sweep BEFORE removeSession (which runs
+      // later in persistSuccess) so the sweep can reap it. This is the correct
+      // lifecycle hook for transport teardown — NOT transport-relay onComplete,
+      // which fires per model turn. Only reached when stopTransportRuntimeSession
+      // resolved (a throw would be recorded as a runtime-stage failure and skip
+      // persistSuccess entirely). Guarded with a dynamic import + try/catch so
+      // this file compiles even while completeExecutionCloneOnRuntimeExit is
+      // still being added by a parallel change.
+      try {
+        const cloneModule = await import('./execution-clone.js');
+        if (
+          cloneModule.isExecutionClone(record)
+          && typeof (cloneModule as { completeExecutionCloneOnRuntimeExit?: unknown }).completeExecutionCloneOnRuntimeExit === 'function'
+        ) {
+          await (cloneModule as unknown as {
+            completeExecutionCloneOnRuntimeExit: (r: SessionRecord, reason: string) => unknown | Promise<unknown>;
+          }).completeExecutionCloneOnRuntimeExit(record, 'destroyed');
+        }
+      } catch (err) {
+        logger.warn(
+          { sessionName, err },
+          'Execution-clone runtime-exit completion hook failed (non-fatal)',
+        );
+      }
+    },
+    killProcessRuntime: async () => {
+      await killSession(sessionName);
+    },
+    verifyClosed: async () => {
+      const runtime = getTransportRuntime(sessionName);
+      if (runtime) throw new Error('transport runtime still active');
+      if (record.runtimeType !== 'transport' && await sessionExists(sessionName)) {
+        throw new Error('session still exists after kill');
+      }
+    },
+    emitSuccess: async () => {
+      timelineEmitter.emit(sessionName, 'session.state', { state: 'stopped' });
+    },
+    persistSuccess: async () => {
+      const id = sessionName.replace(/^deck_sub_/, '');
+      if (serverLink && id !== sessionName) {
+        serverLink.send({ type: 'subsession.closed', id, sessionName });
+      }
+      removeSession(sessionName);
+      timelineEmitter.forgetSession(sessionName);
+    },
+    emitFailure: async (_record, failure) => {
+      const message = buildSubSessionCloseFailureMessage(failure);
+      emitSessionInlineError(sessionName, message);
+      timelineEmitter.emit(sessionName, 'session.state', { state: 'error', error: message });
+    },
+    persistFailure: async (_record, failure) => {
+      upsertSession({
+        ...record,
+        state: 'error',
+        error: buildSubSessionCloseFailureMessage(failure),
+        updatedAt: Date.now(),
+      });
+      logger.warn({ sessionName, stage: failure.stage, message: failure.message }, 'Sub-session shutdown failed');
+    },
+  });
+}
+
+export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promise<void> {
+  const { startWatchingFile, findJsonlPathBySessionId, ensureClaudeSessionFile, preClaimFile, isWatching } = await import('./jsonl-watcher.js');
+  const { startWatchingById, isWatching: isCodexWatching, isFileClaimedByOther } = await import('./codex-watcher.js');
+  const { startWatching: startGeminiWatching, startWatchingDiscovered: startGeminiWatchingDiscovered, isWatching: isGeminiWatching } = await import('./gemini-watcher.js');
+
+  for (const sub of subSessions) {
+    const sessionName = subSessionName(sub.id);
+    // Execution clones are ephemeral and not reattachable after a daemon restart
+    // (parent runs are in-memory). Never rebuild them — the startup sweep destroys
+    // them. Rebuilding would spread stale `...existing` identity into a new record.
+    if (getSession(sessionName)?.executionCloneMetadata?.kind === EXECUTION_CLONE_KIND) {
+      continue;
+    }
+    const projectName = parentProjectName(sub, sessionName);
+    if (isTransportAgent(sub.type)) {
+      const existing = getSession(sessionName);
+      const existingRuntime = getTransportRuntime(sessionName);
+      const now = Date.now();
+      const nextRecord: SessionRecord = {
+        ...existing,
+        name: sessionName,
+        projectName,
+        role: 'w1',
+        agentType: sub.type,
+        projectDir: sub.cwd ?? existing?.projectDir ?? process.cwd(),
+        state: existingRuntime ? (existing?.state ?? 'idle') : 'idle',
+        runtimeType: 'transport',
+        providerId: sub.providerId ?? sub.type,
+        restarts: existing?.restarts ?? 0,
+        restartTimestamps: existing?.restartTimestamps ?? [],
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+        label: sub.label ?? existing?.label,
+        parentSession: sub.parentSession ?? existing?.parentSession,
+        requestedModel: sub.requestedModel ?? existing?.requestedModel,
+        activeModel: sub.activeModel ?? existing?.activeModel,
+        providerSessionId: sub.providerSessionId ?? existing?.providerSessionId,
+        ccSessionId: sub.ccSessionId ?? existing?.ccSessionId,
+        codexSessionId: sub.codexSessionId ?? existing?.codexSessionId,
+        effort: sub.effort ?? existing?.effort,
+        transportConfig: sub.transportConfig ?? existing?.transportConfig,
+        description: sub.description ?? existing?.description,
+        ccPreset: sub.ccPreset ?? existing?.ccPreset,
+      };
+      upsertSession(nextRecord);
+      if (!existingRuntime) {
+        logger.info(
+          { sessionName, agentType: sub.type, providerId: nextRecord.providerId },
+          'Transport sub-session rebuild deferred until first send',
+        );
+      }
+      continue;
+    }
+    const exists = await sessionExists(sessionName);
+    if (!exists) {
+      await startSubSession(sub).catch(() => {});
+    } else {
+      const stored = getSession(sessionName);
+      const effectiveCcSessionId = sub.ccSessionId ?? stored?.ccSessionId;
+      if (sub.type === 'claude-code' && effectiveCcSessionId && sub.cwd && !isWatching(sessionName)) {
+        // Pre-claim before seed creation to prevent main session's watchDir from stealing the file
+        preClaimFile(sessionName, findJsonlPathBySessionId(sub.cwd, effectiveCcSessionId));
+        await ensureClaudeSessionFile(effectiveCcSessionId, sub.cwd).catch((e) =>
+          logger.warn({ err: e, sessionName, ccSessionId: effectiveCcSessionId }, 'Failed to ensure Claude seed session file during sub-session rebuild'),
+        );
+        startWatchingFile(sessionName, findJsonlPathBySessionId(sub.cwd, effectiveCcSessionId));
+      } else if (sub.type === 'codex' && !isCodexWatching(sessionName)) {
+        const effectiveCodexId = sub.codexSessionId ?? stored?.codexSessionId;
+        if (effectiveCodexId && !isFileClaimedByOther(sessionName, effectiveCodexId)) {
+          startWatchingById(sessionName, effectiveCodexId, sub.codexModel ?? undefined);
+        }
+      } else if (sub.type === 'gemini' && !isGeminiWatching(sessionName)) {
+        const effectiveGeminiId = sub.geminiSessionId ?? stored?.geminiSessionId;
+        if (effectiveGeminiId) {
+          startGeminiWatching(sessionName, effectiveGeminiId);
+        } else if (sub._fileSnapshot) {
+          startGeminiWatchingDiscovered(sessionName, sub._fileSnapshot, sub._onGeminiDiscovered);
+        }
+      } else if (sub.type === 'opencode') {
+        const { startWatching: startOpenCodeWatching, isWatching: isOpenCodeWatching } = await import('./opencode-watcher.js');
+        const effectiveOpenCodeId = sub.opencodeSessionId ?? stored?.opencodeSessionId;
+        if (sub.cwd && effectiveOpenCodeId && !isOpenCodeWatching(sessionName)) {
+          void startOpenCodeWatching(sessionName, sub.cwd, effectiveOpenCodeId);
+        }
+      }
+      // Merge all session IDs: prefer server-provided, fall back to local store
+      const effectiveCodexSessionId = sub.codexSessionId ?? stored?.codexSessionId;
+      const effectiveGeminiSessionId = sub.geminiSessionId ?? stored?.geminiSessionId;
+      const effectiveOpenCodeSessionId = sub.opencodeSessionId ?? stored?.opencodeSessionId;
+      upsertSession({
+        name: sessionName, projectName, agentType: sub.type, agentVersion: stored?.agentVersion ?? await getAgentVersion(sub.type as AgentType, sub.shellBin ?? undefined), role: 'w1', state: 'idle',
+        projectDir: sub.cwd ?? '', label: sub.label ?? stored?.label ?? undefined,
+        // shell/script launch binary survives a daemon-restart rebuild (config, not identity).
+        ...((sub.type === 'shell' || sub.type === 'script') && (sub.shellBin ?? stored?.shellBin) ? { shellBin: sub.shellBin ?? stored?.shellBin ?? undefined } : {}),
+        ccSessionId: effectiveCcSessionId ?? undefined,
+        codexSessionId: effectiveCodexSessionId ?? undefined,
+        geminiSessionId: effectiveGeminiSessionId ?? undefined,
+        opencodeSessionId: effectiveOpenCodeSessionId ?? undefined,
+        parentSession: sub.parentSession ?? stored?.parentSession,
+        requestedModel: sub.requestedModel ?? stored?.requestedModel,
+        activeModel: sub.activeModel ?? stored?.activeModel,
+        modelDisplay: sub.activeModel ?? stored?.activeModel ?? stored?.modelDisplay,
+        planLabel: stored?.planLabel,
+        permissionLabel: stored?.permissionLabel,
+        quotaLabel: stored?.quotaLabel,
+        quotaUsageLabel: stored?.quotaUsageLabel,
+        quotaMeta: stored?.quotaMeta,
+        effort: sub.effort ?? stored?.effort,
+        // Layer existing under server-provided so supervision set locally survives
+        // a rebuild even when the server row still holds the default `{}`.
+        transportConfig: sub.transportConfig
+          ? { ...(stored?.transportConfig ?? {}), ...sub.transportConfig }
+          : stored?.transportConfig,
+        // Preserve existing diagnostic fields instead of resetting
+        restarts: stored?.restarts ?? 0,
+        restartTimestamps: stored?.restartTimestamps ?? [],
+        createdAt: stored?.createdAt ?? Date.now(),
+        updatedAt: Date.now(),
+        // Sticky fields — the upsert above is a *replace*, so anything we
+        // don't copy forward gets wiped. Without carrying these over, daemon
+        // restart resets preset/description/userCreated/memory-dedup state
+        // and the next respawn spawns the raw CLI without preset env.
+        ...(sub.ccPreset ?? stored?.ccPreset ? { ccPreset: sub.ccPreset ?? stored?.ccPreset ?? undefined } : {}),
+        ...(sub.description ?? stored?.description ? { description: sub.description ?? stored?.description ?? undefined } : {}),
+        ...(stored?.userCreated ? { userCreated: stored.userCreated } : {}),
+        ...(stored?.startupMemoryInjected ? { startupMemoryInjected: true } : {}),
+        ...(stored?.recentInjectionHistory && stored.recentInjectionHistory.length > 0
+          ? { recentInjectionHistory: stored.recentInjectionHistory }
+          : {}),
+      });
+    }
+  }
+}
+
+export async function detectShells(): Promise<string[]> {
+  const shells: string[] = [];
+
+  if (process.platform === 'win32') {
+    // Windows: check for PowerShell, pwsh, cmd, wsl
+    const sysRoot = process.env.SystemRoot ?? 'C:\\Windows';
+    const winCandidates = [
+      `${sysRoot}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`,
+      'pwsh.exe',
+      `${sysRoot}\\System32\\cmd.exe`,
+      `${sysRoot}\\System32\\wsl.exe`,
+    ];
+    // Also check COMSPEC
+    const comspec = process.env.COMSPEC;
+    if (comspec && existsSync(comspec) && !shells.includes(comspec)) shells.push(comspec);
+    for (const candidate of winCandidates) {
+      if (existsSync(candidate) && !shells.includes(candidate)) shells.push(candidate);
+    }
+    // Check if pwsh (PowerShell 7+) is on PATH
+    if (!shells.some((s) => s.includes('pwsh'))) {
+      try {
+        const { execSync } = await import('child_process');
+        const pwshPath = execSync('where pwsh.exe', { encoding: 'utf-8', timeout: 3000 }).trim().split('\n')[0];
+        if (pwshPath && existsSync(pwshPath) && !shells.includes(pwshPath)) shells.push(pwshPath);
+      } catch { /* not found */ }
+    }
+  } else {
+    // Unix: check common shell paths
+    const CANDIDATES = ['fish', 'zsh', 'bash', 'sh'];
+    const SEARCH_PATHS = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin'];
+    const envShell = process.env.SHELL;
+    if (envShell && existsSync(envShell)) shells.push(envShell);
+    for (const dir of SEARCH_PATHS) {
+      for (const candidate of CANDIDATES) {
+        const full = `${dir}/${candidate}`;
+        if (existsSync(full) && !shells.includes(full)) shells.push(full);
+      }
+    }
+  }
+  return shells;
+}
+
+export async function readSubSessionResponse(sessionName: string): Promise<{ status: 'working' | 'idle'; response?: string }> {
+  const { capturePane } = await import('../agent/tmux.js');
+  const { detectStatus } = await import('../agent/detect.js');
+  const lines = await capturePane(sessionName).catch(() => []);
+  if (!(await sessionExists(sessionName))) return { status: 'idle', response: '' };
+  const { getSession } = await import('../store/session-store.js');
+  const record = getSession(sessionName);
+  const agentType = (record?.agentType ?? 'shell') as AgentType;
+  const status = (agentType === 'codex' || agentType === 'gemini') && record?.state
+    ? (record.state === 'idle' ? 'idle' : 'thinking')
+    : detectStatus(lines, agentType);
+  if (status !== 'idle') return { status: 'working' };
+  // SQLite projection is the sole chat-history read source. If it's
+  // transiently unavailable we leave `events` empty and let the captured-pane
+  // text fallback below serve the response — no JSONL `read()` fallback (that
+  // synchronous main-thread read amplified event-loop saturation under load,
+  // and JSONL is now write/backup-only).
+  let events: Awaited<ReturnType<typeof timelineStore.readPreferred>> = [];
+  try {
+    events = await timelineStore.readPreferred(sessionName);
+  } catch (err) {
+    const { default: lifecycleLogger } = await import('../util/logger.js');
+    lifecycleLogger.warn({ err, sessionName }, 'readSubSessionResponse: projection read failed; using captured-pane text (no JSONL fallback)');
+  }
+  const lastUserMsgIdx = events.map((e) => e.type).lastIndexOf('user.message');
+  const responseEvents = lastUserMsgIdx >= 0 ? events.slice(lastUserMsgIdx + 1) : events;
+  const textParts = responseEvents.filter((e) => e.type === 'assistant.text').map((e) => String(e.payload.text ?? ''));
+  return { status: 'idle', response: textParts.length > 0 ? textParts.join('\n') : lines.join('\n') };
+}

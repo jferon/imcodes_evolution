@@ -1,0 +1,647 @@
+/**
+ * @vitest-environment jsdom
+ */
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { h } from 'preact';
+import { act, render, screen, fireEvent, cleanup } from '@testing-library/preact';
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string, fallback?: string | Record<string, unknown>, opts?: Record<string, unknown>) => {
+      if (key === 'session.unpin_to_stop') return 'Unpin tab first to stop';
+      const template = typeof fallback === 'string' ? fallback : key.split('.').pop() ?? key;
+      const values = typeof fallback === 'string' ? opts : fallback;
+      return template.replace(/\{\{(\w+)\}\}/g, (_match, name) => String(values?.[name] ?? `{{${name}}}`));
+    },
+  }),
+}));
+
+const getUserPrefMock = vi.fn().mockResolvedValue(null);
+const saveUserPrefMock = vi.fn().mockResolvedValue(undefined);
+
+vi.mock('../../src/api.js', () => ({
+  getUserPref: (...args: unknown[]) => getUserPrefMock(...args),
+  saveUserPref: (...args: unknown[]) => saveUserPrefMock(...args),
+}));
+
+import { SessionTabs } from '../../src/components/SessionTabs.js';
+import type { SessionInfo } from '../../src/types.js';
+
+const makeSessions = (overrides: Partial<SessionInfo>[] = []): SessionInfo[] =>
+  overrides.map((o, i) => ({
+    name: `session_w${i + 1}`,
+    project: 'my-project',
+    role: `w${i + 1}` as SessionInfo['role'],
+    agentType: 'worker',
+    state: 'idle',
+    ...o,
+  }));
+
+// Default required props for SessionTabs
+const defaultProps = {
+  onNewSession: vi.fn(),
+  onStopProject: vi.fn(),
+  onRestartProject: vi.fn(),
+  pinned: new Set<string>(),
+  setPinnedArr: vi.fn(),
+};
+
+function firePointer(
+  target: Element,
+  type: 'pointerdown' | 'pointermove' | 'pointerup',
+  init: MouseEventInit & { pointerId: number; pointerType: string },
+) {
+  const win = target.ownerDocument.defaultView ?? window;
+  const eventNames = [
+    type,
+    type === 'pointerdown' ? 'PointerDown' : type === 'pointermove' ? 'PointerMove' : 'PointerUp',
+  ];
+  for (const eventName of eventNames) {
+    const event = new win.MouseEvent(eventName, {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      button: init.button ?? 0,
+      clientX: init.clientX,
+      clientY: init.clientY,
+    });
+    Object.defineProperties(event, {
+      pointerId: { value: init.pointerId, configurable: true },
+      pointerType: { value: init.pointerType, configurable: true },
+    });
+    act(() => {
+      target.dispatchEvent(event);
+    });
+  }
+}
+
+describe('SessionTabs', () => {
+  beforeEach(() => {
+    getUserPrefMock.mockResolvedValue(null);
+    saveUserPrefMock.mockResolvedValue(undefined);
+    // Ensure localStorage is available (jsdom may provide a broken stub)
+    if (typeof globalThis.localStorage === 'undefined' || typeof globalThis.localStorage.setItem !== 'function') {
+      const store: Record<string, string> = {};
+      Object.defineProperty(globalThis, 'localStorage', {
+        value: {
+          getItem: (k: string) => store[k] ?? null,
+          setItem: (k: string, v: string) => { store[k] = v; },
+          removeItem: (k: string) => { delete store[k]; },
+          clear: () => { for (const k of Object.keys(store)) delete store[k]; },
+          get length() { return Object.keys(store).length; },
+          key: (i: number) => Object.keys(store)[i] ?? null,
+        },
+        writable: true,
+        configurable: true,
+      });
+    }
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('renders "No active sessions" when sessions array is empty and sessionsLoaded is true', () => {
+    render(
+      <SessionTabs sessions={[]} activeSession={null} onSelect={vi.fn()} sessionsLoaded={true} {...defaultProps} />,
+    );
+    expect(screen.getByText('No active sessions')).toBeDefined();
+  });
+
+  it('renders a button for each session', () => {
+    const sessions = makeSessions([{}, {}]);
+    render(
+      <SessionTabs sessions={sessions} activeSession={null} onSelect={vi.fn()} sessionsLoaded={true} {...defaultProps} />,
+    );
+    const buttons = screen.getAllByRole('tab');
+    expect(buttons).toHaveLength(2);
+  });
+
+  it('marks the active session button with aria-selected=true', () => {
+    const sessions = makeSessions([{ name: 'session_w1' }, { name: 'session_w2' }]);
+    render(
+      <SessionTabs sessions={sessions} activeSession="session_w1" onSelect={vi.fn()} sessionsLoaded={true} {...defaultProps} />,
+    );
+    const buttons = screen.getAllByRole('tab');
+    expect(buttons[0].getAttribute('aria-selected')).toBe('true');
+    expect(buttons[1].getAttribute('aria-selected')).toBe('false');
+  });
+
+  it('scrolls the active tab into view by mutating tab-bar scrollLeft only (no scrollIntoView)', async () => {
+    // Regression for "怎么往左偏这么多" (image ce683be95d350b6cda6852eae74bb320.png):
+    // the previous implementation called Element.scrollIntoView({ inline: 'center' })
+    // which walks the entire ancestor scroll chain and dragged the chat layout
+    // sideways on mobile. Now we only mutate this tab-bar's scrollLeft.
+    const scrollIntoView = vi.fn();
+    const previous = HTMLElement.prototype.scrollIntoView;
+    HTMLElement.prototype.scrollIntoView = scrollIntoView;
+    try {
+      const sessions = makeSessions([{ name: 'session_w1' }, { name: 'session_w2' }, { name: 'session_w3' }]);
+      const view = render(
+        <SessionTabs sessions={sessions} activeSession="session_w1" onSelect={vi.fn()} sessionsLoaded={true} {...defaultProps} />,
+      );
+
+      // Wait a frame so the requestAnimationFrame inside the effect runs.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      view.rerender(
+        <SessionTabs sessions={sessions} activeSession="session_w3" onSelect={vi.fn()} sessionsLoaded={true} {...defaultProps} />,
+      );
+
+      // Wait again for the rerender's rAF.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // The new implementation MUST NOT use scrollIntoView (which would scroll
+      // every scrollable ancestor including .chat-main / document body).
+      expect(scrollIntoView).not.toHaveBeenCalled();
+    } finally {
+      HTMLElement.prototype.scrollIntoView = previous;
+    }
+  });
+
+  it('calls onSelect with the session name when a tab is clicked', () => {
+    const onSelect = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1' }, { name: 'session_w2' }]);
+    render(
+      <SessionTabs sessions={sessions} activeSession={null} onSelect={onSelect} sessionsLoaded={true} {...defaultProps} />,
+    );
+
+    const buttons = screen.getAllByRole('tab');
+    fireEvent.click(buttons[1]);
+
+    expect(onSelect).toHaveBeenCalledOnce();
+    expect(onSelect).toHaveBeenCalledWith('session_w2');
+  });
+
+  it('selects a pinned tab on mouse pointer-up even if the browser suppresses the click', () => {
+    const onSelect = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1' }, { name: 'session_w2' }]);
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        onSelect={onSelect}
+        sessionsLoaded={true}
+        {...defaultProps}
+        pinned={new Set(['session_w2'])}
+      />,
+    );
+
+    const pinnedTab = screen.getAllByRole('tab')[0];
+    fireEvent.mouseDown(pinnedTab, {
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    fireEvent.mouseUp(pinnedTab, {
+      button: 0,
+      clientX: 25,
+      clientY: 13,
+    });
+
+    expect(onSelect).toHaveBeenCalledOnce();
+    expect(onSelect).toHaveBeenCalledWith('session_w2');
+  });
+
+  it('selects a pinned tab on touch pointer-up even if Android suppresses the click', () => {
+    const onSelect = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1' }, { name: 'session_w2' }, { name: 'session_w3' }]);
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        onSelect={onSelect}
+        sessionsLoaded={true}
+        {...defaultProps}
+        pinned={new Set(['session_w2'])}
+      />,
+    );
+
+    const pinnedTab = screen.getAllByRole('tab')[0];
+    firePointer(pinnedTab, 'pointerdown', {
+      pointerId: 11,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    firePointer(pinnedTab, 'pointerup', {
+      pointerId: 11,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 25,
+      clientY: 13,
+    });
+
+    expect(onSelect).toHaveBeenCalledOnce();
+    expect(onSelect).toHaveBeenCalledWith('session_w2');
+  });
+
+  it('does not double-select when a touch click follows pointer-up activation', () => {
+    const onSelect = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1' }]);
+    render(
+      <SessionTabs sessions={sessions} activeSession={null} onSelect={onSelect} sessionsLoaded={true} {...defaultProps} />,
+    );
+
+    const tab = screen.getByRole('tab');
+    firePointer(tab, 'pointerdown', {
+      pointerId: 12,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    firePointer(tab, 'pointerup', {
+      pointerId: 12,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    fireEvent.click(tab);
+
+    expect(onSelect).toHaveBeenCalledOnce();
+    expect(onSelect).toHaveBeenCalledWith('session_w1');
+  });
+
+  it('does not activate the touch pointer-up fallback after a scroll-sized move', () => {
+    const onSelect = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1' }]);
+    render(
+      <SessionTabs sessions={sessions} activeSession={null} onSelect={onSelect} sessionsLoaded={true} {...defaultProps} />,
+    );
+
+    const tab = screen.getByRole('tab');
+    firePointer(tab, 'pointerdown', {
+      pointerId: 13,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    firePointer(tab, 'pointermove', {
+      pointerId: 13,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 46,
+      clientY: 12,
+    });
+    firePointer(tab, 'pointerup', {
+      pointerId: 13,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 46,
+      clientY: 12,
+    });
+
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it('does not double-select when the normal mouse click follows pointer-up activation', () => {
+    const onSelect = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1' }]);
+    render(
+      <SessionTabs sessions={sessions} activeSession={null} onSelect={onSelect} sessionsLoaded={true} {...defaultProps} />,
+    );
+
+    const tab = screen.getByRole('tab');
+    fireEvent.mouseDown(tab, {
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    fireEvent.mouseUp(tab, {
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    fireEvent.click(tab);
+
+    expect(onSelect).toHaveBeenCalledOnce();
+    expect(onSelect).toHaveBeenCalledWith('session_w1');
+  });
+
+  it('does not activate from the mouse pointer fallback after a drag-sized move', () => {
+    const onSelect = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1' }]);
+    render(
+      <SessionTabs sessions={sessions} activeSession={null} onSelect={onSelect} sessionsLoaded={true} {...defaultProps} />,
+    );
+
+    const tab = screen.getByRole('tab');
+    fireEvent.mouseDown(tab, {
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    fireEvent.mouseMove(tab, {
+      button: 0,
+      clientX: 40,
+      clientY: 12,
+    });
+    fireEvent.mouseUp(tab, {
+      button: 0,
+      clientX: 40,
+      clientY: 12,
+    });
+
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it('opens the tab context menu from a touch long-press without selecting the tab', () => {
+    vi.useFakeTimers();
+    const onSelect = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1' }]);
+    render(
+      <SessionTabs sessions={sessions} activeSession={null} onSelect={onSelect} sessionsLoaded={true} {...defaultProps} />,
+    );
+
+    const tab = screen.getByRole('tab');
+    firePointer(tab, 'pointerdown', {
+      pointerId: 7,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    act(() => {
+      vi.advanceTimersByTime(520);
+    });
+
+    expect(screen.getByRole('button', { name: 'Pin' })).toBeDefined();
+
+    firePointer(tab, 'pointerup', {
+      pointerId: 7,
+      pointerType: 'touch',
+      button: 0,
+      clientX: 24,
+      clientY: 12,
+    });
+    fireEvent.click(tab);
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it('renders brain tab with brain class and project name', () => {
+    const sessions: SessionInfo[] = [{
+      name: 'session_brain',
+      project: 'my-project',
+      role: 'brain',
+      agentType: 'brain',
+      state: 'running',
+    }];
+    render(
+      <SessionTabs sessions={sessions} activeSession={null} onSelect={vi.fn()} sessionsLoaded={true} {...defaultProps} />,
+    );
+    const button = screen.getByRole('tab');
+    expect(button.className).toContain('brain');
+    expect(button.textContent).toContain('my-project');
+  });
+
+  it('applies busy class for running session state', () => {
+    const sessions = makeSessions([{ name: 'session_w1', state: 'running' }]);
+    render(
+      <SessionTabs sessions={sessions} activeSession={null} onSelect={vi.fn()} sessionsLoaded={true} {...defaultProps} />,
+    );
+    const button = screen.getByRole('tab');
+    expect(button.className).toContain('busy');
+  });
+
+
+  it('shows sdk family badges for claude and codex tabs', () => {
+    const sessions = makeSessions([
+      { name: 'sdk-cc', role: 'brain', project: 'sdk-proj', agentType: 'claude-code-sdk', state: 'idle', label: 'claude-code-sdk1' },
+      { name: 'sdk-cx', role: 'w1', project: 'sdk-proj', agentType: 'codex-sdk', state: 'idle', label: 'codex-sdk2' },
+    ]);
+
+    const view = render(
+      <SessionTabs sessions={sessions} activeSession={null} onSelect={vi.fn()} sessionsLoaded={true} {...defaultProps} />,
+    );
+
+    const badges = [...view.container.querySelectorAll('.agent-badge')].map((el) => el.textContent);
+    expect(badges).toEqual(['cc', 'cx']);
+    expect(screen.getByText('CC1')).toBeDefined();
+    expect(screen.getByText('Cx2')).toBeDefined();
+  });
+
+  it('renders tab bar with role=tablist', () => {
+    const sessions = makeSessions([{}]);
+    render(
+      <SessionTabs sessions={sessions} activeSession={null} onSelect={vi.fn()} sessionsLoaded={true} {...defaultProps} />,
+    );
+    expect(screen.getByRole('tablist')).toBeDefined();
+  });
+
+  it('requires three confirmations before stopping from the tab context dialog', () => {
+    const onStopProject = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1', project: 'proj-1' }]);
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+        onStopProject={onStopProject}
+      />,
+    );
+
+    const tab = screen.getByRole('tab');
+    fireEvent.contextMenu(tab);
+    fireEvent.click(screen.getByRole('button', { name: /^Stop$/ }));
+
+    const stopBtn = () => screen.getByRole('button', { name: /stop session|confirm stop|really stop/i });
+
+    fireEvent.click(stopBtn());
+    expect(onStopProject).not.toHaveBeenCalled();
+    expect(screen.getByText('Confirm stop?')).toBeDefined();
+
+    fireEvent.click(stopBtn());
+    expect(onStopProject).not.toHaveBeenCalled();
+    expect(screen.getByText('⚠ REALLY stop proj-1?')).toBeDefined();
+
+    fireEvent.click(stopBtn());
+    expect(onStopProject).toHaveBeenCalledOnce();
+    expect(onStopProject).toHaveBeenCalledWith('proj-1');
+  });
+
+  it('uses typed icons and plain labels in the tab context menu', () => {
+    const sessions = makeSessions([
+      { name: 'deck_proj_brain', project: 'proj-1', role: 'brain', agentType: 'codex-sdk', userCreated: true },
+    ]);
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        onOpenSessionSettings={vi.fn()}
+        onCloneSession={vi.fn()}
+        {...defaultProps}
+      />,
+    );
+
+    fireEvent.contextMenu(screen.getByRole('tab'));
+    const menu = document.querySelector('.tab-context-menu') as HTMLElement;
+    expect(menu).toBeTruthy();
+
+    const expected: Array<[string, string]> = [
+      ['Pin', 'session-action-menu-icon-pin'],
+      ['Restart', 'session-action-menu-icon-restart'],
+      ['Start fresh', 'session-action-menu-icon-new'],
+      ['Rename', 'session-action-menu-icon-rename'],
+      ['Settings', 'session-action-menu-icon-settings'],
+      ['Copy session', 'session-action-menu-icon-clone'],
+      ['Stop', 'session-action-menu-icon-stop'],
+    ];
+
+    for (const [label, iconClass] of expected) {
+      const button = screen.getByRole('button', { name: label });
+      expect(button.closest('.tab-context-menu')).toBe(menu);
+      expect(button.querySelector(`.${iconClass}`)).toBeTruthy();
+    }
+  });
+
+  it('shows the same unpin-first stop guard in the tab context menu', () => {
+    const onStopProject = vi.fn();
+    const sessions = makeSessions([{ name: 'session_w1', project: 'proj-1' }]);
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+        pinned={new Set(['session_w1'])}
+        onStopProject={onStopProject}
+      />,
+    );
+
+    fireEvent.contextMenu(screen.getByRole('tab'));
+    const stopButton = screen.getByRole('button', { name: /unpin tab first to stop/i });
+    expect((stopButton as HTMLButtonElement).disabled).toBe(true);
+    expect(stopButton.querySelector('.session-action-menu-icon-unpin')).toBeTruthy();
+    fireEvent.click(stopButton);
+    expect(onStopProject).not.toHaveBeenCalled();
+  });
+
+  it('opens session settings from the tab context menu', () => {
+    const onOpenSessionSettings = vi.fn();
+    const sessions = makeSessions([{ name: 'deck_proj_brain', project: 'proj-1', role: 'brain', agentType: 'codex-sdk' }]);
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        onOpenSessionSettings={onOpenSessionSettings}
+        {...defaultProps}
+      />,
+    );
+
+    fireEvent.contextMenu(screen.getByRole('tab'));
+    fireEvent.click(screen.getByRole('button', { name: /settings/i }));
+
+    expect(onOpenSessionSettings).toHaveBeenCalledOnce();
+    expect(onOpenSessionSettings).toHaveBeenCalledWith(sessions[0]);
+  });
+
+  it('opens clone session action from the tab context menu for main brain sessions only', () => {
+    const onCloneSession = vi.fn();
+    const sessions = makeSessions([
+      { name: 'deck_proj_brain', project: 'proj-1', role: 'brain', agentType: 'codex-sdk', userCreated: true },
+      { name: 'deck_proj_w1', project: 'proj-1', role: 'w1', agentType: 'codex-sdk', userCreated: true },
+    ]);
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession={null}
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        onCloneSession={onCloneSession}
+        {...defaultProps}
+      />,
+    );
+
+    const [brainTab, workerTab] = screen.getAllByRole('tab');
+
+    fireEvent.contextMenu(workerTab);
+    expect(screen.queryByRole('button', { name: /copy session/i })).toBeNull();
+    fireEvent.mouseDown(document.body);
+
+    fireEvent.contextMenu(brainTab);
+    fireEvent.click(screen.getByRole('button', { name: /copy session/i }));
+
+    expect(onCloneSession).toHaveBeenCalledOnce();
+    expect(onCloneSession).toHaveBeenCalledWith(sessions[0]);
+  });
+
+  it('uses the current label as the rename input value and commits a label update', () => {
+    const onRenameSession = vi.fn();
+    const sessions: SessionInfo[] = [{
+      name: 'deck_proj_brain',
+      project: 'my-project',
+      role: 'brain',
+      agentType: 'brain',
+      state: 'idle',
+      label: 'Main Label',
+    }];
+
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession="deck_proj_brain"
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        renameRequest="deck_proj_brain"
+        onRenameHandled={vi.fn()}
+        onRenameSession={onRenameSession}
+        {...defaultProps}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLInputElement;
+    expect(input.value).toBe('Main Label');
+
+    fireEvent.input(input, { target: { value: 'Readable Main' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+
+    expect(onRenameSession).toHaveBeenCalledWith('deck_proj_brain', 'Readable Main');
+  });
+
+  it('allows clearing the label so the session falls back to the project name', () => {
+    const onRenameSession = vi.fn();
+    const sessions: SessionInfo[] = [{
+      name: 'deck_proj_brain',
+      project: 'my-project',
+      role: 'brain',
+      agentType: 'brain',
+      state: 'idle',
+      label: 'Main Label',
+    }];
+
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession="deck_proj_brain"
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        renameRequest="deck_proj_brain"
+        onRenameHandled={vi.fn()}
+        onRenameSession={onRenameSession}
+        {...defaultProps}
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLInputElement;
+    fireEvent.input(input, { target: { value: '' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+
+    expect(onRenameSession).toHaveBeenCalledWith('deck_proj_brain', null);
+  });
+});

@@ -1,0 +1,633 @@
+/**
+ * TransportProvider — second-layer abstraction between IM.codes and external agent services.
+ *
+ * Each provider (OpenClaw, MiniMax, CC SDK, etc.) implements the TransportProvider interface.
+ * The connection mode determines how the daemon manages sessions and message history.
+ *
+ * Three connection modes:
+ *   - persistent  (OpenClaw):        Long-lived WS, provider owns sessions.
+ *   - per-request (MiniMax/DeepSeek): HTTP per request, daemon self-manages history.
+ *   - local-sdk   (CC SDK/Codex SDK): Local SDK calls, shared session ownership.
+ */
+
+import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
+import type { TransportEffortLevel } from '../../shared/effort-levels.js';
+import type { SessionContextBootstrapState } from '../../shared/session-context-bootstrap.js';
+import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
+import type { TransportAttachment } from '../../shared/transport-attachments.js';
+import type { MemoryMcpProviderStatusView } from '../../shared/memory-ws.js';
+import type {
+  ProviderContextPayload,
+  ProviderSupportClass,
+  SharedScopePolicyOverride,
+} from '../../shared/context-types.js';
+import {
+  SDK_TURN_LOST_RECOVERY_REASON as SHARED_SDK_TURN_LOST_RECOVERY_REASON,
+  isSdkTurnLostRecoveryPhase as isSharedSdkTurnLostRecoveryPhase,
+  sanitizeSdkTurnLostRecoveryMetadata as sanitizeSharedSdkTurnLostRecoveryMetadata,
+  type SdkTurnLostClassifier as SharedSdkTurnLostClassifier,
+  type SdkTurnLostRecoveryMetadata as SharedSdkTurnLostRecoveryMetadata,
+  type SdkTurnLostRecoveryPhase as SharedSdkTurnLostRecoveryPhase,
+  type SdkTurnLostReplayDecision as SharedSdkTurnLostReplayDecision,
+  type ProviderActiveWorkSnapshot,
+} from '../../shared/session-activity-types.js';
+
+// Re-export shared types used by consumers of this module so they can import from one place.
+export type { AgentMessage, MessageDelta, ToolCallEvent };
+
+// ── String constants ────────────────────────────────────────────────────────
+
+/** All valid connection mode values — import instead of hardcoding the string. */
+export const CONNECTION_MODES = {
+  PERSISTENT:  'persistent',
+  PER_REQUEST: 'per-request',
+  LOCAL_SDK:   'local-sdk',
+} as const;
+
+/** All valid session ownership values — import instead of hardcoding the string. */
+export const SESSION_OWNERSHIP = {
+  PROVIDER: 'provider',
+  LOCAL:    'local',
+  SHARED:   'shared',
+} as const;
+
+/** Common provider error codes. Import instead of hardcoding. */
+export const PROVIDER_ERROR_CODES = {
+  AUTH_FAILED:      'AUTH_FAILED',
+  CONFIG_ERROR:     'CONFIG_ERROR',
+  CONNECTION_LOST:  'CONNECTION_LOST',
+  SESSION_NOT_FOUND:'SESSION_NOT_FOUND',
+  RATE_LIMITED:     'RATE_LIMITED',
+  PROVIDER_ERROR:   'PROVIDER_ERROR',
+  CANCELLED:        'CANCELLED',
+  PARSE_ERROR:      'PARSE_ERROR',
+  PROVIDER_NOT_FOUND:'PROVIDER_NOT_FOUND',
+  SDK_TURN_LOST:    'SDK_TURN_LOST',
+} as const;
+
+// ── Derived types ───────────────────────────────────────────────────────────
+
+/** Connection mode determines how the transport manages the agent lifecycle. */
+export type ConnectionMode = typeof CONNECTION_MODES[keyof typeof CONNECTION_MODES];
+
+/** Who owns the session state and is responsible for history management. */
+export type SessionOwnership = typeof SESSION_OWNERSHIP[keyof typeof SESSION_OWNERSHIP];
+
+/** Error code from a provider operation. */
+export type ProviderErrorCode = typeof PROVIDER_ERROR_CODES[keyof typeof PROVIDER_ERROR_CODES];
+
+/** Machine-readable recovery reason for Codex SDK app-server lost foreground turns. */
+export const SDK_TURN_LOST_REASON = SHARED_SDK_TURN_LOST_RECOVERY_REASON;
+export const SDK_TURN_LOST_RECOVERY_REASON = SDK_TURN_LOST_REASON;
+
+/** Agent status used for privacy-safe lost-turn recovery timeline phases. */
+export const SDK_TURN_LOST_RECOVERY_STATUS = 'sdk_turn_lost_recovery' as const;
+
+export const SDK_TURN_LOST_RECOVERY_PHASES = {
+  DETECTED: 'detected',
+  RECOVERING: 'recovering',
+  RECOVERED: 'recovered',
+  FAILED: 'failed',
+} as const;
+
+export const SDK_TURN_LOST_RECOVERY_CLASSIFIERS = {
+  IDLE_MISSING_TURN: 'idle_missing_turn',
+  NOT_LOADED_WITH_ACTIVE_LEASE: 'not_loaded_with_active_lease',
+  START_GRACE_EXPIRED_NO_CURRENT_TURN: 'start_grace_expired_no_current_turn',
+} as const;
+
+export const SDK_TURN_LOST_REPLAY_DECISIONS = {
+  PENDING: 'pending',
+  SAFE_REPLAY: 'safe_replay',
+  UNSAFE_SIDE_EFFECT: 'unsafe_side_effect',
+  UNSAFE_TERMINAL: 'unsafe_terminal',
+  UNSAFE_AMBIGUOUS: 'unsafe_ambiguous',
+  BUDGET_EXHAUSTED: 'budget_exhausted',
+  FAILED: 'failed',
+  NOT_APPLICABLE: 'not_applicable',
+} as const;
+
+export type SdkTurnLostRecoveryReason = typeof SDK_TURN_LOST_RECOVERY_REASON;
+export type SdkTurnLostRecoveryPhase = SharedSdkTurnLostRecoveryPhase;
+export type SdkTurnLostRecoveryClassifier =
+  typeof SDK_TURN_LOST_RECOVERY_CLASSIFIERS[keyof typeof SDK_TURN_LOST_RECOVERY_CLASSIFIERS];
+export type SdkTurnLostClassifier = SharedSdkTurnLostClassifier;
+export type SdkTurnLostReplayDecision = SharedSdkTurnLostReplayDecision;
+export type SdkTurnLostRecoveryMetadata = SharedSdkTurnLostRecoveryMetadata;
+
+export type SdkTurnLostProviderError = ProviderError & {
+  details: SdkTurnLostRecoveryMetadata;
+};
+
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+export function isSdkTurnLostRecoveryDetails(value: unknown): value is SdkTurnLostRecoveryMetadata {
+  return sanitizeSharedSdkTurnLostRecoveryMetadata(value) !== null;
+}
+
+export function isSdkTurnLostProviderError(error: ProviderError | null | undefined): error is SdkTurnLostProviderError {
+  return !!error && error.recoverable === true && isSdkTurnLostRecoveryDetails(error.details);
+}
+
+// ── Supporting types ────────────────────────────────────────────────────────
+
+export type ProviderCompactExecution = 'sdk-rpc' | 'slash-command' | 'unsupported';
+export type ProviderCompactCompletion =
+  | 'rpc-result'
+  | 'provider-event'
+  | 'rpc-result-or-provider-event'
+  | 'command-result'
+  | 'status-only'
+  | 'none';
+export type ProviderCompactCancellation = 'provider-cancel' | 'local-cancel' | 'timeout-only' | 'none';
+
+export interface ProviderCompactCapability {
+  /** How this provider executes the `/compact` control command. */
+  execution: ProviderCompactExecution;
+  /** Provider-native slash command used when execution is `slash-command`. */
+  providerCommand?: `/${string}`;
+  /** Whether the execution strategy is backed by this locked SDK/protocol version. */
+  verified: boolean;
+  /** Where completion signals come from, if any. */
+  completion: ProviderCompactCompletion;
+  /** Whether an in-flight compact can be cancelled or only locally abandoned. */
+  cancellation: ProviderCompactCancellation;
+  /** Human-readable reason for unsupported or unverified behavior. */
+  reason?: string;
+}
+
+/**
+ * Provider capability flags.
+ * Consumers MUST check the relevant flag before calling optional interface methods.
+ */
+export interface ProviderCapabilities {
+  /** Provider can stream partial output via onDelta. */
+  streaming: boolean;
+  /** Provider supports tool-call events (onToolCall). */
+  toolCalling: boolean;
+  /** Provider can request human approval (onApprovalRequest / respondApproval). */
+  approval: boolean;
+  /** Provider supports reconnecting to an existing remote session (restoreSession). */
+  sessionRestore: boolean;
+  /** Provider maintains conversation history across multiple turns. */
+  multiTurn: boolean;
+  /** Provider can accept file/image attachments in send(). */
+  attachments: boolean;
+  /** Provider supports configurable reasoning/thinking effort. */
+  reasoningEffort?: boolean;
+  /** Supported effort levels when reasoningEffort is true. */
+  supportedEffortLevels?: readonly TransportEffortLevel[];
+  /** How well this provider can honor normalized shared-context payloads. */
+  contextSupport?: ProviderSupportClass;
+  /** Provider-specific `/compact` execution support. */
+  compact?: ProviderCompactCapability;
+}
+
+/**
+ * Provider-specific connection configuration.
+ * Additional keys are allowed for provider-specific options.
+ */
+export interface ProviderConfig {
+  /** Base URL for the provider's API or WebSocket endpoint. */
+  url?: string;
+  /** API key for authentication. */
+  apiKey?: string;
+  /** Auth token (alternative to apiKey for token-based auth). */
+  token?: string;
+  /** Identifier of the agent/model to use on the provider side. */
+  agentId?: string;
+  /** Allow arbitrary provider-specific options. */
+  [key: string]: unknown;
+}
+
+/** Parameters for creating a new session on the provider. */
+export interface SessionConfig {
+  /** Local session key used by the daemon to identify this session. */
+  sessionKey: string;
+  /** Exact IM.codes session name whose identity is injected into managed MCP servers. */
+  sessionName?: string;
+  /** Runtime-bound project name for project-scoped managed MCP servers. */
+  projectName?: string;
+  /** Runtime-bound server id for daemon-dependent managed MCP tools. */
+  serverId?: string;
+  /** Force a brand-new provider conversation; do not reuse provider-side continuity. */
+  fresh?: boolean;
+  /** Environment variables to pass through for SDK-backed local providers. */
+  env?: Record<string, string>;
+  /** Working directory for providers that need local project context. */
+  cwd?: string;
+  /** Provider-side agent/model identifier (overrides ProviderConfig.agentId). */
+  agentId?: string;
+  /** Human-readable label for this session. */
+  label?: string;
+  /** Persona/system prompt injection — used for session description/role. */
+  description?: string;
+  /** Runtime/system prompt injection that should not be surfaced as user-facing description. */
+  systemPrompt?: string;
+  /** Resolved shared-context namespace for the live send path. */
+  contextNamespace?: ProviderContextPayload['authority']['namespace'];
+  /** Diagnostics describing how the runtime namespace was derived. */
+  contextNamespaceDiagnostics?: string[];
+  /** Shared processed-state freshness resolved during session bootstrap. */
+  contextRemoteProcessedFreshness?: ProviderContextPayload['authority']['freshness'];
+  /** Local processed-state freshness resolved during session bootstrap. */
+  contextLocalProcessedFreshness?: ProviderContextPayload['authority']['freshness'];
+  /** Whether shared retry has already been exhausted for the current namespace bootstrap. */
+  contextRetryExhausted?: boolean;
+  /** Persisted control-plane policy override for the resolved shared namespace. */
+  contextSharedPolicyOverride?: SharedScopePolicyOverride;
+  /** Language code for authored context applicability matching. */
+  contextAuthoredContextLanguage?: string;
+  /** File path for authored context applicability matching. */
+  contextAuthoredContextFilePath?: string;
+  /** Provider-specific SDK/CLI settings object or settings file path. */
+  settings?: string | Record<string, unknown>;
+  /** Parent session key for sub-sessions. */
+  parentSessionKey?: string;
+  /** If binding to an already-existing remote session, use this key directly. */
+  bindExistingKey?: string;
+  /** Provider-specific durable conversation/session identifier used for resume. */
+  resumeId?: string;
+  /** Reasoning/thinking effort for future turns. */
+  effort?: TransportEffortLevel;
+  /** Skip the sessions.create RPC — session already exists on provider (auto-sync bind). */
+  skipCreate?: boolean;
+  /** When true, the runtime must NOT re-inject startup memory on the next turn
+   *  (session is being restored or restarted without /clear; the provider
+   *  already received startup memory in a prior run). The runtime still emits
+   *  the timeline status card so the UI knows it was deliberately skipped. */
+  startupMemoryAlreadyInjected?: boolean;
+}
+
+/** Structured error emitted by a provider. */
+export interface ProviderError {
+  /** Machine-readable error code. Use values from PROVIDER_ERROR_CODES. */
+  code: string;
+  /** Human-readable description. */
+  message: string;
+  /** Whether the caller may retry after this error without reconnecting. */
+  recoverable: boolean;
+  /** Optional structured details. Recovery details must be privacy-whitelisted; do not store raw provider payloads here. */
+  details?: unknown;
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+export function isSdkTurnLostRecoveryPhase(value: unknown): value is SdkTurnLostRecoveryPhase {
+  return isSharedSdkTurnLostRecoveryPhase(value);
+}
+
+/**
+ * Whitelist sanitizer for the typed Codex SDK lost-turn recovery contract.
+ *
+ * This intentionally copies only bounded metadata needed for routing/recovery
+ * diagnostics. It never projects raw thread/read responses, raw turn objects,
+ * prompts, tool input/output, provider payloads, environment values, secrets,
+ * or arbitrary error strings from provider details.
+ */
+export function sanitizeSdkTurnLostRecoveryMetadata(input: unknown): SdkTurnLostRecoveryMetadata | null {
+  return sanitizeSharedSdkTurnLostRecoveryMetadata(input);
+}
+
+export function isSdkTurnLostRecovery(error: unknown): error is SdkTurnLostProviderError {
+  const candidate = record(error);
+  if (!candidate) return false;
+  const details = sanitizeSdkTurnLostRecoveryMetadata(candidate.details);
+  if (!details) return false;
+  if (candidate.code !== PROVIDER_ERROR_CODES.SDK_TURN_LOST
+    && candidate.code !== PROVIDER_ERROR_CODES.PROVIDER_ERROR) {
+    return false;
+  }
+  return typeof candidate.message === 'string' && typeof candidate.recoverable === 'boolean';
+}
+
+/** Info about a remote session returned by listSessions(). */
+export interface RemoteSessionInfo {
+  /** Provider-side session key or identifier. */
+  key: string;
+  /** Human-readable session name. */
+  displayName?: string;
+  /** Agent/model the session is associated with. */
+  agentId?: string;
+  /** Unix epoch milliseconds of the last update. */
+  updatedAt?: number;
+  /** Context window usage as a percentage (0–100), if available. */
+  percentUsed?: number;
+}
+
+/** Approval request emitted when the agent needs human permission to proceed. */
+export interface ApprovalRequest {
+  /** Unique identifier for this approval request. */
+  id: string;
+  /** Human-readable description of what the agent wants to do. */
+  description: string;
+  /** Name of the tool requesting approval, if applicable. */
+  tool?: string;
+}
+
+/** Provider-reported session metadata updates (e.g. learned resume/thread ID). */
+export interface SessionInfoUpdate extends SessionContextBootstrapState {
+  /** Durable session/thread identifier used for restoring continuity. */
+  resumeId?: string;
+  /** Human-readable active model identifier, if known. */
+  model?: string;
+  /** Human-readable plan label, if known. */
+  planLabel?: string;
+  /** Human-readable quota summary label, if known. */
+  quotaLabel?: string;
+  /** Human-readable quota progress / reset label, if known. */
+  quotaUsageLabel?: string;
+  /** Structured quota metadata for recomputing display labels. */
+  quotaMeta?: ProviderQuotaMeta;
+  /** Current reasoning/thinking effort, if known. */
+  effort?: TransportEffortLevel;
+}
+
+/** Provider-reported transient execution status (e.g. compacting). */
+export interface ProviderStatusUpdate {
+  /** Machine-readable transient status. Null clears any previously active status. */
+  status: string | null;
+  /** Human-readable label shown in the footer/status line. Null clears the label. */
+  label?: string | null;
+}
+
+/** Provider-reported token/context usage update. */
+export interface ProviderUsageUpdate {
+  /** Provider-native usage fields normalized enough for the daemon relay. */
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+    cached_input_tokens?: number;
+    model_context_window?: number;
+    [key: string]: unknown;
+  };
+  /** Active model for resolving display context-window limits. */
+  model?: string;
+}
+
+// ── TransportProvider interface ─────────────────────────────────────────────
+
+/**
+ * TransportProvider is the adapter interface between IM.codes and an external agent service.
+ *
+ * Implement this interface for each provider (e.g. OpenClaw, MiniMax, CC SDK).
+ * The session-manager selects the appropriate provider based on the agent type and
+ * routes messages through it instead of through a tmux process.
+ *
+ * Lifecycle:
+ *   1. connect(config)  — initialise and validate; not necessarily a physical connection.
+ *   2. createSession()  — obtain a session ID from the provider.
+ *   3. send()           — send user messages; receive deltas/completions via callbacks.
+ *   4. endSession()     — clean up a single session.
+ *   5. disconnect()     — release all provider resources and stop background activity.
+ */
+export interface TransportProvider {
+  /** Unique stable identifier for this provider implementation (e.g. 'openclaw', 'minimax'). */
+  readonly id: string;
+
+  /** How this provider manages its connection. See CONNECTION_MODES. */
+  readonly connectionMode: ConnectionMode;
+
+  /** Who is responsible for session state and history. See SESSION_OWNERSHIP. */
+  readonly sessionOwnership: SessionOwnership;
+
+  /** Declare which optional capabilities this provider supports. */
+  readonly capabilities: ProviderCapabilities;
+
+  // ── Core methods — all providers must implement ──────────────────────────
+
+  /**
+   * Initialise the provider with the given configuration.
+   * For persistent providers this may open a WebSocket; for per-request providers
+   * this typically just validates config and sets internal state.
+   * @throws {ProviderError} if configuration is invalid or the initial handshake fails.
+   */
+  connect(config: ProviderConfig): Promise<void>;
+
+  /**
+   * Release all resources held by this provider and stop any background activity
+   * (keep-alive timers, background reconnect loops, etc.).
+   * Safe to call multiple times.
+   */
+  disconnect(): Promise<void>;
+
+  /**
+   * Send a user message to the given session.
+   * @param sessionId  - The session ID returned by createSession().
+   * @param message    - The user's text message.
+   * @param attachments - Optional file/image attachments (only when capabilities.attachments is true).
+   */
+  send(sessionId: string, payload: string | ProviderContextPayload, attachments?: TransportAttachment[], extraSystemPrompt?: string): Promise<void>;
+
+  /**
+   * Best-effort cancellation of the current in-flight turn for a session.
+   * Providers that support interruption should implement this.
+   */
+  cancel?(sessionId: string): Promise<void>;
+
+  /**
+   * Register a callback to receive incremental output deltas while the agent is streaming.
+   * Only meaningful when capabilities.streaming is true.
+   * @returns Unsubscribe function that removes the callback.
+   */
+  onDelta(cb: (sessionId: string, delta: MessageDelta) => void): () => void;
+
+  /**
+   * Register a callback to receive the final completed message after the agent finishes a turn.
+   * @returns Unsubscribe function that removes the callback.
+   */
+  onComplete(cb: (sessionId: string, message: AgentMessage) => void): () => void;
+
+  /**
+   * Register a callback to receive provider errors scoped to a session.
+   * @returns Unsubscribe function that removes the callback.
+   */
+  onError(cb: (sessionId: string, error: ProviderError) => void): () => void;
+
+  /**
+   * Strongly-typed active-work snapshot for lifecycle gating.
+   * This is separate from provider diagnostics: diagnostics are debug JSON,
+   * while this snapshot is a small contract that runtimes may use to defer
+   * clean idle/queue drain while provider-owned tool or background work is open.
+   */
+  getActiveWorkSnapshot?(sessionId: string): ProviderActiveWorkSnapshot | null;
+
+  /**
+   * Create a new session on the provider.
+   * @param config - Session creation parameters.
+   * @returns The provider-assigned session ID to pass to subsequent calls.
+   */
+  createSession(config: SessionConfig): Promise<string>;
+
+  /**
+   * End a session and release any provider-side resources associated with it.
+   * @param sessionId - The session ID returned by createSession().
+   */
+  endSession(sessionId: string): Promise<void>;
+
+  // ── Optional methods — gated by capabilities ─────────────────────────────
+
+  /**
+   * Register a callback for discrete tool-call events.
+   * Only call when capabilities.toolCalling is true.
+   */
+  onToolCall?(cb: (sessionId: string, tool: ToolCallEvent) => void): void;
+
+  /**
+   * Register a callback for provider session metadata changes.
+   * Used by SDK-backed providers that learn durable resume IDs after the first turn.
+   */
+  onSessionInfo?(cb: (sessionId: string, info: SessionInfoUpdate) => void): () => void;
+
+  /**
+   * Register a callback for transient provider status changes (e.g. compacting).
+   * Used by SDK-backed providers that can surface phases before a final response arrives.
+   */
+  onStatus?(cb: (sessionId: string, status: ProviderStatusUpdate) => void): () => void;
+
+  /**
+   * Register a callback for token/context usage updates that can arrive
+   * independently from final assistant messages. Used by transports such as
+   * Codex SDK where tokenUsage notifications may race before or after
+   * item/turn completion.
+   */
+  onUsage?(cb: (sessionId: string, update: ProviderUsageUpdate) => void): () => void;
+
+  /**
+   * Register a callback for approval requests from the agent.
+   * Only call when capabilities.approval is true.
+   */
+  onApprovalRequest?(cb: (sessionId: string, req: ApprovalRequest) => void): void;
+
+  /**
+   * Respond to a pending approval request.
+   * Only call when capabilities.approval is true.
+   * @param sessionId - The session the approval belongs to.
+   * @param requestId - The ApprovalRequest.id to respond to.
+   * @param approved  - Whether the user granted or denied the request.
+   */
+  respondApproval?(sessionId: string, requestId: string, approved: boolean): Promise<void>;
+
+  /**
+   * Attempt to reconnect to an existing remote session by its provider-side ID.
+   * Only call when capabilities.sessionRestore is true.
+   * @returns true if the session was successfully restored, false if not found or expired.
+   */
+  restoreSession?(sessionId: string): Promise<boolean>;
+
+  /**
+   * Update provider-side model/agent selection for an existing session record.
+   * Used by local-sdk providers that apply model choice on each send.
+   */
+  setSessionAgentId?(sessionId: string, agentId: string): void;
+
+  /**
+   * Update provider-side reasoning/thinking effort for an existing session record.
+   * Used by local-sdk providers that apply the effort on subsequent turns.
+   */
+  setSessionEffort?(sessionId: string, effort: TransportEffortLevel): void;
+
+  /**
+   * Enumerate all remote sessions visible to this provider.
+   * Useful for session-picker UIs and resuming orphaned sessions.
+   * Only call when capabilities.sessionRestore is true.
+   */
+  listSessions?(): Promise<RemoteSessionInfo[]>;
+
+  /**
+   * Return the list of models available for this provider.
+   *
+   * Providers that support a model picker MUST implement this method.
+   * The result is used by `transport.list_models` → web model-picker.
+   * Implementations should cache results (≥ 30s TTL) to avoid hammering
+   * the underlying SDK on every UI open.
+   *
+   * @param force  When true, bypass any internal cache and re-probe.
+   */
+  listModels?(force?: boolean): Promise<ProviderModelList>;
+
+  /**
+   * Report the provider's live managed-MCP registration state when available.
+   * The daemon status surface uses this instead of assuming provider readiness.
+   */
+  getMemoryMcpStatus?(): MemoryMcpProviderStatusView;
+
+  /**
+   * Return provider-owned live state for a bound session, if the provider can
+   * expose it safely. This is diagnostic-only and must not include prompts,
+   * user text, API keys, environment variables, or raw MCP configuration.
+   */
+  getSessionDiagnostics?(sessionId: string): Record<string, unknown> | null;
+}
+
+/** A single model entry returned by listModels(). */
+export interface ProviderModelInfo {
+  id: string;
+  name?: string;
+  supportsReasoningEffort?: boolean;
+}
+
+/** Shape returned by TransportProvider.listModels(). */
+export interface ProviderModelList {
+  models: ProviderModelInfo[];
+  defaultModel?: string;
+  /** True when the provider is authenticated and returned real model data. */
+  isAuthenticated?: boolean;
+  /** Human-readable probe error — shown in the picker when models is empty. */
+  error?: string;
+}
+
+export function normalizeProviderPayload(
+  payload: string | ProviderContextPayload,
+  attachments?: TransportAttachment[],
+  extraSystemPrompt?: string,
+): ProviderContextPayload {
+  if (typeof payload !== 'string') {
+    if (extraSystemPrompt?.trim()) {
+      throw new Error('Normalized provider payload must not be combined with legacy extraSystemPrompt');
+    }
+    return payload;
+  }
+  const systemText = extraSystemPrompt?.trim() || undefined;
+  return {
+    userMessage: payload,
+    assembledMessage: payload,
+    sessionSystemText: undefined,
+    turnSystemText: undefined,
+    systemText,
+    messagePreamble: undefined,
+    attachments,
+    context: {
+      sessionSystemText: undefined,
+      turnSystemText: undefined,
+      systemText,
+      messagePreamble: undefined,
+      requiredAuthoredContext: [],
+      advisoryAuthoredContext: [],
+      appliedDocumentVersionIds: [],
+      diagnostics: [],
+    },
+    authority: {
+      namespace: {
+        scope: 'personal',
+        projectId: 'legacy-send',
+      },
+      authoritySource: 'none',
+      freshness: 'missing',
+      fallbackAllowed: true,
+      retryScheduled: false,
+      providerPolicyOutcome: 'allowed',
+      diagnostics: systemText ? ['legacy-extra-system-prompt'] : ['legacy-message-only'],
+    },
+    supportClass: 'full-normalized-context-injection',
+    diagnostics: systemText ? ['legacy-extra-system-prompt'] : ['legacy-message-only'],
+  };
+}

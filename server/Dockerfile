@@ -1,0 +1,121 @@
+# ── Stage 1: Build ────────────────────────────────────────────────────────────
+FROM public.ecr.aws/docker/library/node:24-bookworm-slim AS builder
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends zip python3 make g++ \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Preserve the root package boundary so NodeNext compiles /app/src as ESM.
+COPY package.json ./
+
+# Install deps for server
+COPY server/package.json server/package-lock.json* ./server/
+RUN cd server && npm ci --ignore-scripts
+
+# Install deps for web
+COPY web/package.json web/package-lock.json* web/.npmrc* ./web/
+RUN cd web && npm ci --ignore-scripts
+
+# Copy source
+COPY server/ ./server/
+COPY web/ ./web/
+COPY src/repo/ ./src/repo/
+COPY src/agent/repository-identity-service.ts ./src/agent/repository-identity-service.ts
+COPY src/shared/ ./src/shared/
+COPY shared/ ./shared/
+
+# Build web (BUILD_TIME arg ensures cache is busted on each CI run)
+ARG BUILD_TIME
+ENV BUILD_TIME=${BUILD_TIME}
+RUN cd web && npm run build
+
+# Generate OTA update bundle + manifest
+ARG OTA_VERSION=0
+RUN mkdir -p /app/updates \
+ && cd web/dist && zip -r /app/updates/bundle.zip . \
+ && cd /app \
+ && SHA=$(sha256sum /app/updates/bundle.zip | cut -d' ' -f1) \
+ && printf '{"version":%s,"sha256":"%s","url":"/api/updates/bundle.zip","buildTime":"%s"}\n' \
+      "${OTA_VERSION}" "${SHA}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      > /app/updates/manifest.json
+
+# Build server TypeScript
+RUN cd server && npm run build
+
+# ── Stage 1.5: Stable embedding-model cache ──────────────────────────────────
+# The 73MB @huggingface/transformers model layer used to invalidate on every
+# unrelated server dep bump because this stage COPY'd server/package.json +
+# package-lock.json wholesale. Keep the preload inputs minimal so the cache
+# only busts when something that actually affects the model download changes:
+#   • HF_TRANSFORMERS_VERSION (pinned here in lock-step with server/package.json)
+#   • server/scripts/preload-embedding-model.mjs
+#   • shared/embedding-config.ts (model name / dtype)
+FROM public.ecr.aws/docker/library/node:24-bookworm-slim AS embedding-model
+
+WORKDIR /app
+
+ENV IMCODES_EMBEDDING_CACHE_DIR=/app/embedding-cache
+
+# Pinned explicitly (NOT via ^4.1.0) so `npm install` can't silently resolve
+# to a later patch and invalidate this layer. Bump this in tandem with the
+# version in server/package.json whenever transformers upgrades.
+ARG HF_TRANSFORMERS_VERSION=4.1.0
+RUN npm init -y >/dev/null \
+ && npm install --omit=dev --ignore-scripts --no-audit --no-fund \
+      "@huggingface/transformers@${HF_TRANSFORMERS_VERSION}"
+
+COPY server/scripts/preload-embedding-model.mjs ./scripts/preload-embedding-model.mjs
+COPY shared/embedding-config.ts ./shared/embedding-config.ts
+
+ARG PRELOAD_EMBEDDING_MODEL=1
+ARG IMCODES_EMBEDDING_PRELOAD_ATTEMPTS=3
+ARG IMCODES_EMBEDDING_PRELOAD_RETRY_DELAY_MS=2000
+ARG IMCODES_EMBEDDING_PRELOAD_SOFT_FAIL=0
+ENV IMCODES_EMBEDDING_PRELOAD_ATTEMPTS=${IMCODES_EMBEDDING_PRELOAD_ATTEMPTS}
+ENV IMCODES_EMBEDDING_PRELOAD_RETRY_DELAY_MS=${IMCODES_EMBEDDING_PRELOAD_RETRY_DELAY_MS}
+ENV IMCODES_EMBEDDING_PRELOAD_SOFT_FAIL=${IMCODES_EMBEDDING_PRELOAD_SOFT_FAIL}
+RUN mkdir -p /app/embedding-cache \
+ && if [ "$PRELOAD_EMBEDDING_MODEL" = "1" ]; then node ./scripts/preload-embedding-model.mjs; fi
+
+# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
+FROM public.ecr.aws/docker/library/node:24-bookworm-slim AS runtime
+
+WORKDIR /app
+
+ENV IMCODES_EMBEDDING_CACHE_DIR=/app/embedding-cache
+
+# Install production deps only
+COPY server/package.json server/package-lock.json* ./
+RUN npm ci --omit=dev --ignore-scripts
+
+# Copy preloaded embedding cache from the stable pre-app layer so normal code/web
+# changes do not invalidate the model artifacts.
+COPY --from=embedding-model /app/embedding-cache ./embedding-cache
+
+# Copy compiled server (rootDir=".." puts output under dist/server/src/ and dist/shared/)
+COPY --from=builder /app/server/dist ./dist
+
+# Copy server src/db/migrations (needed at runtime for runMigrations)
+COPY --from=builder /app/server/src/db/migrations ./dist/server/src/db/migrations
+
+# Copy web static files
+COPY --from=builder /app/web/dist ./web/dist
+
+# Copy landing page
+COPY landing/ ./landing/
+
+# Copy OTA update bundle
+COPY --from=builder /app/updates ./updates
+
+EXPOSE 3000
+
+ARG APP_VERSION=0.0.0
+ENV NODE_ENV=production
+ENV APP_VERSION=${APP_VERSION}
+ENV WEB_DIST_PATH=/app/web/dist
+ENV LANDING_DIST_PATH=/app/landing
+ENV UPDATES_DIST_PATH=/app/updates
+
+CMD ["node", "dist/server/src/index.js"]

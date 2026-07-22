@@ -1,0 +1,9 @@
+{
+  "staging": {
+    "enabled": true,
+    "command": "npm",
+    "args": ["run", "deploy:staging"],
+    "cwd": ".",
+    "timeoutMs": 600000
+  }
+}

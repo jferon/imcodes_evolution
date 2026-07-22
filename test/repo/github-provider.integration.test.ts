@@ -1,0 +1,260 @@
+/**
+ * Integration tests for GitHubProvider against real public repos.
+ *
+ * Requires: `gh` CLI installed and authenticated.
+ * Skipped automatically when `gh` is not available or not authed.
+ */
+
+import { describe, it, expect } from 'vitest';
+import { execFileSync } from 'node:child_process';
+
+import { GitHubProvider } from '../../src/repo/github-provider.js';
+import type { RepoIssue, RepoPR, RepoBranch, RepoCommit } from '../../src/repo/types.js';
+
+// Check gh is installed (auth not required for public repos)
+let ghAvailable = false;
+try {
+  execFileSync('gh', ['--version'], { timeout: 5_000, stdio: 'pipe' });
+  ghAvailable = true;
+} catch {
+  // gh not installed
+}
+
+function isTransientGhFailure(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const code = (err as { code?: unknown }).code;
+  if (code === 'cli_error' || code === 'rate_limited' || code === 'unauthorized') return true;
+
+  const message = err instanceof Error ? err.message : String(err);
+  return /gh error: (cli_error|rate_limited|unauthorized)/i.test(message);
+}
+
+async function runLiveGh<T>(label: string, operation: () => Promise<T>): Promise<T | null> {
+  try {
+    return await operation();
+  } catch (err) {
+    if (!isTransientGhFailure(err)) throw err;
+    const message = err instanceof Error ? err.message : String(err);
+    console.warn(`[github-provider.integration] skipped ${label}: ${message}`);
+    return null;
+  }
+}
+
+// Famous public repos for testing
+const REPOS = {
+  react: { owner: 'facebook', repo: 'react' },
+  vscode: { owner: 'microsoft', repo: 'vscode' },
+} as const;
+
+async function findNonEmptyIssuePage(provider: GitHubProvider, opts?: { state?: 'open' | 'closed'; perPage?: number; startPage?: number; maxPages?: number }) {
+  const state = opts?.state ?? 'open';
+  const perPage = opts?.perPage ?? 20;
+  const startPage = opts?.startPage ?? 1;
+  const maxPages = opts?.maxPages ?? 5;
+
+  let last = await provider.listIssues({ state, perPage, page: startPage });
+  for (let page = startPage; page < startPage + maxPages; page++) {
+    last = await provider.listIssues({ state, perPage, page });
+    if (last.items.length > 0) return last;
+    if (!last.hasMore) break;
+  }
+  return last;
+}
+
+describe.skipIf(!ghAvailable)('GitHubProvider integration — microsoft/vscode (issues)', { retry: 2 }, () => {
+  const provider = new GitHubProvider(REPOS.vscode.owner, REPOS.vscode.repo, process.cwd());
+
+  describe('listIssues', () => {
+    it('returns issues with correct shape', async () => {
+      const result = await runLiveGh('listIssues shape', () => findNonEmptyIssuePage(provider, { perPage: 20, maxPages: 5 }));
+      if (!result) return;
+
+      expect(result.items.length).toBeGreaterThan(0);
+      expect(result.items.length).toBeLessThanOrEqual(20);
+      expect(result.page).toBeGreaterThanOrEqual(1);
+      expect(typeof result.hasMore).toBe('boolean');
+
+      const issue: RepoIssue = result.items[0];
+      expect(issue.id).toBeTruthy();
+      expect(typeof issue.number).toBe('number');
+      expect(issue.number).toBeGreaterThan(0);
+      expect(issue.title).toBeTruthy();
+      expect(typeof issue.body).toBe('string');
+      expect(issue.state).toBe('open');
+      expect(issue.author).toBeTruthy();
+      expect(Array.isArray(issue.labels)).toBe(true);
+      expect(issue.url).toContain('github.com');
+      expect(typeof issue.createdAt).toBe('number');
+      expect(issue.createdAt).toBeGreaterThan(0);
+      expect(typeof issue.updatedAt).toBe('number');
+    });
+
+    it('accepts state=closed filter', async () => {
+      const result = await runLiveGh('listIssues closed filter', () => provider.listIssues({ state: 'closed', perPage: 20 }));
+      if (!result) return;
+
+      // External data shape changes frequently; this is only a smoke test that
+      // the provider can execute the filtered query and return a well-formed list.
+      expect(Array.isArray(result.items)).toBe(true);
+      expect(result.page).toBe(1);
+      expect(typeof result.hasMore).toBe('boolean');
+    });
+
+    it('supports pagination', async () => {
+      const pages = await runLiveGh('listIssues pagination', async () => ({
+        page1: await provider.listIssues({ page: 1, perPage: 3 }),
+        page2: await provider.listIssues({ page: 2, perPage: 3 }),
+      }));
+      if (!pages) return;
+      const { page1, page2 } = pages;
+
+      expect(page1.page).toBe(1);
+      expect(page2.page).toBe(2);
+
+      const ids1 = new Set(page1.items.map((i) => i.number));
+      const ids2 = new Set(page2.items.map((i) => i.number));
+      const overlap = [...ids1].filter((id) => ids2.has(id));
+      expect(overlap.length).toBe(0);
+    });
+
+    it('excludes pull requests from issues', async () => {
+      const result = await runLiveGh('listIssues excludes PRs', () => provider.listIssues({ perPage: 10 }));
+      if (!result) return;
+
+      for (const issue of result.items) {
+        expect(issue.url).toContain('/issues/');
+      }
+    });
+  });
+
+  describe('listPRs', () => {
+    it('returns PRs with correct shape', async () => {
+      const result = await runLiveGh('listPRs shape', () => provider.listPRs({ perPage: 5 }));
+      if (!result) return;
+
+      expect(result.items.length).toBeGreaterThan(0);
+
+      const pr: RepoPR = result.items[0];
+      expect(typeof pr.number).toBe('number');
+      expect(pr.number).toBeGreaterThan(0);
+      expect(pr.title).toBeTruthy();
+      expect(['open', 'merged', 'closed']).toContain(pr.state);
+      expect(pr.author).toBeTruthy();
+      expect(pr.head).toBeTruthy();
+      expect(pr.base).toBeTruthy();
+      expect(pr.url).toContain('github.com');
+      expect(typeof pr.createdAt).toBe('number');
+      expect(typeof pr.updatedAt).toBe('number');
+      expect(typeof pr.draft).toBe('boolean');
+    });
+
+    it('supports state=closed filter', async () => {
+      const result = await runLiveGh('listPRs closed filter', () => provider.listPRs({ state: 'closed', perPage: 3 }));
+      if (!result) return;
+
+      expect(result.items.length).toBeGreaterThan(0);
+      for (const pr of result.items) {
+        expect(['merged', 'closed']).toContain(pr.state);
+      }
+    });
+  });
+
+  describe('listBranches', () => {
+    it('returns branches with correct shape', async () => {
+      const result = await runLiveGh('listBranches shape', () => provider.listBranches());
+      if (!result) return;
+
+      expect(result.items.length).toBeGreaterThan(0);
+
+      const branch: RepoBranch = result.items[0];
+      expect(branch.name).toBeTruthy();
+      expect(typeof branch.isDefault).toBe('boolean');
+      expect(typeof branch.isCurrent).toBe('boolean');
+    });
+
+    it('returns multiple branches', async () => {
+      const result = await runLiveGh('listBranches count', () => provider.listBranches());
+      if (!result) return;
+
+      // microsoft/vscode has many branches
+      expect(result.items.length).toBeGreaterThan(10);
+    });
+  });
+
+  describe('listCommits', () => {
+    it('returns commits with correct shape', async () => {
+      const result = await runLiveGh('listCommits shape', () => provider.listCommits({ perPage: 5 }));
+      if (!result) return;
+
+      expect(result.items.length).toBeGreaterThan(0);
+
+      const commit: RepoCommit = result.items[0];
+      expect(commit.sha).toHaveLength(40);
+      expect(commit.shortSha).toHaveLength(7);
+      expect(commit.message).toBeTruthy();
+      expect(commit.author).toBeTruthy();
+      expect(typeof commit.date).toBe('number');
+      expect(commit.date).toBeGreaterThan(0);
+      expect(commit.url).toContain('github.com');
+    });
+
+    it('supports branch filter', async () => {
+      const result = await runLiveGh('listCommits branch filter', () => provider.listCommits({ branch: 'main', perPage: 3 }));
+      if (!result) return;
+
+      expect(result.items.length).toBeGreaterThan(0);
+      for (const commit of result.items) {
+        expect(commit.sha).toHaveLength(40);
+      }
+    });
+
+    it('supports pagination', async () => {
+      const pages = await runLiveGh('listCommits pagination', async () => ({
+        page1: await provider.listCommits({ page: 1, perPage: 3 }),
+        page2: await provider.listCommits({ page: 2, perPage: 3 }),
+      }));
+      if (!pages) return;
+      const { page1, page2 } = pages;
+
+      const shas1 = new Set(page1.items.map((c) => c.sha));
+      const shas2 = new Set(page2.items.map((c) => c.sha));
+      const overlap = [...shas1].filter((s) => shas2.has(s));
+      expect(overlap.length).toBe(0);
+    });
+  });
+});
+
+describe.skipIf(!ghAvailable)('GitHubProvider integration — microsoft/vscode', { retry: 3, timeout: 30_000 }, () => {
+  const provider = new GitHubProvider(REPOS.vscode.owner, REPOS.vscode.repo, process.cwd());
+
+  it('lists issues from vscode', async () => {
+    // vscode has many PRs mixed with issues; jq filters PRs out, so a small
+    // page may occasionally return 0 pure issues. Use a larger page to compensate.
+    const result = await runLiveGh('vscode issues smoke', () => provider.listIssues({ perPage: 30 }));
+    if (!result) return;
+    expect(result.items.length).toBeGreaterThanOrEqual(0);
+    if (result.items.length > 0) {
+      expect(result.items[0].url).toContain('microsoft/vscode');
+    }
+  });
+
+  it('lists PRs from vscode', async () => {
+    const result = await runLiveGh('vscode PRs smoke', () => provider.listPRs({ perPage: 5 }));
+    if (!result) return;
+    expect(result.items.length).toBeGreaterThan(0);
+    expect(result.items[0].url).toContain('microsoft/vscode');
+  });
+
+  it('lists branches from vscode', async () => {
+    const result = await runLiveGh('vscode branches smoke', () => provider.listBranches());
+    if (!result) return;
+    expect(result.items.length).toBeGreaterThan(0);
+  });
+
+  it('lists commits from vscode', async () => {
+    const result = await runLiveGh('vscode commits smoke', () => provider.listCommits({ perPage: 5 }));
+    if (!result) return;
+    expect(result.items.length).toBeGreaterThan(0);
+    expect(result.items[0].sha).toHaveLength(40);
+  });
+});

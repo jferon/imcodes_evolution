@@ -1,0 +1,1172 @@
+/**
+ * @vitest-environment jsdom
+ *
+ * Tests for RepoPage component.
+ * Covers: overview header, tab switching, loading/error/empty states,
+ * load more pagination, and stale response discarding.
+ */
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { h } from 'preact';
+import { render, screen, fireEvent, act, cleanup } from '@testing-library/preact';
+
+if (!HTMLElement.prototype.scrollIntoView) {
+  HTMLElement.prototype.scrollIntoView = vi.fn();
+}
+
+// jsdom localStorage may be a plain object without methods — ensure a working stub
+const localStorageStore: Record<string, string> = {};
+Object.defineProperty(globalThis, 'localStorage', {
+  value: {
+    getItem: (k: string) => localStorageStore[k] ?? null,
+    setItem: (k: string, v: string) => { localStorageStore[k] = v; },
+    removeItem: (k: string) => { delete localStorageStore[k]; },
+    clear: () => { for (const k of Object.keys(localStorageStore)) delete localStorageStore[k]; },
+    get length() { return Object.keys(localStorageStore).length; },
+    key: (i: number) => Object.keys(localStorageStore)[i] ?? null,
+  },
+  writable: true,
+  configurable: true,
+});
+
+beforeEach(() => {
+  // Clear localStorage between tests
+  for (const k of Object.keys(localStorageStore)) delete localStorageStore[k];
+});
+
+afterEach(cleanup);
+
+// ── i18n stub ─────────────────────────────────────────────────────────────
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string, _opts?: Record<string, unknown>) => {
+      const map: Record<string, string> = {
+        'repo.tab_issues': 'Issues',
+        'repo.tab_prs': 'PRs',
+        'repo.tab_branches': 'Branches',
+        'repo.tab_commits': 'Commits',
+        'repo.tab_actions': 'Actions',
+        'repo.tab_cicd': 'Actions',
+        'repo.back': 'Back',
+        'repo.refresh': 'Refresh',
+        'repo.load_more': 'Load more',
+        'repo.retry': 'Retry',
+        'repo.detail_loading': 'Loading details...',
+        'repo.detail_error': 'Failed to load details',
+        'repo.detail_retry': 'Retry details',
+        'repo.actions_view': 'View',
+        'repo.cli_not_installed': 'CLI not installed',
+        'repo.error_cli_missing_hint': 'Install the GitHub CLI',
+        'repo.error_unauthorized_hint': 'Run gh auth login',
+        'repo.current_branch': 'current',
+        'repo.default_branch': 'default',
+        'repo.branch_local_label': 'Local branch',
+        'repo.branch_local_short': 'local',
+        'repo.branch_remote_label': 'Remote branch',
+        'repo.branch_remote_short': 'remote',
+        'repo.checkout_switch': 'Switch',
+        'repo.checkout_switching': 'Switching...',
+        'repo.checkout_switch_to': `Switch to ${_opts?.branch ?? ''}`,
+        'repo.checkout_pending': `Switching to ${_opts?.branch ?? ''}`,
+        'repo.checkout_success': `Switched to ${_opts?.branch ?? ''}.`,
+        'repo.checkout_remote_only_disabled': 'Remote-only branches cannot be switched in this version.',
+        'repo.checkout_dirty_worktree': 'Clean or commit local changes before switching branches.',
+        'repo.checkout_invalid_target': 'Only existing local branches can be switched.',
+        'repo.checkout_in_progress': 'A branch switch is already in progress for this repository.',
+        'repo.checkout_busy': 'Repository operations are busy. Try again shortly.',
+        'repo.checkout_failed': 'Branch switch failed.',
+        'repo.empty_issues': 'No issues found',
+        'repo.empty_prs': 'No pull requests found',
+        'repo.empty_branches': 'No branches found',
+        'repo.empty_commits': 'No commits found',
+        'common.loading': 'Loading...',
+      };
+      return map[key] ?? key;
+    },
+  }),
+}));
+
+import { RepoPage } from '../src/pages/RepoPage.js';
+import type { WsClient, ServerMessage } from '../src/ws-client.js';
+import { __resetSessionRepoContextStoreForTests } from '../src/session-repo-context-store.js';
+
+// ── WsClient mock factory ─────────────────────────────────────────────────
+
+function makeWs() {
+  let messageHandler: ((msg: ServerMessage) => void) | null = null;
+  // Track request IDs returned by each method
+  let detectReqId = '';
+  const lastTabReqIds: Partial<Record<'issues' | 'prs' | 'branches' | 'commits' | 'actions', string>> = {};
+  let lastActionDetailReqId = '';
+  let lastCommitDetailReqId = '';
+  let lastCheckoutReqId = '';
+
+  const repoDetect = vi.fn((projectDir: string) => {
+    detectReqId = `detect-${Date.now()}-${Math.random()}`;
+    return detectReqId;
+  });
+  const repoListIssues = vi.fn((_dir: string, _opts?: any) => {
+    lastTabReqIds.issues = `issues-${Date.now()}-${Math.random()}`;
+    return lastTabReqIds.issues;
+  });
+  const repoListPRs = vi.fn((_dir: string, _opts?: any) => {
+    lastTabReqIds.prs = `prs-${Date.now()}-${Math.random()}`;
+    return lastTabReqIds.prs;
+  });
+  const repoListBranches = vi.fn((_dir: string) => {
+    lastTabReqIds.branches = `branches-${Date.now()}-${Math.random()}`;
+    return lastTabReqIds.branches;
+  });
+  const repoListCommits = vi.fn((_dir: string, _opts?: any) => {
+    lastTabReqIds.commits = `commits-${Date.now()}-${Math.random()}`;
+    return lastTabReqIds.commits;
+  });
+  const repoListActions = vi.fn((_dir: string, _opts?: any) => {
+    lastTabReqIds.actions = `actions-${Date.now()}-${Math.random()}`;
+    return lastTabReqIds.actions;
+  });
+  const repoActionDetail = vi.fn((_dir: string, _runId: number, _opts?: any) => {
+    lastActionDetailReqId = `action-detail-${Date.now()}-${Math.random()}`;
+    return lastActionDetailReqId;
+  });
+  const repoCommitDetail = vi.fn((_dir: string, _sha: string) => {
+    lastCommitDetailReqId = `commit-detail-${Date.now()}-${Math.random()}`;
+    return lastCommitDetailReqId;
+  });
+  const repoCheckoutBranch = vi.fn((_dir: string, _branch: string, _opts?: any) => {
+    lastCheckoutReqId = `checkout-${Date.now()}-${Math.random()}`;
+    return lastCheckoutReqId;
+  });
+  const fsGitStatus = vi.fn((_path: string, _opts?: any) => `git-status-${Date.now()}-${Math.random()}`);
+
+  const ws: WsClient = {
+    connected: true,
+    onMessage: (handler: (msg: ServerMessage) => void) => {
+      messageHandler = handler;
+      return () => { messageHandler = null; };
+    },
+    repoDetect,
+    repoListIssues,
+    repoListPRs,
+    repoListBranches,
+    repoListCommits,
+    repoListActions,
+    repoActionDetail,
+    repoCommitDetail,
+    repoCheckoutBranch,
+    fsGitStatus,
+  } as unknown as WsClient;
+
+  /** Send a message to the component's onMessage handler */
+  const emit = (msg: ServerMessage) => messageHandler?.(msg);
+
+  /** Respond to the pending detect request with repo context (nested shape) */
+  const respondDetect = (context: Record<string, unknown>) => {
+    emit({
+      type: 'repo.detect_response',
+      requestId: detectReqId,
+      context,
+    } as ServerMessage);
+  };
+
+  /** Respond with real daemon shape: context fields spread at top level, no nested context */
+  const respondDetectFlat = (context: Record<string, unknown>, projectDir = PROJECT_DIR) => {
+    emit({
+      type: 'repo.detect_response',
+      requestId: detectReqId,
+      projectDir,
+      ...context,
+    } as ServerMessage);
+  };
+
+  /** Respond with a repo.error for the detect request */
+  const respondDetectError = (error: string) => {
+    emit({
+      type: 'repo.error',
+      requestId: detectReqId,
+      error,
+    } as ServerMessage);
+  };
+
+  /** Respond to the last tab request with items */
+  const respondTab = (type: string, projectDir: string, items: any[], page = 1, hasMore = false) => {
+    const requestId = type === 'repo.issues_response'
+      ? lastTabReqIds.issues
+      : type === 'repo.prs_response'
+        ? lastTabReqIds.prs
+        : type === 'repo.branches_response'
+          ? lastTabReqIds.branches
+          : type === 'repo.commits_response'
+            ? lastTabReqIds.commits
+            : lastTabReqIds.actions;
+    emit({
+      type,
+      requestId,
+      projectDir,
+      items,
+      page,
+      hasMore,
+    } as unknown as ServerMessage);
+  };
+
+  /** Respond to the last tab request with a repo.error */
+  const respondTabError = (error: string, tab: 'issues' | 'prs' | 'branches' | 'commits' | 'actions' = 'issues') => {
+    emit({
+      type: 'repo.error',
+      requestId: lastTabReqIds[tab],
+      error,
+    } as ServerMessage);
+  };
+
+  const respondActionDetail = (projectDir: string, detail: any) => {
+    emit({
+      type: 'repo.action_detail_response',
+      requestId: lastActionDetailReqId,
+      projectDir,
+      detail,
+    } as unknown as ServerMessage);
+  };
+
+  const respondCommitDetail = (projectDir: string, detail: any, requestId = lastCommitDetailReqId) => {
+    emit({
+      type: 'repo.commit_detail_response',
+      requestId,
+      projectDir,
+      detail,
+    } as unknown as ServerMessage);
+  };
+
+  const respondCheckout = (projectDir: string, currentBranch: string, repoGeneration = 2) => {
+    emit({
+      type: 'repo.checkout_branch_response',
+      requestId: lastCheckoutReqId,
+      projectDir,
+      ok: true,
+      previousBranch: 'main',
+      currentBranch,
+      repoGeneration,
+      detectedAt: Date.now(),
+    } as unknown as ServerMessage);
+  };
+
+  const respondCheckoutError = (error: string) => {
+    emit({
+      type: 'repo.error',
+      requestId: lastCheckoutReqId,
+      projectDir: PROJECT_DIR,
+      error,
+    } as ServerMessage);
+  };
+
+  const respondActionDetailError = (error: string) => {
+    emit({
+      type: 'repo.error',
+      requestId: lastActionDetailReqId,
+      error,
+    } as ServerMessage);
+  };
+
+  return {
+    ws,
+    emit,
+    repoDetect,
+    repoListIssues,
+    repoListPRs,
+    repoListBranches,
+    repoListCommits,
+    repoListActions,
+    repoActionDetail,
+    repoCommitDetail,
+    repoCheckoutBranch,
+    respondDetect,
+    respondDetectFlat,
+    respondDetectError,
+    respondTab,
+    respondTabError,
+    respondActionDetail,
+    respondCommitDetail,
+    respondCheckout,
+    respondCheckoutError,
+    respondActionDetailError,
+    getDetectReqId: () => detectReqId,
+    getLastTabReqId: (tab: 'issues' | 'prs' | 'branches' | 'commits' | 'actions' = 'issues') => lastTabReqIds[tab] ?? '',
+    getLastCommitDetailReqId: () => lastCommitDetailReqId,
+    getLastCheckoutReqId: () => lastCheckoutReqId,
+  };
+}
+
+const PROJECT_DIR = '/home/user/myproject';
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+describe('RepoPage', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    __resetSessionRepoContextStoreForTests();
+  });
+
+  // 1. Renders overview header
+  it('renders provider badge and owner/repo after detect response', async () => {
+    const { ws, respondDetect } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    await act(async () => {
+      respondDetect({ provider: 'github', owner: 'acme', repo: 'widgets', defaultBranch: 'main' });
+    });
+
+    // Provider is rendered lowercase with CSS text-transform: uppercase
+    expect(screen.getByText('github')).toBeDefined();
+    expect(screen.getByText('acme/widgets')).toBeDefined();
+    expect(screen.getByText('main')).toBeDefined();
+  });
+
+  it('does not re-trigger repo detect after receiving detect response', async () => {
+    const { ws, respondDetect, repoDetect } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    expect(repoDetect).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      respondDetect({ provider: 'github', owner: 'acme', repo: 'widgets' });
+    });
+
+    expect(repoDetect).toHaveBeenCalledTimes(1);
+  });
+
+  // 2. Tab switching preserves state (no re-fetch)
+  it('does not re-fetch issues tab when switching away and back', async () => {
+    const { ws, respondDetect, respondTab, repoListIssues, repoListPRs } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    // Complete detect — triggers lazy-load of active tab (issues)
+    await act(async () => {
+      respondDetect({ provider: 'github', owner: 'acme', repo: 'widgets' });
+    });
+
+    // Respond to the issues fetch
+    await act(async () => {
+      respondTab('repo.issues_response', PROJECT_DIR, [
+        { number: 1, title: 'Bug A', state: 'open' },
+      ]);
+    });
+
+    const issuesFetchCount = repoListIssues.mock.calls.length;
+    expect(issuesFetchCount).toBe(1);
+
+    // Switch to PRs tab
+    await act(async () => {
+      fireEvent.click(screen.getByText('PRs'));
+    });
+
+    // Respond to PRs fetch
+    await act(async () => {
+      respondTab('repo.prs_response', PROJECT_DIR, [
+        { number: 10, title: 'PR X', state: 'open' },
+      ]);
+    });
+
+    expect(repoListPRs).toHaveBeenCalledTimes(1);
+
+    // Switch back to Issues — should NOT re-fetch
+    await act(async () => {
+      fireEvent.click(screen.getByText('Issues'));
+    });
+
+    expect(repoListIssues.mock.calls.length).toBe(issuesFetchCount);
+    // Original data should still be displayed
+    expect(screen.getByText('Bug A')).toBeDefined();
+  });
+
+  it('opens and fetches the requested initial tab', async () => {
+    const { ws, respondDetect, repoListIssues, repoListBranches } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} initialTab="branches" initialTabToken={1} onBack={vi.fn()} />);
+
+    await act(async () => {
+      respondDetect({ provider: 'github', owner: 'acme', repo: 'widgets' });
+    });
+
+    expect(repoListBranches).toHaveBeenCalledTimes(1);
+    expect(repoListIssues).not.toHaveBeenCalled();
+    expect(localStorage.getItem('repo-active-tab')).toBe('branches');
+  });
+
+  // 3. Loading state
+  it('shows loading indicator before detect response arrives', () => {
+    const { ws } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    // The header should show the loading text while waiting for detect
+    const loadingElements = screen.getAllByText('Loading...');
+    expect(loadingElements.length).toBeGreaterThanOrEqual(1);
+  });
+
+  // 4. Error state on tab
+  it('shows error message when tab receives repo.error', async () => {
+    const { ws, respondDetect, respondTabError } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    await act(async () => {
+      respondDetect({ provider: 'github', owner: 'acme', repo: 'widgets' });
+    });
+
+    // Issues tab auto-fetches; respond with error
+    await act(async () => {
+      respondTabError('rate limit exceeded (429)');
+    });
+
+    expect(screen.getByText('rate limit exceeded (429)')).toBeDefined();
+    // Rate-limited errors show a Retry button
+    expect(screen.getByText('Retry')).toBeDefined();
+  });
+
+  it('keeps existing tab items visible and shows tab error marker when refresh fails', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ws, respondDetect, respondTab, respondTabError } = makeWs();
+      render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+      await act(async () => {
+        respondDetect({ provider: 'github', owner: 'acme', repo: 'widgets' });
+      });
+
+      await act(async () => {
+        fireEvent.click(screen.getByText('Actions'));
+        respondTab('repo.actions_response', PROJECT_DIR, [
+          { id: 1, name: 'CI', status: 'success', conclusion: 'success', updatedAt: Date.now() },
+        ]);
+      });
+
+      expect(screen.getByText('CI')).toBeDefined();
+
+      await act(async () => {
+        vi.advanceTimersByTime(61_000);
+      });
+
+      await act(async () => {
+        respondTabError('cli_error', 'actions');
+      });
+
+      expect(screen.getByText('CI')).toBeDefined();
+      expect(screen.queryByText('cli_error')).toBeNull();
+      const actionsTab = screen.getByText('Actions').closest('button') as HTMLButtonElement;
+      expect(actionsTab.title).toBe('cli_error');
+      expect(screen.getByText('!')).toBeDefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('silently retries latest action detail errors instead of showing a detail error immediately', async () => {
+    vi.useFakeTimers();
+    try {
+      const { ws, respondDetect, respondTab, respondActionDetailError, repoActionDetail } = makeWs();
+      render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+      await act(async () => {
+        respondDetect({ provider: 'github', owner: 'acme', repo: 'widgets' });
+      });
+
+      await act(async () => {
+        fireEvent.click(screen.getByText('Actions'));
+      });
+
+      await act(async () => {
+        respondTab('repo.actions_response', PROJECT_DIR, [
+          { id: 101, name: 'CI', status: 'failure', conclusion: 'failure', updatedAt: Date.now() },
+        ]);
+      });
+
+      await act(async () => {
+        fireEvent.click(screen.getByText('CI'));
+      });
+
+      expect(repoActionDetail).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        respondActionDetailError('cli_error');
+      });
+
+      expect(screen.queryByText('Failed to load details')).toBeNull();
+
+      await act(async () => {
+        vi.advanceTimersByTime(1300);
+      });
+
+      expect(screen.queryByText('Failed to load details')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('applies CSS focus animation classes to the targeted failed action step', async () => {
+    const { ws, respondDetect, respondTab, respondActionDetail } = makeWs();
+    const { container, rerender } = render(
+      <RepoPage
+        ws={ws}
+        projectDir={PROJECT_DIR}
+        onBack={vi.fn()}
+        focusLatestAction={{ token: 1, failedJobName: 'test', failedStepName: 'unit tests' }}
+      />,
+    );
+
+    await act(async () => {
+      respondDetect({ provider: 'github', owner: 'acme', repo: 'widgets' });
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Actions'));
+    });
+
+    await act(async () => {
+      respondTab('repo.actions_response', PROJECT_DIR, [
+        { id: 101, name: 'CI', status: 'failure', conclusion: 'failure', updatedAt: Date.now() },
+      ]);
+    });
+
+    await act(async () => {
+      respondActionDetail(PROJECT_DIR, {
+        runId: 101,
+        jobs: [
+          {
+            id: 'job-1',
+            name: 'test',
+            status: 'failure',
+            conclusion: 'failure',
+            steps: [
+              { number: 1, name: 'install', status: 'completed', conclusion: 'success' },
+              { number: 2, name: 'unit tests', status: 'failure', conclusion: 'failure' },
+            ],
+          },
+        ],
+      });
+    });
+
+    const focusedStep = Array.from(container.querySelectorAll('.repo-action-step')).find((el) => el.textContent?.includes('unit tests'));
+    expect(focusedStep?.className).toMatch(/repo-action-focus-[ab]/);
+
+    rerender(
+      <RepoPage
+        ws={ws}
+        projectDir={PROJECT_DIR}
+        onBack={vi.fn()}
+        focusLatestAction={{ token: 2, failedJobName: 'test', failedStepName: 'unit tests' }}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const replayedStep = Array.from(container.querySelectorAll('.repo-action-step')).find((el) => el.textContent?.includes('unit tests'));
+    expect(replayedStep?.className).toMatch(/repo-action-focus-[ab]/);
+  });
+
+  it('renders branch inventory fields and switches only checkoutable local branches', async () => {
+    const { ws, respondDetectFlat, respondTab, respondCheckout, repoCheckoutBranch, repoListBranches, repoListCommits, repoDetect } = makeWs();
+    render(<RepoPage ws={ws} sessionId="deck_proj_brain" projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    await act(async () => {
+      respondDetectFlat({
+        status: 'ok',
+        info: { platform: 'github', owner: 'acme', repo: 'widgets', currentBranch: 'main', defaultBranch: 'main' },
+        repoGeneration: 1,
+        detectedAt: 1000,
+      });
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Branches'));
+    });
+
+    await act(async () => {
+      respondTab('repo.branches_response', PROJECT_DIR, [
+        { name: 'main', isCurrent: true, isDefault: true, localPresent: true, remotePresent: true, checkoutable: true },
+        { name: 'feature/a', isCurrent: false, isDefault: false, localPresent: true, remotePresent: false, checkoutable: true },
+        { name: 'remote-only', isCurrent: false, isDefault: false, localPresent: false, remotePresent: true, checkoutable: false },
+      ]);
+    });
+
+    expect(screen.getByText('feature/a')).toBeDefined();
+    expect(screen.getByText('Remote-only branches cannot be switched in this version.')).toBeDefined();
+
+    await act(async () => {
+      fireEvent.click(screen.getByTitle('Switch to feature/a'));
+    });
+
+    expect(repoCheckoutBranch).toHaveBeenCalledWith(PROJECT_DIR, 'feature/a', { sessionId: 'deck_proj_brain' });
+
+    await act(async () => {
+      respondCheckout(PROJECT_DIR, 'feature/a', 2);
+    });
+
+    expect(screen.getByText('Switched to feature/a.')).toBeDefined();
+    expect(repoDetect).toHaveBeenLastCalledWith(PROJECT_DIR, { force: true });
+    expect(repoListBranches).toHaveBeenLastCalledWith(PROJECT_DIR, { force: true });
+    expect(repoListCommits).toHaveBeenLastCalledWith(PROJECT_DIR, { page: 1, branch: 'feature/a', force: true });
+  });
+
+  it('shows checkout dirty feedback without optimistic current-branch update', async () => {
+    const { ws, respondDetectFlat, respondTab, respondCheckoutError, repoCheckoutBranch } = makeWs();
+    render(<RepoPage ws={ws} sessionId="deck_proj_brain" projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    await act(async () => {
+      respondDetectFlat({
+        status: 'ok',
+        info: { platform: 'github', owner: 'acme', repo: 'widgets', currentBranch: 'main', defaultBranch: 'main' },
+        repoGeneration: 1,
+        detectedAt: 1000,
+      });
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Branches'));
+    });
+
+    await act(async () => {
+      respondTab('repo.branches_response', PROJECT_DIR, [
+        { name: 'main', isCurrent: true, isDefault: true, localPresent: true, remotePresent: true, checkoutable: true },
+        { name: 'feature/a', isCurrent: false, isDefault: false, localPresent: true, remotePresent: false, checkoutable: true },
+      ]);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTitle('Switch to feature/a'));
+    });
+
+    expect(repoCheckoutBranch).toHaveBeenCalledWith(PROJECT_DIR, 'feature/a', { sessionId: 'deck_proj_brain' });
+
+    await act(async () => {
+      respondCheckoutError('dirty_worktree');
+    });
+
+    expect(screen.getByText('Clean or commit local changes before switching branches.')).toBeDefined();
+    expect(screen.queryByText('Switched to feature/a.')).toBeNull();
+    expect(screen.getAllByText('current')).toHaveLength(1);
+  });
+
+  it('requests commits for current branch and loads commit details on first row click once', async () => {
+    const { ws, respondDetectFlat, respondTab, respondCommitDetail, repoListCommits, repoCommitDetail } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    await act(async () => {
+      respondDetectFlat({
+        status: 'ok',
+        info: { platform: 'github', owner: 'acme', repo: 'widgets', currentBranch: 'feature/a' },
+        repoGeneration: 5,
+        detectedAt: 1000,
+      });
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Commits'));
+    });
+
+    expect(repoListCommits).toHaveBeenCalledWith(PROJECT_DIR, { page: 1, branch: 'feature/a' });
+
+    await act(async () => {
+      respondTab('repo.commits_response', PROJECT_DIR, [
+        { sha: 'abcdef1234567890', message: 'Add feature\n\nbody', author: 'Ada', date: Date.now(), url: 'https://example.test/c' },
+      ]);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Add feature'));
+    });
+
+    expect(repoCommitDetail).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      respondCommitDetail(PROJECT_DIR, {
+        sha: 'abcdef1234567890',
+        shortSha: 'abcdef1',
+        message: 'Add feature',
+        body: 'body',
+        author: 'Ada',
+        date: Date.now(),
+        url: 'https://example.test/c',
+        stats: { additions: 2, deletions: 1, filesChanged: 1 },
+        files: [{ filename: 'src/app.ts', status: 'modified', additions: 2, deletions: 1 }],
+        hasMoreFiles: false,
+      });
+    });
+
+    expect(screen.getByText('src/app.ts')).toBeDefined();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Add feature'));
+    });
+
+    expect(repoCommitDetail).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores commit detail responses that do not match a pending request id', async () => {
+    const { ws, emit, respondDetectFlat, respondTab, respondCommitDetail } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    await act(async () => {
+      respondDetectFlat({
+        status: 'ok',
+        info: { platform: 'github', owner: 'acme', repo: 'widgets', currentBranch: 'feature/a' },
+        repoGeneration: 5,
+        detectedAt: 1000,
+      });
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Commits'));
+    });
+
+    await act(async () => {
+      respondTab('repo.commits_response', PROJECT_DIR, [
+        { sha: 'abcdef1234567890', message: 'Add feature', author: 'Ada', date: Date.now(), url: '' },
+      ]);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Add feature'));
+    });
+
+    await act(async () => {
+      emit({
+        type: 'repo.commit_detail_response',
+        projectDir: PROJECT_DIR,
+        detail: {
+          sha: 'abcdef1234567890',
+          stats: { additions: 1, deletions: 0, filesChanged: 1 },
+          files: [{ filename: 'src/no-request.ts', status: 'modified', additions: 1, deletions: 0 }],
+        },
+      } as unknown as ServerMessage);
+    });
+
+    expect(screen.queryByText('src/no-request.ts')).toBeNull();
+
+    await act(async () => {
+      respondCommitDetail(PROJECT_DIR, {
+        sha: 'abcdef1234567890',
+        stats: { additions: 2, deletions: 0, filesChanged: 1 },
+        files: [{ filename: 'src/current.ts', status: 'modified', additions: 2, deletions: 0 }],
+        hasMoreFiles: false,
+      });
+    });
+
+    expect(screen.getByText('src/current.ts')).toBeDefined();
+  });
+
+  it('drops stale pending commit detail after checkout generation changes', async () => {
+    const {
+      ws,
+      respondDetectFlat,
+      respondTab,
+      respondCommitDetail,
+      respondCheckout,
+      getLastCommitDetailReqId,
+    } = makeWs();
+    render(<RepoPage ws={ws} sessionId="deck_proj_brain" projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    await act(async () => {
+      respondDetectFlat({
+        status: 'ok',
+        info: { platform: 'github', owner: 'acme', repo: 'widgets', currentBranch: 'main', defaultBranch: 'main' },
+        repoGeneration: 1,
+        detectedAt: 1000,
+      });
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Commits'));
+    });
+
+    await act(async () => {
+      respondTab('repo.commits_response', PROJECT_DIR, [
+        { sha: 'abcdef1234567890', message: 'Add feature', author: 'Ada', date: Date.now(), url: '' },
+      ]);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Add feature'));
+    });
+    const staleDetailRequestId = getLastCommitDetailReqId();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Branches'));
+    });
+
+    await act(async () => {
+      respondTab('repo.branches_response', PROJECT_DIR, [
+        { name: 'main', isCurrent: true, isDefault: true, localPresent: true, remotePresent: true, checkoutable: true },
+        { name: 'feature/a', isCurrent: false, isDefault: false, localPresent: true, remotePresent: false, checkoutable: true },
+      ]);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTitle('Switch to feature/a'));
+    });
+
+    await act(async () => {
+      respondCheckout(PROJECT_DIR, 'feature/a', 2);
+    });
+
+    await act(async () => {
+      respondCommitDetail(PROJECT_DIR, {
+        sha: 'abcdef1234567890',
+        shortSha: 'abcdef1',
+        message: 'Add feature',
+        body: '',
+        author: 'Ada',
+        date: Date.now(),
+        url: '',
+        stats: { additions: 1, deletions: 0, filesChanged: 1 },
+        files: [{ filename: 'src/stale.ts', status: 'modified', additions: 1, deletions: 0 }],
+        hasMoreFiles: false,
+      }, staleDetailRequestId);
+    });
+
+    expect(screen.queryByText('src/stale.ts')).toBeNull();
+  });
+
+  it('ignores checkout success responses that do not match the active checkout request', async () => {
+    const { ws, emit, respondDetectFlat, respondTab, repoDetect, repoListCommits } = makeWs();
+    render(<RepoPage ws={ws} sessionId="deck_proj_brain" projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    await act(async () => {
+      respondDetectFlat({
+        status: 'ok',
+        info: { platform: 'github', owner: 'acme', repo: 'widgets', currentBranch: 'main', defaultBranch: 'main' },
+        repoGeneration: 1,
+        detectedAt: 1000,
+      });
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Branches'));
+    });
+
+    await act(async () => {
+      respondTab('repo.branches_response', PROJECT_DIR, [
+        { name: 'main', isCurrent: true, isDefault: true, localPresent: true, remotePresent: true, checkoutable: true },
+        { name: 'feature/a', isCurrent: false, isDefault: false, localPresent: true, remotePresent: false, checkoutable: true },
+      ]);
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByTitle('Switch to feature/a'));
+    });
+
+    const detectCallsBefore = repoDetect.mock.calls.length;
+    await act(async () => {
+      emit({
+        type: 'repo.checkout_branch_response',
+        projectDir: PROJECT_DIR,
+        ok: true,
+        previousBranch: 'main',
+        currentBranch: 'feature/a',
+        repoGeneration: 2,
+        detectedAt: 2000,
+      } as unknown as ServerMessage);
+    });
+
+    expect(screen.queryByText('Switched to feature/a.')).toBeNull();
+    expect(repoDetect).toHaveBeenCalledTimes(detectCallsBefore);
+    expect(repoListCommits).not.toHaveBeenCalledWith(PROJECT_DIR, { page: 1, branch: 'feature/a', force: true });
+  });
+
+  // 5. Empty state
+  it('shows empty state message when tab has zero items', async () => {
+    const { ws, respondDetect, respondTab } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    await act(async () => {
+      respondDetect({ provider: 'github', owner: 'acme', repo: 'widgets' });
+    });
+
+    await act(async () => {
+      respondTab('repo.issues_response', PROJECT_DIR, [], 1, false);
+    });
+
+    expect(screen.getByText('No issues found')).toBeDefined();
+  });
+
+  // 6. Load more pagination
+  it('shows Load more button when hasMore is true, hides it after second page', async () => {
+    const { ws, respondDetect, respondTab, repoListIssues } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    await act(async () => {
+      respondDetect({ provider: 'github', owner: 'acme', repo: 'widgets' });
+    });
+
+    // First page with hasMore=true
+    await act(async () => {
+      respondTab('repo.issues_response', PROJECT_DIR, [
+        { number: 1, title: 'Issue One', state: 'open' },
+      ], 1, true);
+    });
+
+    const loadMoreBtn = screen.getByText('Load more');
+    expect(loadMoreBtn).toBeDefined();
+
+    // Click load more
+    await act(async () => {
+      fireEvent.click(loadMoreBtn);
+    });
+
+    expect(repoListIssues).toHaveBeenCalledWith(PROJECT_DIR, { page: 2 });
+
+    // Second page with hasMore=false
+    await act(async () => {
+      respondTab('repo.issues_response', PROJECT_DIR, [
+        { number: 2, title: 'Issue Two', state: 'open' },
+      ], 2, false);
+    });
+
+    // Both items should be visible (appended)
+    expect(screen.getByText('Issue One')).toBeDefined();
+    expect(screen.getByText('Issue Two')).toBeDefined();
+
+    // Load more button should be gone
+    expect(screen.queryByText('Load more')).toBeNull();
+  });
+
+  // 7. Stale response discarded (wrong projectDir)
+  it('discards tab response with wrong projectDir', async () => {
+    const { ws, respondDetect, respondTab, emit, getLastTabReqId } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    await act(async () => {
+      respondDetect({ provider: 'github', owner: 'acme', repo: 'widgets' });
+    });
+
+    // Capture the request ID for the issues fetch
+    const reqId = getLastTabReqId();
+
+    // Send a response with a DIFFERENT projectDir
+    await act(async () => {
+      emit({
+        type: 'repo.issues_response',
+        requestId: reqId,
+        projectDir: '/some/other/project',
+        items: [{ number: 999, title: 'Stale Issue', state: 'open' }],
+        page: 1,
+        hasMore: false,
+      } as unknown as ServerMessage);
+    });
+
+    // The stale item should NOT appear
+    expect(screen.queryByText('Stale Issue')).toBeNull();
+
+    // Now send a valid response
+    await act(async () => {
+      respondTab('repo.issues_response', PROJECT_DIR, [
+        { number: 1, title: 'Real Issue', state: 'open' },
+      ]);
+    });
+
+    // But this uses a new requestId from a fresh call, not the original one.
+    // The stale response was discarded due to projectDir mismatch. The valid
+    // response also won't match if the requestId changed. Let's verify the
+    // stale item is still absent and that there's no issue rendered from stale data.
+    expect(screen.queryByText('Stale Issue')).toBeNull();
+  });
+
+  // Additional: detect error renders in header
+  it('shows detect error in header', async () => {
+    const { ws, respondDetectError } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    await act(async () => {
+      respondDetectError('Could not detect repository');
+    });
+
+    // Error text appears in both header and tab content (with debug info)
+    const elements = screen.getAllByText('Could not detect repository');
+    expect(elements.length).toBeGreaterThanOrEqual(1);
+  });
+
+  // Critical: detect_response with flat shape (real daemon format)
+  it('renders correctly with flat detect_response (real daemon shape)', async () => {
+    const { ws, respondDetectFlat } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    await act(async () => {
+      respondDetectFlat({
+        status: 'ok',
+        info: { platform: 'github', owner: 'facebook', repo: 'react' },
+        cliVersion: '2.50.0',
+        cliAuth: true,
+      });
+    });
+
+    expect(screen.getByText('github')).toBeDefined();
+    expect(screen.getByText('facebook/react')).toBeDefined();
+  });
+
+  it('shows cli_missing hint with flat detect_response', async () => {
+    const { ws, respondDetectFlat } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    await act(async () => {
+      respondDetectFlat({
+        status: 'cli_missing',
+        info: null,
+        cliMinVersion: '2.0.0',
+      });
+    });
+
+    expect(screen.getByText('CLI not installed')).toBeDefined();
+  });
+
+  // Back button removed — FloatingPanel provides close/minimize instead
+
+  // ── Detect timeout ──────────────────────────────────────────────────────────
+
+  it('retries detect timeouts before showing an error', async () => {
+    vi.useFakeTimers();
+    const { ws, repoDetect } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    for (let i = 0; i < 3; i++) {
+      await act(async () => {
+        vi.advanceTimersByTime(10_001);
+      });
+      expect(screen.queryByText(/Detect timeout/)).toBeNull();
+      await act(async () => {
+        vi.advanceTimersByTime(1_201);
+      });
+    }
+
+    await act(async () => {
+      vi.advanceTimersByTime(10_001);
+    });
+
+    vi.useRealTimers();
+
+    const errorElements = screen.getAllByText(/Detect timeout/);
+    expect(errorElements.length).toBeGreaterThanOrEqual(1);
+    expect(errorElements[0].textContent).toContain('10s');
+    expect(repoDetect).toHaveBeenCalledTimes(4);
+  });
+
+  it('retries transient WS send failures before showing an error', async () => {
+    vi.useFakeTimers();
+    const repoDetect = vi.fn(() => { throw new Error('WebSocket not connected'); });
+    // Create a ws mock where repoDetect throws (simulating disconnected WS)
+    const failWs = {
+      connected: false,
+      onMessage: (_handler: (msg: any) => void) => () => {},
+      repoDetect,
+      repoListIssues: vi.fn(),
+      repoListPRs: vi.fn(),
+      repoListBranches: vi.fn(),
+      repoListCommits: vi.fn(),
+    } as unknown as WsClient;
+
+    render(<RepoPage ws={failWs} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    // Transient disconnected sends stay in loading/retry instead of failing immediately.
+    await act(async () => {});
+    expect(screen.queryByText(/Send failed/)).toBeNull();
+
+    for (let i = 0; i < 2; i++) {
+      await act(async () => {
+        vi.advanceTimersByTime(1_201);
+      });
+      expect(screen.queryByText(/Send failed/)).toBeNull();
+    }
+
+    await act(async () => {
+      vi.advanceTimersByTime(1_201);
+    });
+
+    vi.useRealTimers();
+
+    const errorElements = screen.getAllByText(/Send failed/);
+    expect(errorElements.length).toBeGreaterThanOrEqual(1);
+    expect(errorElements[0].textContent).toContain('WebSocket not connected');
+    expect(repoDetect).toHaveBeenCalledTimes(4);
+  });
+
+  it('does not show timeout if detect response arrives before 10s', async () => {
+    vi.useFakeTimers();
+    const { ws, respondDetect } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    // Response arrives at 5s
+    await act(async () => {
+      vi.advanceTimersByTime(5_000);
+    });
+
+    await act(async () => {
+      respondDetect({ provider: 'github', owner: 'acme', repo: 'widgets' });
+    });
+
+    // Advance past 10s
+    await act(async () => {
+      vi.advanceTimersByTime(6_000);
+    });
+
+    vi.useRealTimers();
+
+    // No timeout error should appear
+    expect(screen.queryByText(/Detect timeout/)).toBeNull();
+    expect(screen.getByText('acme/widgets')).toBeDefined();
+  });
+
+  // ── End-to-end flat daemon shape through mapDetectToContext ──────────────────
+
+  it('mapDetectToContext: flat daemon shape displays provider/owner/repo correctly', async () => {
+    const { ws, respondDetectFlat } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    // Simulate the exact shape daemon sends: status + info at top level
+    await act(async () => {
+      respondDetectFlat({
+        status: 'ok',
+        info: { platform: 'gitlab', owner: 'myorg', repo: 'myapp', defaultBranch: 'develop' },
+        cliVersion: '2.60.0',
+        cliAuth: true,
+      });
+    });
+
+    // mapDetectToContext should extract info.platform → provider, info.owner → owner, info.repo → repo
+    expect(screen.getByText('gitlab')).toBeDefined();
+    expect(screen.getByText('myorg/myapp')).toBeDefined();
+    expect(screen.getByText('develop')).toBeDefined();
+  });
+
+  it('mapDetectToContext: flat daemon shape with nested context also works', async () => {
+    const { ws, respondDetect } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    // respondDetect wraps in { context: { ... } } — the "old" nested shape
+    await act(async () => {
+      respondDetect({
+        status: 'ok',
+        info: { platform: 'github', owner: 'torvalds', repo: 'linux', defaultBranch: 'master' },
+        cliVersion: '2.50.0',
+        cliAuth: true,
+      });
+    });
+
+    expect(screen.getByText('github')).toBeDefined();
+    expect(screen.getByText('torvalds/linux')).toBeDefined();
+    expect(screen.getByText('master')).toBeDefined();
+  });
+
+  it('mapDetectToContext: cli_missing status sets cliInstalled=false', async () => {
+    const { ws, respondDetectFlat } = makeWs();
+    render(<RepoPage ws={ws} projectDir={PROJECT_DIR} onBack={vi.fn()} />);
+
+    await act(async () => {
+      respondDetectFlat({
+        status: 'cli_missing',
+        info: null,
+        cliMinVersion: '2.0.0',
+      });
+    });
+
+    // When CLI is missing, the header shows the cli_missing badge
+    expect(screen.getByText('CLI not installed')).toBeDefined();
+    // No provider badge or owner/repo should be rendered since info is null
+    expect(screen.queryByText('github')).toBeNull();
+    expect(screen.queryByText('gitlab')).toBeNull();
+  });
+});

@@ -1,0 +1,456 @@
+import Foundation
+
+enum SnapshotStatus: String, Codable, CaseIterable {
+    case fresh
+    case stale
+    case switching
+}
+
+enum WatchSessionState: String, Codable, CaseIterable {
+    case working
+    case idle
+    case error
+    case stopped
+}
+
+struct WatchServerRow: Identifiable, Codable, Equatable {
+    let id: String
+    var name: String
+    var baseUrl: String
+}
+
+struct WatchRecentTextRow: Identifiable, Codable, Equatable {
+    let eventId: String
+    let type: String
+    let text: String
+    let ts: Double
+
+    var id: String { eventId }
+}
+
+struct WatchQueueEntry: Identifiable, Codable, Equatable {
+    let clientMessageId: String
+    let text: String
+    let status: String?
+    let commandId: String?
+
+    var id: String { clientMessageId }
+}
+
+struct WatchQueueReceipt: Identifiable, Codable, Equatable {
+    let commandId: String
+    let status: String
+    let reason: String?
+
+    var id: String { commandId }
+}
+
+struct WatchSessionRow: Identifiable, Codable, Equatable {
+    var sessionName: String
+    var serverId: String
+    var title: String
+    var state: WatchSessionState
+    var agentBadge: String
+    var isSubSession: Bool
+    var parentTitle: String?
+    var parentSessionName: String?
+    var isPinned: Bool?
+    var previewText: String?
+    var previewUpdatedAt: Double?
+    var recentText: [WatchRecentTextRow]?
+    var queueEpoch: String?
+    var queueAuthorityId: String?
+    var transportPendingMessageVersion: Double?
+    var transportPendingMessageEntries: [WatchQueueEntry]?
+    var failedMessageEntries: [WatchQueueEntry]?
+    var transportQueueReceipts: [WatchQueueReceipt]?
+    var commandReceipts: [WatchQueueReceipt]?
+
+    enum CodingKeys: String, CodingKey {
+        case sessionName
+        case serverId
+        case title
+        case state
+        case agentBadge
+        case isSubSession
+        case parentTitle
+        case parentSessionName
+        case isPinned
+        case previewText
+        case previewUpdatedAt
+        case recentText
+        case queueEpoch
+        case queueAuthorityId
+        case transportPendingMessageVersion
+        case transportPendingMessageEntries
+        case failedMessageEntries
+        case transportQueueReceipts
+        case commandReceipts
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let sessionName = try container.decode(String.self, forKey: .sessionName)
+        let serverId = try container.decode(String.self, forKey: .serverId)
+        let parentSessionName = try container.decodeIfPresent(String.self, forKey: .parentSessionName)
+        let explicitIsSubSession = try container.decodeIfPresent(Bool.self, forKey: .isSubSession)
+
+        self.sessionName = sessionName
+        self.serverId = serverId
+        self.title = try container.decodeIfPresent(String.self, forKey: .title) ?? sessionName
+        self.state = (try? container.decode(WatchSessionState.self, forKey: .state)) ?? .stopped
+        self.agentBadge = try container.decodeIfPresent(String.self, forKey: .agentBadge) ?? ""
+        self.parentTitle = try container.decodeIfPresent(String.self, forKey: .parentTitle)
+        self.parentSessionName = parentSessionName
+        self.isSubSession = explicitIsSubSession ?? sessionName.hasPrefix("deck_sub_") || parentSessionName != nil
+        self.isPinned = try container.decodeIfPresent(Bool.self, forKey: .isPinned) ?? false
+        self.previewText = try container.decodeIfPresent(String.self, forKey: .previewText)
+        self.previewUpdatedAt = try container.decodeIfPresent(Double.self, forKey: .previewUpdatedAt)
+        self.recentText = try container.decodeIfPresent([WatchRecentTextRow].self, forKey: .recentText) ?? []
+        self.queueEpoch = try container.decodeIfPresent(String.self, forKey: .queueEpoch)
+        self.queueAuthorityId = try container.decodeIfPresent(String.self, forKey: .queueAuthorityId)
+        self.transportPendingMessageVersion = try container.decodeIfPresent(Double.self, forKey: .transportPendingMessageVersion)
+        self.transportPendingMessageEntries = try container.decodeIfPresent([WatchQueueEntry].self, forKey: .transportPendingMessageEntries) ?? []
+        self.failedMessageEntries = try container.decodeIfPresent([WatchQueueEntry].self, forKey: .failedMessageEntries) ?? []
+        self.transportQueueReceipts = try container.decodeIfPresent([WatchQueueReceipt].self, forKey: .transportQueueReceipts) ?? []
+        self.commandReceipts = try container.decodeIfPresent([WatchQueueReceipt].self, forKey: .commandReceipts) ?? []
+    }
+
+    var id: String { "\(serverId):\(sessionName)" }
+
+    var latestRecentText: WatchRecentTextRow? {
+        (recentText ?? []).sorted { lhs, rhs in
+            if lhs.ts == rhs.ts { return lhs.eventId < rhs.eventId }
+            return lhs.ts < rhs.ts
+        }.last
+    }
+
+    var effectivePreviewText: String? {
+        if let previewText, !previewText.isEmpty { return previewText }
+        return latestRecentText?.text
+    }
+
+    var effectivePreviewUpdatedAt: Double? {
+        previewUpdatedAt ?? latestRecentText?.ts
+    }
+
+    var allCommandReceipts: [WatchQueueReceipt] {
+        (transportQueueReceipts ?? []) + (commandReceipts ?? [])
+    }
+}
+
+struct WatchServerListResponse: Codable, Equatable {
+    let servers: [WatchServerRow]
+}
+
+struct WatchSessionListResponse: Codable, Equatable {
+    let serverId: String
+    let sessions: [WatchSessionRow]
+}
+
+enum JSONValue: Codable, Equatable {
+    case string(String)
+    case number(Double)
+    case bool(Bool)
+    case object([String: JSONValue])
+    case array([JSONValue])
+    case null
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() {
+            self = .null
+        } else if let string = try? container.decode(String.self) {
+            self = .string(string)
+        } else if let bool = try? container.decode(Bool.self) {
+            self = .bool(bool)
+        } else if let number = try? container.decode(Double.self) {
+            self = .number(number)
+        } else if let object = try? container.decode([String: JSONValue].self) {
+            self = .object(object)
+        } else if let array = try? container.decode([JSONValue].self) {
+            self = .array(array)
+        } else {
+            throw DecodingError.dataCorruptedError(in: container, debugDescription: "Unsupported JSON value")
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .string(let value):
+            try container.encode(value)
+        case .number(let value):
+            try container.encode(value)
+        case .bool(let value):
+            try container.encode(value)
+        case .object(let value):
+            try container.encode(value)
+        case .array(let value):
+            try container.encode(value)
+        case .null:
+            try container.encodeNil()
+        }
+    }
+
+    var stringValue: String? {
+        if case .string(let value) = self { return value }
+        return nil
+    }
+
+    var objectValue: [String: JSONValue]? {
+        if case .object(let value) = self { return value }
+        return nil
+    }
+}
+
+struct WatchTimelineEvent: Identifiable, Codable, Equatable {
+    let eventId: String
+    let sessionId: String
+    let ts: Double
+    let type: String
+    let payload: JSONValue?
+
+    var id: String { eventId }
+
+    var text: String? {
+        payload?.objectValue?["text"]?.stringValue
+    }
+
+    var commandId: String? {
+        payload?.objectValue?["commandId"]?.stringValue
+            ?? payload?.objectValue?["clientMessageId"]?.stringValue
+    }
+}
+
+struct WatchHistoryResponse: Equatable {
+    let sessionName: String
+    let epoch: Double?
+    let events: [WatchTimelineEvent]
+    let hasMore: Bool
+    let nextCursor: Double?
+}
+
+extension WatchHistoryResponse: Decodable {
+    enum CodingKeys: String, CodingKey {
+        case sessionName, epoch, events, hasMore, nextCursor
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionName = try container.decode(String.self, forKey: .sessionName)
+        epoch = try container.decodeIfPresent(Double.self, forKey: .epoch)
+        hasMore = (try? container.decode(Bool.self, forKey: .hasMore)) ?? false
+        nextCursor = try container.decodeIfPresent(Double.self, forKey: .nextCursor)
+        // Lenient event decoding — skip individual events that fail to decode
+        var eventsArray = try container.nestedUnkeyedContainer(forKey: .events)
+        var decoded: [WatchTimelineEvent] = []
+        while !eventsArray.isAtEnd {
+            if let event = try? eventsArray.decode(WatchTimelineEvent.self) {
+                decoded.append(event)
+            } else {
+                // skip malformed event
+                _ = try? eventsArray.decode(JSONValue.self)
+            }
+        }
+        events = decoded
+    }
+}
+
+struct WatchApplicationContext: Codable, Equatable {
+    var v: Int
+    var generatedAt: Double?
+    var currentServerId: String?
+    var servers: [WatchServerRow]
+    var sessions: [WatchSessionRow]
+    var snapshotStatus: SnapshotStatus
+    var apiKey: String?
+
+    static let empty = WatchApplicationContext(
+        v: 1,
+        generatedAt: nil,
+        currentServerId: nil,
+        servers: [],
+        sessions: [],
+        snapshotStatus: .stale,
+        apiKey: nil
+    )
+}
+
+struct WatchRoute: Codable, Equatable, Hashable, Identifiable {
+    var serverId: String
+    var sessionName: String
+    var title: String?
+
+    var id: String { "\(serverId):\(sessionName)" }
+}
+
+struct WatchControlMessage: Codable, Equatable {
+    var action: String
+    var serverId: String?
+}
+
+struct WatchNotificationPayload: Codable, Equatable {
+    var serverId: String
+    var session: String
+    var type: String
+    var sessionName: String?
+
+    enum CodingKeys: String, CodingKey {
+        case serverId
+        case session
+        case type
+        case sessionName
+    }
+
+    init(serverId: String, session: String, type: String, sessionName: String? = nil) {
+        self.serverId = serverId
+        self.session = session
+        self.type = type
+        self.sessionName = sessionName
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let serverId = try container.decode(String.self, forKey: .serverId)
+        let type = try container.decode(String.self, forKey: .type)
+        let session = try container.decodeIfPresent(String.self, forKey: .session)
+            ?? container.decode(String.self, forKey: .sessionName)
+        let alias = try container.decodeIfPresent(String.self, forKey: .sessionName)
+
+        self.init(serverId: serverId, session: session, type: type, sessionName: alias)
+    }
+}
+
+struct WatchConversationItem: Identifiable, Equatable {
+    let eventId: String
+    let sessionId: String
+    let ts: Double
+    let type: String
+    let text: String
+    let isWarmCache: Bool
+    /// True while the message is awaiting daemon confirmation (optimistic bubble).
+    var isPending: Bool = false
+    /// True when the send has failed (HTTP error, auth expired, etc.).
+    var isFailed: Bool = false
+    /// Present for optimistic user messages so later real echoes can reconcile
+    /// by commandId instead of text (agent may normalize the prompt).
+    var commandId: String?
+    /// Failure reason shown as a small subtitle under a failed bubble.
+    var failureReason: String?
+
+    var id: String { eventId }
+    var isUser: Bool { type == "user.message" }
+
+    static func fromRecentText(_ row: WatchRecentTextRow, sessionId: String) -> WatchConversationItem? {
+        guard row.type == "user.message" || row.type == "assistant.text" else { return nil }
+        let trimmed = row.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return WatchConversationItem(
+            eventId: row.eventId,
+            sessionId: sessionId,
+            ts: row.ts,
+            type: row.type,
+            text: row.text,
+            isWarmCache: true
+        )
+    }
+
+    static func fromTimelineEvent(_ event: WatchTimelineEvent) -> WatchConversationItem? {
+        guard event.type == "user.message" || event.type == "assistant.text" else { return nil }
+        guard let rawText = event.text else { return nil }
+        let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return WatchConversationItem(
+            eventId: event.eventId,
+            sessionId: event.sessionId,
+            ts: event.ts,
+            type: event.type,
+            text: rawText,
+            isWarmCache: false,
+            commandId: event.commandId
+        )
+    }
+
+    /// Optimistic user.message injected when the user taps Send, before the
+    /// daemon round-trip confirms delivery. The eventId is prefixed so merge()
+    /// can distinguish it from real events; commandId lets a later echo (with
+    /// payload.commandId / payload.clientMessageId) replace it in place.
+    static func optimisticSend(sessionId: String, text: String, commandId: String) -> WatchConversationItem {
+        return WatchConversationItem(
+            eventId: "optimistic:\(sessionId):\(commandId)",
+            sessionId: sessionId,
+            ts: Date().timeIntervalSince1970 * 1000,
+            type: "user.message",
+            text: text,
+            isWarmCache: false,
+            isPending: true,
+            isFailed: false,
+            commandId: commandId
+        )
+    }
+
+    static func merge(existing: [WatchConversationItem], incoming: [WatchConversationItem]) -> [WatchConversationItem] {
+        // Extract any live optimistic bubbles from `existing` so real echoes
+        // arriving in `incoming` can cancel them by commandId rather than
+        // leaving a ghost "sending" row next to the confirmed message.
+        var incomingCommandIds = Set<String>()
+        for item in incoming {
+            if let cmd = item.commandId, !cmd.isEmpty {
+                incomingCommandIds.insert(cmd)
+            }
+        }
+
+        var byId: [String: WatchConversationItem] = [:]
+        for item in existing + incoming {
+            // A real event for this commandId arrived → drop the optimistic
+            // sibling regardless of eventId (they have different eventIds by
+            // construction: "optimistic:<id>" vs. daemon-emitted id).
+            if item.isPending, let cmd = item.commandId, incomingCommandIds.contains(cmd) {
+                continue
+            }
+            if let current = byId[item.eventId] {
+                if current.isWarmCache && !item.isWarmCache {
+                    byId[item.eventId] = item
+                } else if current.isWarmCache == item.isWarmCache {
+                    byId[item.eventId] = item.ts >= current.ts ? item : current
+                }
+            } else {
+                byId[item.eventId] = item
+            }
+        }
+
+        // Fallback: match optimistic bubbles to real echoes by (text, user
+        // type) within a 5-second window. Handles older daemons that don't
+        // emit payload.commandId yet.
+        let dedupWindow: Double = 5_000
+        var trimmedReal: [(text: String, ts: Double)] = []
+        for item in byId.values where !item.isPending && item.isUser && !item.isFailed {
+            trimmedReal.append((item.text.trimmingCharacters(in: .whitespacesAndNewlines), item.ts))
+        }
+        let staleOptimistic: [String] = byId.compactMap { key, value in
+            guard value.isPending else { return nil }
+            let trimmed = value.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let matched = trimmedReal.contains { real in
+                real.text == trimmed && abs(real.ts - value.ts) < dedupWindow
+            }
+            return matched ? key : nil
+        }
+        for key in staleOptimistic { byId.removeValue(forKey: key) }
+
+        return byId.values.sorted { lhs, rhs in
+            if lhs.ts == rhs.ts { return lhs.eventId < rhs.eventId }
+            return lhs.ts < rhs.ts
+        }
+    }
+}
+
+struct WatchHistoryViewState: Equatable {
+    var items: [WatchConversationItem] = []
+    var hasMore = false
+    var nextCursor: Double?
+    var isLoading = false
+    var isLoadingOlder = false
+    var loadedOnce = false
+    var errorMessage: String?
+}

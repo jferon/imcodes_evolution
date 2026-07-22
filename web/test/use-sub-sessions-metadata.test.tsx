@@ -1,0 +1,1640 @@
+/**
+ * @vitest-environment jsdom
+ *
+ * Tests for sub-session metadata propagation via subsession.created and subsession.sync.
+ * Verifies that provider display metadata (model, plan, quota) survives the WS → hook → state pipeline.
+ */
+import { render, cleanup, waitFor, act } from '@testing-library/preact';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  SUPERVISION_MODE,
+  SUPERVISION_TRANSPORT_CONFIG_KEY,
+} from '@shared/supervision-config.js';
+import { useSubSessions, type SubSession } from '../src/hooks/useSubSessions.js';
+import { createSubSession, listSubSessions, patchSubSession } from '../src/api.js';
+
+vi.mock('../src/api.js', () => ({
+  listSubSessions: vi.fn().mockResolvedValue([]),
+  createSubSession: vi.fn(),
+  patchSubSession: vi.fn().mockResolvedValue(undefined),
+}));
+
+type MsgHandler = (msg: any) => void;
+
+const sentMessages: any[] = [];
+function createMockWs() {
+  const handlers: MsgHandler[] = [];
+  const send = (msg: any) => { sentMessages.push(msg); handlers.forEach((h) => h(msg)); };
+  return {
+    ws: {
+      subSessionRebuildAll: vi.fn(),
+      subSessionStart: vi.fn(),
+      onMessage: vi.fn((fn: MsgHandler) => {
+        handlers.push(fn);
+        return () => { const i = handlers.indexOf(fn); if (i >= 0) handlers.splice(i, 1); };
+      }),
+      send,
+    } as any,
+    send,
+  };
+}
+
+let captured: SubSession[] = [];
+
+const TEST_QUEUE_EPOCH = 'test-queue-epoch';
+const TEST_QUEUE_AUTHORITY_ID = 'test-queue-authority';
+
+function queuePayload(
+  state: 'queued' | 'running' | 'idle',
+  pendingMessageVersion: number,
+  pendingMessageEntries: Array<{ clientMessageId: string; text: string }>,
+) {
+  return {
+    state,
+    queueEpoch: TEST_QUEUE_EPOCH,
+    queueAuthorityId: TEST_QUEUE_AUTHORITY_ID,
+    pendingMessageVersion,
+    pendingMessageEntries,
+    failedMessageEntries: [],
+  };
+}
+
+function Harness({ ws, connected }: { ws: any; connected: boolean }) {
+  const { subSessions } = useSubSessions('srv1', ws, connected, null);
+  captured = subSessions;
+  return null;
+}
+
+let closeSubSessionHook: ((id: string) => Promise<void>) | null = null;
+let renameSubSessionHook: ((id: string, label: string) => Promise<void>) | null = null;
+let createSubSessionHook: ((type: string, shellBin?: string, cwd?: string, label?: string, extra?: Record<string, unknown>) => Promise<SubSession | null>) | null = null;
+
+function CloseHarness({ ws, connected }: { ws: any; connected: boolean }) {
+  const { subSessions, close } = useSubSessions('srv1', ws, connected, null);
+  captured = subSessions;
+  closeSubSessionHook = close;
+  return null;
+}
+
+function RenameHarness({ ws, connected }: { ws: any; connected: boolean }) {
+  const { subSessions, rename } = useSubSessions('srv1', ws, connected, null);
+  captured = subSessions;
+  renameSubSessionHook = rename;
+  return null;
+}
+
+function CreateHarness({ ws, connected }: { ws: any; connected: boolean }) {
+  const { subSessions, create } = useSubSessions('srv1', ws, connected, null);
+  captured = subSessions;
+  createSubSessionHook = create;
+  return null;
+}
+
+describe('sub-session metadata via subsession.created', () => {
+  afterEach(() => { cleanup(); vi.clearAllMocks(); captured = []; sentMessages.length = 0; });
+
+  it('stores Qwen metadata fields from subsession.created', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'q1',
+      sessionName: 'deck_sub_q1',
+      sessionType: 'qwen',
+      state: 'running',
+      cwd: '/tmp/proj',
+      label: 'Qwen Worker',
+      qwenModel: 'qwen-max-latest',
+      qwenAuthType: 'qwen-oauth',
+      modelDisplay: 'Qwen Max',
+      planLabel: 'Free',
+      quotaLabel: '1,000/day',
+      quotaUsageLabel: 'today 5/1000',
+      effort: 'medium',
+    }));
+
+    expect(captured).toHaveLength(1);
+    const s = captured[0];
+    expect(s.qwenModel).toBe('qwen-max-latest');
+    expect(s.qwenAuthType).toBe('qwen-oauth');
+    expect(s.modelDisplay).toBe('Qwen Max');
+    expect(s.planLabel).toBe('Free');
+    expect(s.quotaLabel).toBe('1,000/day');
+    expect(s.quotaUsageLabel).toBe('today 5/1000');
+    expect(s.effort).toBe('medium');
+  });
+
+  it('defaults metadata to null when not provided', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'cc1',
+      sessionName: 'deck_sub_cc1',
+      sessionType: 'claude-code',
+    }));
+
+    expect(captured).toHaveLength(1);
+    const s = captured[0];
+    expect(s.state).toBe('idle');
+    expect(s.modelDisplay).toBeNull();
+    expect(s.planLabel).toBeNull();
+    expect(s.quotaLabel).toBeNull();
+    expect(s.quotaUsageLabel).toBeNull();
+    expect(s.qwenModel).toBeNull();
+  });
+
+  it('stores execution-clone projection from subsession.created', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'clone1',
+      sessionName: 'deck_sub_clone1',
+      sessionType: 'codex-sdk',
+      parentSession: 'deck_proj_brain',
+      executionCloneKind: 'execution_clone',
+      parentRunId: 'run-parent-1',
+    }));
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].executionCloneKind).toBe('execution_clone');
+    expect(captured[0].parentRunId).toBe('run-parent-1');
+  });
+
+  it('updates execution-clone projection on an existing subsession.created rebroadcast', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'clone2',
+      sessionName: 'deck_sub_clone2',
+      sessionType: 'codex-sdk',
+      parentSession: 'deck_proj_brain',
+    }));
+    expect(captured[0].executionCloneKind).toBeNull();
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'clone2',
+      executionCloneKind: 'execution_clone',
+      parentRunId: 'run-parent-2',
+    }));
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].executionCloneKind).toBe('execution_clone');
+    expect(captured[0].parentRunId).toBe('run-parent-2');
+  });
+});
+
+describe('sub-session metadata via subsession.sync', () => {
+  afterEach(() => { cleanup(); vi.clearAllMocks(); captured = []; });
+
+  it('merges metadata into existing sub-session', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'q2',
+      sessionName: 'deck_sub_q2',
+      sessionType: 'qwen',
+      state: 'running',
+    }));
+    expect(captured[0].modelDisplay).toBeNull();
+
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'q2',
+      modelDisplay: 'Qwen Turbo',
+      planLabel: 'Paid',
+      quotaUsageLabel: 'today 10/5000',
+      effort: 'high',
+    }));
+
+    expect(captured[0].modelDisplay).toBe('Qwen Turbo');
+    expect(captured[0].planLabel).toBe('Paid');
+    expect(captured[0].quotaUsageLabel).toBe('today 10/5000');
+    expect(captured[0].effort).toBe('high');
+  });
+
+  it('ignores sync for unknown id', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'x1',
+      sessionName: 'deck_sub_x1',
+      sessionType: 'shell',
+      state: 'running',
+    }));
+
+    const before = [...captured];
+    act(() => send({ type: 'subsession.sync', id: 'unknown123', modelDisplay: 'nope' }));
+    expect(captured).toEqual(before);
+  });
+
+  it('merges execution-clone projection from subsession.sync into existing sub-session', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'sync-clone',
+      sessionName: 'deck_sub_sync_clone',
+      sessionType: 'codex-sdk',
+      parentSession: 'deck_proj_brain',
+    }));
+
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'sync-clone',
+      executionCloneKind: 'execution_clone',
+      parentRunId: 'run-sync-clone',
+    }));
+
+    expect(captured[0].executionCloneKind).toBe('execution_clone');
+    expect(captured[0].parentRunId).toBe('run-sync-clone');
+  });
+
+
+  it('stores codex-sdk model, level, and quota metadata from sync', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'cxsdk1',
+      sessionName: 'deck_sub_cxsdk1',
+      sessionType: 'codex-sdk',
+      state: 'running',
+    }));
+
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'cxsdk1',
+      modelDisplay: 'gpt-5.4',
+      planLabel: 'Pro',
+      quotaLabel: '5h 11% 2h03m 4/6 14:40 · 7d 50% 1d04h 4/8 15:48',
+      effort: 'high',
+    }));
+
+    expect(captured[0].modelDisplay).toBe('gpt-5.4');
+    expect(captured[0].planLabel).toBe('Pro');
+    expect(captured[0].quotaLabel).toContain('5h 11%');
+    expect(captured[0].effort).toBe('high');
+  });
+
+  it('preserves codex-sdk quota metadata when a later sync carries null quota fields', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'cxsdk_quota_stable',
+      sessionName: 'deck_sub_cxsdk_quota_stable',
+      sessionType: 'codex-sdk',
+      state: 'running',
+      codexAvailableModels: ['gpt-5.5'],
+      planLabel: 'Pro',
+      quotaLabel: '5h 11% 2h03m 4/6 14:40',
+      quotaMeta: {
+        primary: { usedPercent: 11, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+      },
+    }));
+
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'cxsdk_quota_stable',
+      codexAvailableModels: null,
+      planLabel: null,
+      quotaLabel: null,
+      quotaUsageLabel: null,
+      quotaMeta: null,
+    }));
+
+    expect(captured[0].codexAvailableModels).toEqual(['gpt-5.5']);
+    expect(captured[0].planLabel).toBe('Pro');
+    expect(captured[0].quotaLabel).toBe('5h 11% 2h03m 4/6 14:40');
+    expect(captured[0].quotaMeta?.primary?.usedPercent).toBe(11);
+  });
+
+  it('preserves codex-sdk quota metadata when API reload omits daemon-only display fields', async () => {
+    const staleApiSub = {
+      id: 'cxsdk_api_reload',
+      serverId: 'srv1',
+      type: 'codex-sdk',
+      runtimeType: 'transport' as const,
+      providerId: 'codex-sdk',
+      providerSessionId: null,
+      shellBin: null,
+      cwd: '/tmp/proj',
+      ccSessionId: null,
+      geminiSessionId: null,
+      parentSession: 'deck_app_brain',
+      label: 'Codex Worker',
+      description: null,
+      ccPresetId: null,
+      requestedModel: null,
+      activeModel: null,
+      qwenModel: null,
+      qwenAuthType: null,
+      qwenAvailableModels: null,
+      modelDisplay: null,
+      planLabel: null,
+      quotaLabel: null,
+      quotaUsageLabel: null,
+      quotaMeta: null,
+      effort: null,
+      transportConfig: null,
+      closedAt: null,
+      createdAt: 1,
+      updatedAt: 1,
+    };
+    vi.mocked(listSubSessions)
+      .mockResolvedValueOnce([staleApiSub])
+      .mockResolvedValueOnce([staleApiSub]);
+
+    const { ws, send } = createMockWs();
+    const view = render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(captured).toHaveLength(1));
+
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'cxsdk_api_reload',
+      state: 'running',
+      modelDisplay: 'gpt-5.5',
+      planLabel: 'Pro',
+      quotaLabel: '5h 12% 2h01m 4/6 14:40',
+      quotaMeta: {
+        primary: { usedPercent: 12, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+      },
+    }));
+    expect(captured[0].planLabel).toBe('Pro');
+    expect(captured[0].quotaLabel).toContain('5h 12%');
+
+    view.rerender(<Harness ws={ws} connected={false} />);
+    view.rerender(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(listSubSessions).toHaveBeenCalledTimes(2));
+
+    expect(captured[0].state).toBe('running');
+    expect(captured[0].modelDisplay).toBe('gpt-5.5');
+    expect(captured[0].planLabel).toBe('Pro');
+    expect(captured[0].quotaLabel).toBe('5h 12% 2h01m 4/6 14:40');
+    expect(captured[0].quotaMeta?.primary?.usedPercent).toBe(12);
+  });
+
+  it('clears non-codex quota metadata when a later sync carries null quota fields', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'qwen_quota_clear',
+      sessionName: 'deck_sub_qwen_quota_clear',
+      sessionType: 'qwen',
+      state: 'running',
+      planLabel: 'Free',
+      quotaLabel: '1,000/day',
+      quotaUsageLabel: 'today 5/1000',
+      quotaMeta: {
+        primary: { usedPercent: 5, windowDurationMins: 1440, resetsAt: 1_800_000_000 },
+      },
+    }));
+
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'qwen_quota_clear',
+      quotaLabel: null,
+      quotaUsageLabel: null,
+      quotaMeta: null,
+    }));
+
+    expect(captured[0].quotaLabel).toBeNull();
+    expect(captured[0].quotaUsageLabel).toBeNull();
+    expect(captured[0].quotaMeta).toBeNull();
+  });
+
+  it('partial sync keeps existing values', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'q3',
+      sessionName: 'deck_sub_q3',
+      sessionType: 'qwen',
+      state: 'running',
+      modelDisplay: 'Qwen Max',
+      planLabel: 'Free',
+    }));
+
+    // Sync only updates quotaUsageLabel, should keep modelDisplay and planLabel
+    act(() => send({ type: 'subsession.sync', id: 'q3', quotaUsageLabel: 'today 20/1000' }));
+
+    expect(captured[0].modelDisplay).toBe('Qwen Max');
+    expect(captured[0].planLabel).toBe('Free');
+    expect(captured[0].quotaUsageLabel).toBe('today 20/1000');
+  });
+
+  it('preserves queued transport messages while the drained send is still running and clears on authoritative idle', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'q4',
+      sessionName: 'deck_sub_q4',
+      sessionType: 'qwen',
+      state: 'running',
+    }));
+
+    // Queue two messages
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_q4',
+        payload: queuePayload('queued', 1, [
+          { clientMessageId: 'msg-1', text: 'queued one' },
+          { clientMessageId: 'msg-2', text: 'queued two' },
+        ]),
+      },
+    }));
+
+    expect(captured[0].state).toBe('queued');
+    expect(captured[0].transportPendingMessages).toEqual(['queued one', 'queued two']);
+    expect(captured[0].transportPendingMessageEntries).toEqual([
+      { clientMessageId: 'msg-1', text: 'queued one' },
+      { clientMessageId: 'msg-2', text: 'queued two' },
+    ]);
+
+    // Drain: running without pending field → preserves queue (messages still in flight)
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_q4',
+        payload: { state: 'running' },
+      },
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual(['queued one', 'queued two']);
+    expect(captured[0].transportPendingMessageEntries).toEqual([
+      { clientMessageId: 'msg-1', text: 'queued one' },
+      { clientMessageId: 'msg-2', text: 'queued two' },
+    ]);
+
+    // Idle without queue fields is state-only; queue must stay visible until
+    // an authoritative empty queue snapshot arrives.
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_q4',
+        payload: { state: 'idle' },
+      },
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual(['queued one', 'queued two']);
+    expect(captured[0].transportPendingMessageEntries).toEqual([
+      { clientMessageId: 'msg-1', text: 'queued one' },
+      { clientMessageId: 'msg-2', text: 'queued two' },
+    ]);
+
+    // Authoritative idle with empty queue clears
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_q4',
+        payload: queuePayload('idle', 2, []),
+      },
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual([]);
+    expect(captured[0].transportPendingMessageEntries).toEqual([]);
+  });
+
+  it('clears queue when running event carries explicit empty pending (drain completed)', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'q5',
+      sessionName: 'deck_sub_q5',
+      sessionType: 'qwen',
+      state: 'running',
+    }));
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_q5',
+        payload: {
+          ...queuePayload('queued', 1, [{ clientMessageId: 'msg-1', text: 'msg' }]),
+        },
+      },
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual(['msg']);
+
+    // Running with explicit empty pending — drain dispatched the message.
+    // Daemon emits user.message simultaneously, so queue must clear.
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_q5',
+        payload: queuePayload('running', 2, []),
+      },
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual([]);
+    expect(captured[0].transportPendingMessageEntries).toEqual([]);
+
+    // Subsequent idle is a no-op for queue (already empty)
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_q5',
+        payload: queuePayload('idle', 3, []),
+      },
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual([]);
+    expect(captured[0].transportPendingMessageEntries).toEqual([]);
+  });
+
+  it('treats partial entry snapshots as authoritative and does not fill legacy tails', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'q4',
+      sessionName: 'deck_sub_q4',
+      sessionType: 'qwen',
+      state: 'running',
+    }));
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_q4',
+        payload: queuePayload('queued', 1, [
+          { clientMessageId: 'msg-1', text: 'queued one' },
+        ]),
+      },
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual(['queued one']);
+    expect(captured[0].transportPendingMessageEntries).toEqual([
+      { clientMessageId: 'msg-1', text: 'queued one' },
+    ]);
+  });
+});
+
+describe('sub-session metadata integration', () => {
+  afterEach(() => { cleanup(); vi.clearAllMocks(); captured = []; });
+
+  it('created → sync sequence yields latest metadata', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'seq1',
+      sessionName: 'deck_sub_seq1',
+      sessionType: 'qwen',
+      state: 'running',
+      modelDisplay: 'Initial Model',
+      planLabel: 'Free',
+    }));
+
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'seq1',
+      modelDisplay: 'Updated Model',
+      planLabel: 'Paid',
+    }));
+
+    expect(captured[0].modelDisplay).toBe('Updated Model');
+    expect(captured[0].planLabel).toBe('Paid');
+  });
+
+  it('multiple sub-sessions get independent metadata', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => {
+      send({ type: 'subsession.created', id: 'a1', sessionName: 'deck_sub_a1', sessionType: 'qwen', state: 'running', planLabel: 'Free' });
+      send({ type: 'subsession.created', id: 'b1', sessionName: 'deck_sub_b1', sessionType: 'codex', state: 'running', planLabel: null });
+    });
+
+    act(() => send({ type: 'subsession.sync', id: 'a1', quotaUsageLabel: 'today 1/1000' }));
+
+    const a = captured.find((s) => s.id === 'a1')!;
+    const b = captured.find((s) => s.id === 'b1')!;
+    expect(a.planLabel).toBe('Free');
+    expect(a.quotaUsageLabel).toBe('today 1/1000');
+    expect(b.planLabel).toBeNull();
+    expect(b.quotaUsageLabel).toBeNull();
+  });
+
+  it('subsession.removed cleans up fully', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'rm1',
+      sessionName: 'deck_sub_rm1',
+      sessionType: 'qwen',
+      state: 'running',
+      modelDisplay: 'Model',
+      planLabel: 'Free',
+    }));
+    expect(captured).toHaveLength(1);
+
+    act(() => send({ type: 'subsession.removed', id: 'rm1', sessionName: 'deck_sub_rm1' }));
+    expect(captured).toHaveLength(0);
+  });
+});
+
+describe('sub-session runtime type inference', () => {
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    captured = [];
+    createSubSessionHook = null;
+  });
+
+  it('marks copilot-sdk subsession.created payloads as transport when runtimeType is omitted', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'cp-created',
+      sessionName: 'deck_sub_cp-created',
+      sessionType: 'copilot-sdk',
+      state: 'running',
+    }));
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].runtimeType).toBe('transport');
+  });
+
+
+  it('auto-generates short sdk labels when no label is provided', async () => {
+    const { ws } = createMockWs();
+    vi.mocked(createSubSession).mockResolvedValueOnce({
+      id: 'ccsdk-created-api',
+      sessionName: 'deck_sub_ccsdk-created-api',
+      subSession: {
+        id: 'ccsdk-created-api',
+        serverId: 'srv1',
+        type: 'claude-code-sdk',
+        runtimeType: 'transport',
+        providerId: 'claude-code-sdk',
+        providerSessionId: null,
+        cwd: '/tmp/project',
+        label: 'CC1',
+        closedAt: null,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        ccSessionId: null,
+        geminiSessionId: null,
+        parentSession: null,
+        description: null,
+        ccPresetId: null,
+        requestedModel: null,
+        activeModel: null,
+        modelDisplay: null,
+        effort: null,
+        transportConfig: null,
+      },
+    } as any);
+
+    render(<CreateHarness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    await createSubSessionHook?.('claude-code-sdk', undefined, '/tmp/project');
+    expect(createSubSession).toHaveBeenCalledWith('srv1', expect.objectContaining({
+      type: 'claude-code-sdk',
+      label: 'CC1',
+    }));
+  });
+
+  it('REGRESSION: auto-generated sub-session labels increment after each create', async () => {
+    const { ws } = createMockWs();
+    const createdResponse = (id: string, body: {
+      type: string;
+      cwd?: string;
+      label?: string;
+      parentSession?: string | null;
+    }) => ({
+      id,
+      sessionName: `deck_sub_${id}`,
+      subSession: {
+        id,
+        serverId: 'srv1',
+        type: body.type,
+        runtimeType: 'transport',
+        providerId: body.type,
+        providerSessionId: null,
+        cwd: body.cwd ?? null,
+        label: body.label ?? null,
+        closedAt: null,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        ccSessionId: null,
+        geminiSessionId: null,
+        parentSession: body.parentSession ?? null,
+        description: null,
+        ccPresetId: null,
+        requestedModel: null,
+        activeModel: null,
+        modelDisplay: null,
+        effort: null,
+        transportConfig: null,
+      },
+    } as any);
+
+    vi.mocked(createSubSession)
+      .mockImplementationOnce(async (_serverId, body) => createdResponse('cc-1', body))
+      .mockImplementationOnce(async (_serverId, body) => createdResponse('cc-2', body))
+      .mockImplementationOnce(async (_serverId, body) => createdResponse('cx-1', body))
+      .mockImplementationOnce(async (_serverId, body) => createdResponse('cx-2', body));
+
+    render(<CreateHarness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    await act(async () => { await createSubSessionHook?.('claude-code-sdk', undefined, '/tmp/project'); });
+    await waitFor(() => expect(captured).toHaveLength(1));
+    await act(async () => { await createSubSessionHook?.('claude-code-sdk', undefined, '/tmp/project'); });
+    await waitFor(() => expect(captured).toHaveLength(2));
+    await act(async () => { await createSubSessionHook?.('codex-sdk', undefined, '/tmp/project'); });
+    await waitFor(() => expect(captured).toHaveLength(3));
+    await act(async () => { await createSubSessionHook?.('codex-sdk', undefined, '/tmp/project'); });
+
+    expect(vi.mocked(createSubSession).mock.calls.map(([, body]) => body.label)).toEqual(['CC1', 'CC2', 'Cx1', 'Cx2']);
+  });
+
+  it('keeps newly created copilot-sdk sub-sessions in transport mode before daemon sync arrives', async () => {
+    const { ws } = createMockWs();
+    vi.mocked(createSubSession).mockResolvedValueOnce({
+      id: 'cp-created-api',
+      sessionName: 'deck_sub_cp-created-api',
+      subSession: {
+        id: 'cp-created-api',
+        serverId: 'srv1',
+        type: 'copilot-sdk',
+        runtimeType: null,
+        providerId: null,
+        providerSessionId: null,
+        cwd: '/tmp/project',
+        label: 'Copilot Worker',
+        closedAt: null,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        ccSessionId: null,
+        geminiSessionId: null,
+        parentSession: null,
+        description: null,
+        ccPresetId: null,
+        requestedModel: null,
+        activeModel: null,
+        modelDisplay: null,
+        effort: null,
+        transportConfig: null,
+      },
+    } as any);
+
+    render(<CreateHarness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    const created = await createSubSessionHook?.('copilot-sdk', undefined, '/tmp/project', 'Copilot Worker');
+    expect(created?.runtimeType).toBe('transport');
+    expect(created?.providerId).toBe('copilot-sdk');
+    expect(captured.at(-1)?.runtimeType).toBe('transport');
+  });
+
+  it('REGRESSION: copilot-sdk sends subsession.start (not subSessionStart) so the daemon receives transport fields', async () => {
+    const { ws } = createMockWs();
+    vi.mocked(createSubSession).mockResolvedValueOnce({
+      id: 'cp-start-test', sessionName: 'deck_sub_cp-start-test', subSession: {
+        id: 'cp-start-test', serverId: 'srv1', type: 'copilot-sdk', runtimeType: null,
+        providerId: null, providerSessionId: null, cwd: '/tmp/project', label: 'CP',
+        closedAt: null, createdAt: Date.now(), updatedAt: Date.now(),
+        ccSessionId: null, geminiSessionId: null, parentSession: null,
+        description: null, ccPresetId: null, requestedModel: null,
+        activeModel: null, modelDisplay: null, effort: null, transportConfig: null,
+      },
+    } as any);
+
+    render(<CreateHarness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    await createSubSessionHook?.('copilot-sdk', undefined, '/tmp/project', 'CP');
+    // Previously broken: only qwen/openclaw used ws.send; copilot-sdk fell through
+    // to subSessionStart which omits transport fields (requestedModel/thinking/
+    // transportConfig), causing chat subscription to appear stuck.
+    expect(sentMessages.some((m) => m.type === 'subsession.start' && m.sessionType === 'copilot-sdk')).toBe(true);
+    expect(ws.subSessionStart).not.toHaveBeenCalled();
+  });
+
+  it('REGRESSION: cursor-headless sends subsession.start (not subSessionStart)', async () => {
+    const { ws } = createMockWs();
+    vi.mocked(createSubSession).mockResolvedValueOnce({
+      id: 'cu-start-test', sessionName: 'deck_sub_cu-start-test', subSession: {
+        id: 'cu-start-test', serverId: 'srv1', type: 'cursor-headless', runtimeType: null,
+        providerId: null, providerSessionId: null, cwd: '/tmp/project', label: 'CU',
+        closedAt: null, createdAt: Date.now(), updatedAt: Date.now(),
+        ccSessionId: null, geminiSessionId: null, parentSession: null,
+        description: null, ccPresetId: null, requestedModel: null,
+        activeModel: null, modelDisplay: null, effort: null, transportConfig: null,
+      },
+    } as any);
+
+    render(<CreateHarness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    await createSubSessionHook?.('cursor-headless', undefined, '/tmp/project', 'CU');
+    expect(sentMessages.some((m) => m.type === 'subsession.start' && m.sessionType === 'cursor-headless')).toBe(true);
+    expect(ws.subSessionStart).not.toHaveBeenCalled();
+  });
+});
+
+describe('sub-session realtime state sync', () => {
+  afterEach(() => { cleanup(); vi.clearAllMocks(); captured = []; });
+
+  it('marks a sub-session running on assistant/tool timeline events and idle on session.idle', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'run1',
+      sessionName: 'deck_sub_run1',
+      sessionType: 'codex-sdk',
+      state: 'idle',
+    }));
+    expect(captured[0]?.state).toBe('idle');
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        eventId: 'e1',
+        sessionId: 'deck_sub_run1',
+        ts: 100,
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'assistant.text',
+        payload: { text: 'working', streaming: true },
+      },
+    }));
+    expect(captured[0]?.state).toBe('running');
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        eventId: 'e2',
+        sessionId: 'deck_sub_run1',
+        ts: 101,
+        seq: 2,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'tool.call',
+        payload: { tool: 'read_file' },
+      },
+    }));
+    expect(captured[0]?.state).toBe('running');
+
+    act(() => send({
+      type: 'session.idle',
+      session: 'deck_sub_run1',
+    }));
+    expect(captured[0]?.state).toBe('idle');
+  });
+
+  it('tracks stopping and error states from timeline events', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'run2',
+      sessionName: 'deck_sub_run2',
+      sessionType: 'codex',
+      state: 'running',
+    }));
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        eventId: 'e3',
+        sessionId: 'deck_sub_run2',
+        ts: 200,
+        seq: 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'session.state',
+        payload: { state: 'stopping' },
+      },
+    }));
+    expect(captured[0]?.state).toBe('stopping');
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        eventId: 'e4',
+        sessionId: 'deck_sub_run2',
+        ts: 201,
+        seq: 2,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'session.state',
+        payload: { state: 'error' },
+      },
+    }));
+    expect(captured[0]?.state).toBe('error');
+  });
+});
+
+describe('sub-session close behavior', () => {
+  afterEach(() => { cleanup(); vi.clearAllMocks(); captured = []; closeSubSessionHook = null; });
+
+  it('marks a sub-session stopping locally and waits for daemon/server confirmation before removal', async () => {
+    vi.mocked(listSubSessions).mockResolvedValueOnce([
+      {
+        id: 'stop1',
+        serverId: 'srv1',
+        type: 'codex',
+        runtimeType: 'process',
+        providerId: null,
+        providerSessionId: null,
+        shellBin: null,
+        cwd: '/tmp/proj',
+        ccSessionId: null,
+        geminiSessionId: null,
+        parentSession: 'deck_app_brain',
+        label: 'Worker',
+        description: null,
+        ccPresetId: null,
+        requestedModel: null,
+        activeModel: null,
+        qwenModel: null,
+        qwenAuthType: null,
+        qwenAvailableModels: null,
+        modelDisplay: null,
+        planLabel: null,
+        quotaLabel: null,
+        quotaUsageLabel: null,
+        quotaMeta: null,
+        effort: null,
+        transportConfig: null,
+        closedAt: null,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ]);
+
+    const { ws, send } = createMockWs();
+    (ws as any).subSessionStop = vi.fn();
+    render(<CloseHarness ws={ws} connected={true} />);
+    await waitFor(() => expect(captured).toHaveLength(1));
+
+    await act(async () => {
+      await closeSubSessionHook?.('stop1');
+    });
+
+    expect((ws as any).subSessionStop).toHaveBeenCalledWith('deck_sub_stop1');
+    expect(vi.mocked(patchSubSession)).not.toHaveBeenCalled();
+    expect(captured).toHaveLength(1);
+    expect(captured[0]?.state).toBe('stopping');
+
+    act(() => send({ type: 'subsession.removed', id: 'stop1', sessionName: 'deck_sub_stop1' }));
+    expect(captured).toHaveLength(0);
+  });
+});
+
+describe('sub-session rename behavior', () => {
+  afterEach(() => { cleanup(); vi.clearAllMocks(); captured = []; renameSubSessionHook = null; });
+
+  it('persists label changes through the API and updates local state without direct ws rename commands', async () => {
+    vi.mocked(listSubSessions).mockResolvedValueOnce([
+      {
+        id: 'rename1',
+        serverId: 'srv1',
+        type: 'codex',
+        runtimeType: 'process',
+        providerId: null,
+        providerSessionId: null,
+        shellBin: null,
+        cwd: '/tmp/proj',
+        ccSessionId: null,
+        geminiSessionId: null,
+        parentSession: 'deck_app_brain',
+        label: 'Old Label',
+        description: null,
+        ccPresetId: null,
+        requestedModel: null,
+        activeModel: null,
+        qwenModel: null,
+        qwenAuthType: null,
+        qwenAvailableModels: null,
+        modelDisplay: null,
+        planLabel: null,
+        quotaLabel: null,
+        quotaUsageLabel: null,
+        quotaMeta: null,
+        effort: null,
+        transportConfig: null,
+        closedAt: null,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ]);
+
+    const { ws } = createMockWs();
+    (ws as any).subSessionRename = vi.fn();
+    render(<RenameHarness ws={ws} connected={true} />);
+    await waitFor(() => expect(captured).toHaveLength(1));
+
+    await act(async () => {
+      await renameSubSessionHook?.('rename1', 'New Label');
+    });
+
+    expect(vi.mocked(patchSubSession)).toHaveBeenCalledWith('srv1', 'rename1', { label: 'New Label' });
+    expect(captured[0]?.label).toBe('New Label');
+    expect((ws as any).subSessionRename).not.toHaveBeenCalled();
+  });
+});
+
+describe('sub-session supervision preservation (regression: Auto dropdown 自动跳回关闭状态)', () => {
+  afterEach(() => { cleanup(); vi.clearAllMocks(); captured = []; });
+
+  const SUPERVISED_SNAPSHOT = {
+    mode: SUPERVISION_MODE.SUPERVISED,
+    backend: 'codex-sdk',
+    model: 'gpt-5.3-codex-spark',
+    timeoutMs: 12_000,
+    promptVersion: 'supervision_decision_v1',
+    maxParseRetries: 1,
+  };
+
+  async function seedSupervisedSubSession(send: (m: any) => void) {
+    act(() => send({
+      type: 'subsession.created',
+      id: 'sup1',
+      sessionName: 'deck_sub_sup1',
+      sessionType: 'codex-sdk',
+      state: 'running',
+      transportConfig: { [SUPERVISION_TRANSPORT_CONFIG_KEY]: SUPERVISED_SNAPSHOT },
+    }));
+  }
+
+  it('keeps supervision when a subsequent subsession.created carries an empty transportConfig', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+    await seedSupervisedSubSession(send);
+    expect((captured[0].transportConfig as any)?.[SUPERVISION_TRANSPORT_CONFIG_KEY]).toMatchObject({
+      mode: SUPERVISION_MODE.SUPERVISED,
+    });
+
+    // Stale broadcast arrives with an empty transportConfig — must not wipe supervision.
+    act(() => send({
+      type: 'subsession.created',
+      id: 'sup1',
+      sessionName: 'deck_sub_sup1',
+      sessionType: 'codex-sdk',
+      state: 'running',
+      transportConfig: {},
+    }));
+
+    expect((captured[0].transportConfig as any)?.[SUPERVISION_TRANSPORT_CONFIG_KEY]).toMatchObject({
+      mode: SUPERVISION_MODE.SUPERVISED,
+    });
+  });
+
+  it('keeps supervision when subsession.sync reports unrelated keys without supervision', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+    await seedSupervisedSubSession(send);
+
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'sup1',
+      transportConfig: { ccPreset: 'MiniMax' },
+    }));
+
+    expect(captured[0].transportConfig).toMatchObject({
+      ccPreset: 'MiniMax',
+      [SUPERVISION_TRANSPORT_CONFIG_KEY]: expect.objectContaining({
+        mode: SUPERVISION_MODE.SUPERVISED,
+      }),
+    });
+  });
+
+  it('replaces supervision when daemon broadcasts an authoritative OFF snapshot', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+    await seedSupervisedSubSession(send);
+
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'sup1',
+      transportConfig: { [SUPERVISION_TRANSPORT_CONFIG_KEY]: { mode: SUPERVISION_MODE.OFF } },
+    }));
+
+    expect((captured[0].transportConfig as any)?.[SUPERVISION_TRANSPORT_CONFIG_KEY]).toMatchObject({
+      mode: SUPERVISION_MODE.OFF,
+    });
+  });
+
+  it('full race: user enables supervised → daemon sends {} via subsession.sync → authoritative sync lands', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    // Created with no supervision yet.
+    act(() => send({
+      type: 'subsession.created',
+      id: 'race1',
+      sessionName: 'deck_sub_race1',
+      sessionType: 'codex-sdk',
+      state: 'running',
+    }));
+    expect(captured[0].transportConfig).toBeNull();
+
+    // User flips to supervised — mirror the optimistic UI path: subsession.sync carries the snapshot.
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'race1',
+      transportConfig: { [SUPERVISION_TRANSPORT_CONFIG_KEY]: SUPERVISED_SNAPSHOT },
+    }));
+    expect((captured[0].transportConfig as any)?.[SUPERVISION_TRANSPORT_CONFIG_KEY]).toMatchObject({
+      mode: SUPERVISION_MODE.SUPERVISED,
+    });
+
+    // Stale broadcast (common symptom: daemon hydrates from DB before PATCH lands).
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'race1',
+      transportConfig: {},
+    }));
+    expect((captured[0].transportConfig as any)?.[SUPERVISION_TRANSPORT_CONFIG_KEY]).toMatchObject({
+      mode: SUPERVISION_MODE.SUPERVISED,
+    });
+
+    // Authoritative post-PATCH broadcast confirms the same snapshot.
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'race1',
+      transportConfig: { [SUPERVISION_TRANSPORT_CONFIG_KEY]: SUPERVISED_SNAPSHOT },
+    }));
+    expect((captured[0].transportConfig as any)?.[SUPERVISION_TRANSPORT_CONFIG_KEY]).toMatchObject({
+      mode: SUPERVISION_MODE.SUPERVISED,
+    });
+  });
+});
+
+describe('queue visibility e2e — queued messages must stay visible until turn completes', () => {
+  afterEach(() => { cleanup(); vi.clearAllMocks(); captured = []; });
+
+  async function setupSession(ws: any, send: (m: any) => void) {
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+    act(() => send({
+      type: 'subsession.created',
+      id: 'eq1',
+      sessionName: 'deck_sub_eq1',
+      sessionType: 'claude-code-sdk',
+      state: 'running',
+    }));
+  }
+
+  function queueMessages(send: (m: any) => void) {
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_eq1',
+        payload: queuePayload('queued', 1, [
+          { clientMessageId: 'q1', text: 'fix the bug' },
+          { clientMessageId: 'q2', text: 'then add tests' },
+        ]),
+      },
+    }));
+  }
+
+  function expectQueueVisible() {
+    expect(captured[0].transportPendingMessages).toEqual(['fix the bug', 'then add tests']);
+    expect(captured[0].transportPendingMessageEntries).toEqual([
+      { clientMessageId: 'q1', text: 'fix the bug' },
+      { clientMessageId: 'q2', text: 'then add tests' },
+    ]);
+  }
+
+  function expectQueueCleared() {
+    expect(captured[0].transportPendingMessages?.length ?? 0).toBe(0);
+    expect(captured[0].transportPendingMessageEntries?.length ?? 0).toBe(0);
+  }
+
+  it('preserves queue on idle without pending fields until authoritative empty idle arrives', async () => {
+    const { ws, send } = createMockWs();
+    await setupSession(ws, send);
+    queueMessages(send);
+    expectQueueVisible();
+
+    // State-only idle must not clear the queue.
+    act(() => send({
+      type: 'timeline.event',
+      event: { type: 'session.state', sessionId: 'deck_sub_eq1', payload: { state: 'idle' } },
+    }));
+    expectQueueVisible();
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_eq1',
+        payload: queuePayload('idle', 2, []),
+      },
+    }));
+    expectQueueCleared();
+  });
+
+  it('does not clear queue on session.idle notification', async () => {
+    const { ws, send } = createMockWs();
+    await setupSession(ws, send);
+    queueMessages(send);
+    expectQueueVisible();
+
+    act(() => send({
+      type: 'session.idle',
+      session: 'deck_sub_eq1',
+      project: 'proj',
+      agentType: 'codex-sdk',
+    }));
+    expectQueueVisible();
+  });
+
+  it('preserves queue on idle with attached pending snapshot', async () => {
+    const { ws, send } = createMockWs();
+    await setupSession(ws, send);
+    queueMessages(send);
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_eq1',
+        payload: {
+          ...queuePayload('idle', 1, [
+            { clientMessageId: 'q1', text: 'fix the bug' },
+            { clientMessageId: 'q2', text: 'then add tests' },
+          ]),
+        },
+      },
+    }));
+    expectQueueVisible();
+  });
+
+  it('survives drain running event (no pending field) — queue stays', async () => {
+    const { ws, send } = createMockWs();
+    await setupSession(ws, send);
+    queueMessages(send);
+    expectQueueVisible();
+
+    // onDrain fires running WITHOUT pending fields (drained messages in flight)
+    act(() => send({
+      type: 'timeline.event',
+      event: { type: 'session.state', sessionId: 'deck_sub_eq1', payload: { state: 'running' } },
+    }));
+    expectQueueVisible();
+  });
+
+  it('survives streaming status changes (no pending field) — queue stays', async () => {
+    const { ws, send } = createMockWs();
+    await setupSession(ws, send);
+    queueMessages(send);
+
+    // Multiple running events during streaming (onStatusChange thinking/streaming → running)
+    for (let i = 0; i < 5; i++) {
+      act(() => send({
+        type: 'timeline.event',
+        event: { type: 'session.state', sessionId: 'deck_sub_eq1', payload: { state: 'running' } },
+      }));
+    }
+    expectQueueVisible();
+  });
+
+  it('clears on authoritative idle (with pending field) — turn completed', async () => {
+    const { ws, send } = createMockWs();
+    await setupSession(ws, send);
+    queueMessages(send);
+    expectQueueVisible();
+
+    // Runtime idle with authoritative pending=[] (turn truly completed, no more pending)
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_eq1',
+        payload: queuePayload('idle', 2, []),
+      },
+    }));
+    expectQueueCleared();
+  });
+
+  it('clears queue on running with explicit empty pending (drain completed)', async () => {
+    const { ws, send } = createMockWs();
+    await setupSession(ws, send);
+    queueMessages(send);
+    expectQueueVisible();
+
+    // Drain fires → daemon emits running WITH explicit empty pending.
+    // user.message simultaneously appears in timeline. Queue must clear now.
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_eq1',
+        payload: queuePayload('running', 2, []),
+      },
+    }));
+    expectQueueCleared();
+  });
+
+  it('clears stale queue from reconnect subsession sync when runtime reports empty pending', async () => {
+    const { ws, send } = createMockWs();
+    await setupSession(ws, send);
+    queueMessages(send);
+    expectQueueVisible();
+
+    // Browser missed the live drain while offline; lifecycle reconnect sync
+    // must carry an explicit empty runtime snapshot so the old queue is cleared.
+    act(() => send({
+      type: 'subsession.created',
+      id: 'eq1',
+      sessionName: 'deck_sub_eq1',
+      sessionType: 'claude-code-sdk',
+      state: 'running',
+      queueEpoch: TEST_QUEUE_EPOCH,
+      queueAuthorityId: TEST_QUEUE_AUTHORITY_ID,
+      pendingMessageEntries: [],
+      pendingMessageVersion: 2,
+    }));
+
+    expectQueueCleared();
+    expect(captured[0].transportPendingMessageVersion).toBe(2);
+  });
+
+  it('ignores stale reconnect queue snapshots older than a drained user.message', async () => {
+    const { ws, send } = createMockWs();
+    await setupSession(ws, send);
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_eq1',
+        payload: {
+          ...queuePayload('queued', 1, [
+            { clientMessageId: 'q1', text: 'fix the bug' },
+            { clientMessageId: 'q2', text: 'then add tests' },
+          ]),
+        },
+      },
+    }));
+    expectQueueVisible();
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'user.message',
+        sessionId: 'deck_sub_eq1',
+        payload: { clientMessageId: 'q1', text: 'fix the bug', pendingMessageVersion: 2 },
+      },
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual(['then add tests']);
+    expect(captured[0].transportPendingMessageVersion).toBe(2);
+
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'eq1',
+      state: 'queued',
+      queueEpoch: TEST_QUEUE_EPOCH,
+      queueAuthorityId: TEST_QUEUE_AUTHORITY_ID,
+      pendingMessageEntries: [
+        { clientMessageId: 'q1', text: 'fix the bug' },
+        { clientMessageId: 'q2', text: 'then add tests' },
+      ],
+      pendingMessageVersion: 1,
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual(['then add tests']);
+    expect(captured[0].transportPendingMessageEntries).toEqual([
+      { clientMessageId: 'q2', text: 'then add tests' },
+    ]);
+    expect(captured[0].transportPendingMessageVersion).toBe(2);
+  });
+
+  it('removes queued entries as authoritative user messages enter the timeline', async () => {
+    const { ws, send } = createMockWs();
+    await setupSession(ws, send);
+    queueMessages(send);
+    expectQueueVisible();
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'user.message',
+        sessionId: 'deck_sub_eq1',
+        payload: { clientMessageId: 'q1', text: 'fix the bug' },
+      },
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual(['then add tests']);
+    expect(captured[0].transportPendingMessageEntries).toEqual([
+      { clientMessageId: 'q2', text: 'then add tests' },
+    ]);
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'user.message',
+        sessionId: 'deck_sub_eq1',
+        payload: { clientMessageId: 'q2', text: 'then   add tests' },
+      },
+    }));
+
+    expectQueueCleared();
+    expect(captured[0].state).toBe('running');
+  });
+
+  it('removes queued entries from delivery facts even before user.message or idle snapshots arrive', async () => {
+    const { ws, send } = createMockWs();
+    await setupSession(ws, send);
+    queueMessages(send);
+    expectQueueVisible();
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'transport.queue.delivery',
+        sessionId: 'deck_sub_eq1',
+        payload: {
+          type: 'transport.queue.delivery',
+          sessionName: 'deck_sub_eq1',
+          clientMessageId: 'q1',
+          queueEpoch: TEST_QUEUE_EPOCH,
+          queueAuthorityId: TEST_QUEUE_AUTHORITY_ID,
+          pendingMessageVersion: 2,
+          deliveryFrameId: 'frame-1',
+          deliveryFrameVersion: 1,
+        },
+      },
+    }));
+
+    expect(captured[0].transportPendingMessages).toEqual(['then add tests']);
+    expect(captured[0].transportPendingMessageEntries).toEqual([
+      { clientMessageId: 'q2', text: 'then add tests' },
+    ]);
+    expect(captured[0].transportPendingMessageVersion).toBe(2);
+
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'transport.queue.delivery',
+        sessionId: 'deck_sub_eq1',
+        payload: {
+          type: 'transport.queue.delivery',
+          sessionName: 'deck_sub_eq1',
+          clientMessageId: 'q2',
+          queueEpoch: TEST_QUEUE_EPOCH,
+          queueAuthorityId: TEST_QUEUE_AUTHORITY_ID,
+          pendingMessageVersion: 3,
+          deliveryFrameId: 'frame-2',
+          deliveryFrameVersion: 1,
+        },
+      },
+    }));
+
+    expectQueueCleared();
+    expect(captured[0].state).toBe('running');
+    expect(captured[0].transportPendingMessageVersion).toBe(3);
+  });
+
+  it('full lifecycle: queue → running → idle clears', async () => {
+    const { ws, send } = createMockWs();
+    await setupSession(ws, send);
+    queueMessages(send);
+    expectQueueVisible();
+
+    // Step 1: agent picks up message → running with empty pending
+    act(() => send({
+      type: 'timeline.event',
+      event: { type: 'session.state', sessionId: 'deck_sub_eq1', payload: { state: 'running' } },
+    }));
+    expectQueueVisible(); // running without pending field — queue stays
+
+    // Step 2: streaming status changes (still running)
+    act(() => send({
+      type: 'timeline.event',
+      event: { type: 'session.state', sessionId: 'deck_sub_eq1', payload: { state: 'running' } },
+    }));
+    expectQueueVisible(); // still in flight
+
+    // Step 3: state-only idle does not clear queue
+    act(() => send({
+      type: 'timeline.event',
+      event: { type: 'session.state', sessionId: 'deck_sub_eq1', payload: { state: 'idle' } },
+    }));
+    expectQueueVisible();
+
+    // Step 4: authoritative empty idle clears queue
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_eq1',
+        payload: queuePayload('idle', 2, []),
+      },
+    }));
+    expectQueueCleared();
+  });
+
+  it('updates queue when new queued event arrives mid-flight', async () => {
+    const { ws, send } = createMockWs();
+    await setupSession(ws, send);
+    queueMessages(send);
+    expectQueueVisible();
+
+    // Drain (no pending field)
+    act(() => send({
+      type: 'timeline.event',
+      event: { type: 'session.state', sessionId: 'deck_sub_eq1', payload: { state: 'running' } },
+    }));
+    expectQueueVisible();
+
+    // User queues a NEW message while drained turn is in flight
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        type: 'session.state',
+        sessionId: 'deck_sub_eq1',
+        payload: {
+          ...queuePayload('queued', 2, [{ clientMessageId: 'q3', text: 'deploy to prod' }]),
+        },
+      },
+    }));
+
+    // Queue updated to only the new message (old ones were drained)
+    expect(captured[0].transportPendingMessages).toEqual(['deploy to prod']);
+    expect(captured[0].transportPendingMessageEntries).toEqual([
+      { clientMessageId: 'q3', text: 'deploy to prod' },
+    ]);
+  });
+});

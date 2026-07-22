@@ -1,0 +1,34 @@
+import { cwdPrefix, type AgentDriver, type LaunchOptions } from './base.js';
+import type { AgentStatus } from '../detect.js';
+import { detectStatus } from '../detect.js';
+
+export class ShellDriver implements AgentDriver {
+  readonly type = 'shell' as const;
+  readonly promptChar = '$';
+  readonly spinnerChars: string[] = [];
+
+  buildLaunchCommand(_sessionName: string, opts?: LaunchOptions): string {
+    const bin = (opts as { shellBin?: string } | undefined)?.shellBin
+      ?? process.env.SHELL
+      ?? (process.platform === 'win32' ? (process.env.COMSPEC ?? 'powershell.exe') : '/bin/bash');
+    const cwd = cwdPrefix(opts?.cwd);
+    const quotedBin = process.platform === 'win32' && /\s/.test(bin) ? `"${bin}"` : bin;
+    return `${cwd}${quotedBin}`;
+  }
+
+  buildResumeCommand(sessionName: string, opts?: LaunchOptions): string {
+    return this.buildLaunchCommand(sessionName, opts);
+  }
+
+  detectStatus(lines: string[]): AgentStatus {
+    return detectStatus(lines, 'shell');
+  }
+
+  isOverlay(_lines: string[]): boolean {
+    return false;
+  }
+
+  async captureLastResponse(capturePane: () => Promise<string[]>): Promise<string> {
+    return (await capturePane()).join('\n');
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "tasteSkill": {
+    "enabled": true,
+    "required": false,
+    "command": "my-hifi-visual-renderer",
+    "args": [
+      "--prompt",
+      "{promptPath}",
+      "--handoff",
+      "{designHandoffPath}",
+      "--markdown-output",
+      "{outputPath}",
+      "--image-output",
+      "{referencePath}"
+    ],
+    "cwd": ".",
+    "outputRelativePath": "design/taste-hifi-output.md",
+    "referenceRelativePath": "design/taste-hifi-reference.png",
+    "timeoutMs": 600000
+  }
+}

@@ -1,0 +1,246 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { Hono } from 'hono';
+import { SHARED_CONTEXT_RUNTIME_CONFIG_MSG } from '../../shared/shared-context-runtime-config.js';
+
+const getServersByUserIdMock = vi.fn();
+const getServerByIdMock = vi.fn();
+const getServerSharedContextRuntimeConfigMock = vi.fn();
+const updateServerSharedContextRuntimeConfigMock = vi.fn();
+const getUserPrefMock = vi.fn();
+const setUserPrefMock = vi.fn();
+const sendToDaemonMock = vi.fn();
+const queryOneMock = vi.fn();
+
+vi.mock('../src/security/authorization.js', () => ({
+  requireAuth: () => async (c: { set: (key: string, value: string) => void }, next: () => Promise<void>) => {
+    c.set('userId', 'user-1');
+    c.set('role', 'owner');
+    await next();
+  },
+}));
+
+vi.mock('../src/db/queries.js', () => ({
+  getServersByUserId: (...args: unknown[]) => getServersByUserIdMock(...args),
+  updateServerHeartbeat: vi.fn(),
+  updateServerName: vi.fn(),
+  deleteServer: vi.fn(),
+  upsertChannelBinding: vi.fn(),
+  getServerById: (...args: unknown[]) => getServerByIdMock(...args),
+  getServerSharedContextRuntimeConfig: (...args: unknown[]) => getServerSharedContextRuntimeConfigMock(...args),
+  updateServerSharedContextRuntimeConfig: (...args: unknown[]) => updateServerSharedContextRuntimeConfigMock(...args),
+  getUserPref: (...args: unknown[]) => getUserPrefMock(...args),
+  setUserPref: (...args: unknown[]) => setUserPrefMock(...args),
+}));
+
+vi.mock('../src/ws/bridge.js', () => ({
+  WsBridge: {
+    get: () => ({
+      sendToDaemon: sendToDaemonMock,
+    }),
+  },
+}));
+
+vi.mock('../src/security/crypto.js', async () => {
+  const actual = await vi.importActual('../src/security/crypto.js') as Record<string, unknown>;
+  return {
+    ...actual,
+    sha256Hex: vi.fn(() => 'token-hash'),
+    randomHex: vi.fn(() => 'nonce'),
+  };
+});
+
+describe('server shared-context runtime config routes', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    getServerByIdMock.mockResolvedValue({ id: 'srv-1', user_id: 'user-1' });
+    getServerSharedContextRuntimeConfigMock.mockResolvedValue({
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'sonnet',
+      primaryContextPreset: undefined,
+      backupContextBackend: undefined,
+      backupContextModel: undefined,
+      backupContextPreset: undefined,
+      memoryRecallMinScore: 0.4,
+      memoryScoringWeights: {
+        similarity: 0.4,
+        recency: 0.25,
+        frequency: 0.15,
+        project: 0.2,
+      },
+    });
+    updateServerSharedContextRuntimeConfigMock.mockResolvedValue(true);
+    getUserPrefMock.mockResolvedValue(undefined);
+    setUserPrefMock.mockResolvedValue(undefined);
+    queryOneMock.mockResolvedValue({ id: 'srv-1', user_id: 'user-1' });
+  });
+
+  async function buildApp() {
+    const { serverRoutes } = await import('../src/routes/server.js');
+    const app = new Hono();
+    app.use('*', async (c, next) => {
+      (c as unknown as { env: { DB: { queryOne: typeof queryOneMock } } }).env = { DB: { queryOne: queryOneMock } };
+      await next();
+    });
+    app.route('/api/server', serverRoutes);
+    return app;
+  }
+
+  it('gets the persisted runtime config for the selected server', async () => {
+    const app = await buildApp();
+    const response = await app.request('/api/server/srv-1/shared-context/runtime-config');
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      snapshot: {
+        persisted: {
+          primaryContextBackend: 'claude-code-sdk',
+          primaryContextModel: 'sonnet',
+          memoryRecallMinScore: 0.4,
+          memoryScoringWeights: {
+            similarity: 0.4,
+            recency: 0.25,
+            frequency: 0.15,
+            project: 0.2,
+          },
+          enablePersonalMemorySync: true,
+        },
+        effective: {
+          primaryContextBackend: 'claude-code-sdk',
+          primaryContextModel: 'sonnet',
+          memoryRecallMinScore: 0.4,
+          memoryScoringWeights: {
+            similarity: 0.4,
+            recency: 0.25,
+            frequency: 0.15,
+            project: 0.2,
+          },
+          enablePersonalMemorySync: true,
+        },
+      },
+    });
+  });
+
+  it('treats legacy false personal sync prefs as default-enabled until explicitly disabled in v2', async () => {
+    getUserPrefMock.mockImplementation(async (_db, _userId, key) => (
+      key === 'shared_context.personal_memory_sync' ? 'false' : undefined
+    ));
+
+    const app = await buildApp();
+    const response = await app.request('/api/server/srv-1/shared-context/runtime-config');
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.snapshot.persisted.enablePersonalMemorySync).toBe(true);
+    expect(body.snapshot.effective.enablePersonalMemorySync).toBe(true);
+  });
+
+  it('respects an explicit v2 personal sync opt-out', async () => {
+    getUserPrefMock.mockImplementation(async (_db, _userId, key) => (
+      key === 'shared_context.personal_memory_sync.v2' ? 'false' : 'true'
+    ));
+
+    const app = await buildApp();
+    const response = await app.request('/api/server/srv-1/shared-context/runtime-config');
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body.snapshot.persisted.enablePersonalMemorySync).toBe(false);
+    expect(body.snapshot.effective.enablePersonalMemorySync).toBe(false);
+  });
+
+  it('updates the cloud config and relays apply to the daemon', async () => {
+    const app = await buildApp();
+    const response = await app.request('/api/server/srv-1/shared-context/runtime-config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        primaryContextBackend: 'qwen',
+        primaryContextModel: 'qwen-team-model',
+        primaryContextPreset: 'Qwen Team',
+        backupContextBackend: 'qwen',
+        backupContextModel: 'qwen-backup-model',
+        backupContextPreset: 'Qwen Backup',
+        memoryRecallMinScore: 0.37,
+        memoryScoringWeights: {
+          similarity: 0.5,
+          recency: 0.2,
+          frequency: 0.1,
+          project: 0.2,
+        },
+        enablePersonalMemorySync: true,
+      }),
+    });
+    expect(response.status).toBe(200);
+    expect(updateServerSharedContextRuntimeConfigMock).toHaveBeenCalledWith(
+      expect.anything(),
+      'srv-1',
+      'user-1',
+      {
+        primaryContextBackend: 'qwen',
+        primaryContextModel: 'qwen-team-model',
+        primaryContextPreset: 'Qwen Team',
+        backupContextBackend: 'qwen',
+        backupContextModel: 'qwen-backup-model',
+        backupContextPreset: 'Qwen Backup',
+        memoryRecallMinScore: 0.37,
+        memoryScoringWeights: {
+          similarity: 0.5,
+          recency: 0.2,
+          frequency: 0.1,
+          project: 0.2,
+        },
+        enablePersonalMemorySync: undefined,
+      },
+    );
+    expect(setUserPrefMock).toHaveBeenCalledWith(
+      expect.anything(),
+      'user-1',
+      'shared_context.personal_memory_sync.v2',
+      'true',
+    );
+    expect(sendToDaemonMock).toHaveBeenCalledWith(JSON.stringify({
+      type: SHARED_CONTEXT_RUNTIME_CONFIG_MSG.APPLY,
+      config: {
+        primaryContextBackend: 'qwen',
+        primaryContextModel: 'qwen-team-model',
+        primaryContextPreset: 'Qwen Team',
+        backupContextBackend: 'qwen',
+        backupContextModel: 'qwen-backup-model',
+        backupContextPreset: 'Qwen Backup',
+        memoryRecallMinScore: 0.37,
+        memoryScoringWeights: {
+          similarity: 0.5,
+          recency: 0.2,
+          frequency: 0.1,
+          project: 0.2,
+        },
+        enablePersonalMemorySync: true,
+      },
+    }));
+  });
+
+  it('returns cloud config to the daemon using bearer auth', async () => {
+    const app = await buildApp();
+    const response = await app.request('/api/server/srv-1/shared-context/runtime-config/daemon', {
+      method: 'GET',
+      headers: { Authorization: 'Bearer token-1' },
+    });
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      config: {
+        primaryContextBackend: 'claude-code-sdk',
+        primaryContextModel: 'sonnet',
+        primaryContextPreset: undefined,
+        backupContextBackend: undefined,
+        backupContextModel: undefined,
+        backupContextPreset: undefined,
+        memoryRecallMinScore: 0.4,
+        memoryScoringWeights: {
+          similarity: 0.4,
+          recency: 0.25,
+          frequency: 0.15,
+          project: 0.2,
+        },
+        enablePersonalMemorySync: true,
+      },
+    });
+    expect(queryOneMock).toHaveBeenCalled();
+  });
+});

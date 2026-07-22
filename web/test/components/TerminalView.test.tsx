@@ -1,0 +1,307 @@
+/**
+ * @vitest-environment jsdom
+ */
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { h } from 'preact';
+import { render, screen } from '@testing-library/preact';
+
+vi.mock('xterm', () => ({
+  Terminal: vi.fn().mockImplementation(() => ({
+    open: vi.fn(),
+    write: vi.fn(),
+    reset: vi.fn(),
+    loadAddon: vi.fn(),
+    dispose: vi.fn(),
+    options: {},
+    attachCustomKeyEventHandler: vi.fn(),
+    hasSelection: vi.fn().mockReturnValue(false),
+    getSelection: vi.fn().mockReturnValue(''),
+    onData: vi.fn(),
+    onResize: vi.fn(),
+    onScroll: vi.fn(),
+    focus: vi.fn(),
+    scrollToBottom: vi.fn(),
+    buffer: { active: { baseY: 0, viewportY: 0 } },
+    cols: 80,
+    rows: 24,
+  })),
+}));
+
+vi.mock('@xterm/addon-fit', () => ({
+  FitAddon: vi.fn().mockImplementation(() => ({ fit: vi.fn() })),
+}));
+
+vi.mock('@xterm/addon-web-links', () => ({
+  WebLinksAddon: vi.fn().mockImplementation(() => ({})),
+}));
+
+// Mock ResizeObserver which is not available in jsdom
+global.ResizeObserver = vi.fn().mockImplementation(() => ({
+  observe: vi.fn(),
+  unobserve: vi.fn(),
+  disconnect: vi.fn(),
+}));
+
+import { TerminalView } from '../../src/components/TerminalView.js';
+import type { TerminalDiff } from '../../src/types.js';
+
+describe('TerminalView', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('renders a container div with terminal-container class', () => {
+    const { container } = render(
+      <TerminalView sessionName="test-session" />,
+    );
+    const div = container.querySelector('.terminal-container');
+    expect(div).toBeDefined();
+    expect(div).not.toBeNull();
+  });
+
+  it('calls onDiff with the applyDiff callback on mount', async () => {
+    const onDiff = vi.fn();
+    render(
+      <TerminalView sessionName="test-session" onDiff={onDiff} />,
+    );
+    expect(onDiff).toHaveBeenCalledOnce();
+    expect(typeof onDiff.mock.calls[0][0]).toBe('function');
+  });
+
+  it('applyDiff callback calls term.write with joined lines', async () => {
+    const { Terminal } = await import('xterm');
+    const mockWrite = vi.fn();
+    const mockReset = vi.fn();
+    (Terminal as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      open: vi.fn(),
+      write: mockWrite,
+      reset: mockReset,
+      loadAddon: vi.fn(),
+      dispose: vi.fn(),
+      options: {},
+      attachCustomKeyEventHandler: vi.fn(),
+      hasSelection: vi.fn().mockReturnValue(false),
+      getSelection: vi.fn().mockReturnValue(''),
+      onData: vi.fn(),
+      onResize: vi.fn(),
+      onScroll: vi.fn(),
+      focus: vi.fn(),
+      scrollToBottom: vi.fn(),
+      buffer: { active: { baseY: 0, viewportY: 0 } },
+      cols: 80,
+      rows: 24,
+    }));
+
+    let capturedApplyDiff: ((diff: TerminalDiff) => void) | undefined;
+    const onDiff = vi.fn((fn) => { capturedApplyDiff = fn; });
+
+    render(
+      <TerminalView sessionName="my-session" onDiff={onDiff} />,
+    );
+
+    expect(capturedApplyDiff).toBeDefined();
+
+    // Partial update (no fullFrame flag): component uses cursor-addressed write
+    const diff: TerminalDiff = {
+      rows: 2,
+      lines: [[0, 'line one'], [1, 'line two']],
+    };
+    capturedApplyDiff!(diff);
+
+    // Component writes cursor-positioned escape sequences for partial updates
+    expect(mockWrite).toHaveBeenCalledWith(
+      '\x1b[1;1Hline one\x1b[K\x1b[2;1Hline two\x1b[K',
+    );
+  });
+
+  it('mounts and unmounts without throwing', () => {
+    expect(() => {
+      const { unmount } = render(
+        <TerminalView sessionName="cleanup-session" />,
+      );
+      unmount();
+    }).not.toThrow();
+  });
+
+  it('calls Terminal dispose on unmount', async () => {
+    const { Terminal } = await import('xterm');
+    const mockDispose = vi.fn();
+    (Terminal as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      open: vi.fn(),
+      write: vi.fn(),
+      reset: vi.fn(),
+      loadAddon: vi.fn(),
+      dispose: mockDispose,
+      options: {},
+      attachCustomKeyEventHandler: vi.fn(),
+      hasSelection: vi.fn().mockReturnValue(false),
+      getSelection: vi.fn().mockReturnValue(''),
+      onData: vi.fn(),
+      onResize: vi.fn(),
+      onScroll: vi.fn(),
+      focus: vi.fn(),
+      scrollToBottom: vi.fn(),
+      buffer: { active: { baseY: 0, viewportY: 0 } },
+      cols: 80,
+      rows: 24,
+    }));
+
+    const { unmount } = render(
+      <TerminalView sessionName="dispose-session" />,
+    );
+    unmount();
+    expect(mockDispose).toHaveBeenCalledOnce();
+  });
+
+  it('does not subscribe to raw terminal bytes while inactive', async () => {
+    const onTerminalRaw = vi.fn();
+    render(
+      <TerminalView sessionName="inactive-session" ws={{ onTerminalRaw } as any} active={false} />,
+    );
+    expect(onTerminalRaw).not.toHaveBeenCalled();
+  });
+
+  it('does not apply diffs while inactive', async () => {
+    const { Terminal } = await import('xterm');
+    const mockWrite = vi.fn();
+    (Terminal as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      open: vi.fn(),
+      write: mockWrite,
+      reset: vi.fn(),
+      loadAddon: vi.fn(),
+      dispose: vi.fn(),
+      options: {},
+      attachCustomKeyEventHandler: vi.fn(),
+      hasSelection: vi.fn().mockReturnValue(false),
+      getSelection: vi.fn().mockReturnValue(''),
+      onData: vi.fn(),
+      onResize: vi.fn(),
+      onScroll: vi.fn(),
+      focus: vi.fn(),
+      scrollToBottom: vi.fn(),
+      buffer: { active: { baseY: 0, viewportY: 0 } },
+      cols: 80,
+      rows: 24,
+    }));
+
+    let capturedApplyDiff: ((diff: TerminalDiff) => void) | undefined;
+    render(
+      <TerminalView
+        sessionName="inactive-diff"
+        active={false}
+        onDiff={(fn) => { capturedApplyDiff = fn; }}
+      />,
+    );
+
+    capturedApplyDiff?.({
+      rows: 1,
+      lines: [[0, 'hidden update']],
+    });
+
+    expect(mockWrite).not.toHaveBeenCalled();
+  });
+
+  it('batches raw PTY writes while rendering a preview terminal', async () => {
+    vi.useFakeTimers();
+    const { Terminal } = await import('xterm');
+    const mockWrite = vi.fn((_data: Uint8Array, cb?: () => void) => cb?.());
+    const mockScrollToBottom = vi.fn();
+    (Terminal as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      open: vi.fn(),
+      write: mockWrite,
+      reset: vi.fn(),
+      loadAddon: vi.fn(),
+      dispose: vi.fn(),
+      options: {},
+      attachCustomKeyEventHandler: vi.fn(),
+      hasSelection: vi.fn().mockReturnValue(false),
+      getSelection: vi.fn().mockReturnValue(''),
+      onData: vi.fn(),
+      onResize: vi.fn(),
+      onScroll: vi.fn(),
+      focus: vi.fn(),
+      scrollToBottom: mockScrollToBottom,
+      buffer: { active: { baseY: 0, viewportY: 0 } },
+      cols: 80,
+      rows: 24,
+    }));
+
+    let rawHandler: ((data: Uint8Array) => void) | undefined;
+    const ws = {
+      onTerminalRaw: vi.fn((_session: string, handler: (data: Uint8Array) => void) => {
+        rawHandler = handler;
+        return vi.fn();
+      }),
+      onMessage: vi.fn(() => vi.fn()),
+    };
+
+    render(
+      <TerminalView sessionName="preview-raw" ws={ws as any} preview />,
+    );
+
+    expect(rawHandler).toBeDefined();
+    rawHandler!(new Uint8Array([65]));
+    rawHandler!(new Uint8Array([66]));
+
+    expect(mockWrite).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(31);
+    expect(mockWrite).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+
+    expect(mockWrite).toHaveBeenCalledOnce();
+    expect(Array.from(mockWrite.mock.calls[0][0] as Uint8Array)).toEqual([65, 66]);
+    expect(mockScrollToBottom).toHaveBeenCalledOnce();
+  });
+
+  it('sends clipboard text to the session when pasting into the terminal', async () => {
+    const { Terminal } = await import('xterm');
+    const mockFocus = vi.fn();
+    (Terminal as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      open: vi.fn(),
+      write: vi.fn(),
+      reset: vi.fn(),
+      loadAddon: vi.fn(),
+      dispose: vi.fn(),
+      options: {},
+      attachCustomKeyEventHandler: vi.fn(),
+      hasSelection: vi.fn().mockReturnValue(false),
+      getSelection: vi.fn().mockReturnValue(''),
+      onData: vi.fn(),
+      onResize: vi.fn(),
+      onScroll: vi.fn(),
+      focus: mockFocus,
+      scrollToBottom: vi.fn(),
+      buffer: { active: { baseY: 0, viewportY: 0 } },
+      cols: 80,
+      rows: 24,
+    }));
+    const sendInput = vi.fn();
+
+    const { container } = render(
+      <TerminalView
+        sessionName="paste-session"
+        ws={{
+          sendInput,
+          onTerminalRaw: vi.fn(() => vi.fn()),
+          onMessage: vi.fn(() => vi.fn()),
+        } as any}
+      />,
+    );
+    const terminal = container.querySelector('.terminal-container') as HTMLElement;
+    Object.defineProperty(terminal, 'clientWidth', { value: 640, configurable: true });
+    Object.defineProperty(terminal, 'clientHeight', { value: 360, configurable: true });
+    const event = new Event('paste', { bubbles: true, cancelable: true }) as ClipboardEvent;
+    Object.defineProperty(event, 'clipboardData', {
+      value: { getData: vi.fn(() => 'echo pasted\n') },
+    });
+    terminal.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(mockFocus).toHaveBeenCalled();
+    expect(sendInput).toHaveBeenCalledWith('paste-session', 'echo pasted\n');
+  });
+});

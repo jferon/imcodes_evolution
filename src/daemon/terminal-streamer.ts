@@ -1,0 +1,836 @@
+/**
+ * Terminal streaming via tmux pipe-pane -O raw PTY stream.
+ * Replaces polling capture-pane approach.
+ *
+ * Per-subscriber flow:
+ *   1. capturePaneVisible() → fullFrame snapshot → sent to subscriber
+ *   2. startPipePaneStream() → raw PTY bytes forwarded to subscribers
+ *
+ * Subscribers joining an already-running stream get a snapshot barrier:
+ *   - rawBuffer during snapshotPending (up to 256KB, else fail_subscriber)
+ *   - flush buffer after snapshot completes
+ *
+ * Dual-layer idle detection:
+ *   - Any raw bytes → reset idle timer → emit session.state(running) if was idle
+ *   - No raw bytes for IDLE_THRESHOLD_MS → emit session.state(idle)
+ */
+
+import type { Readable } from 'stream';
+import { BACKEND, capturePaneVisible, capturePaneHistory, getPaneId, getPaneSize, paneExists, sessionExists, startPipePaneStream, stopPipePaneStream } from '../agent/tmux.js';
+import { isTransportAgent } from '../agent/detect.js';
+import { getSession, upsertSession } from '../store/session-store.js';
+import { processRawPtyData, resetParser } from './terminal-parser.js';
+import { isWatching } from './jsonl-watcher.js';
+import { isWatching as isCodexWatching } from './codex-watcher.js';
+import { isWatching as isGeminiWatching } from './gemini-watcher.js';
+import logger from '../util/logger.js';
+import { timelineEmitter } from './timeline-emitter.js';
+import { emitSessionInlineError } from './session-error.js';
+import type { TerminalDiff, TerminalHistory } from '../shared/transport/terminal.js';
+
+const IDLE_THRESHOLD_MS = 5_000; // 5s without raw bytes → idle (Stop hook fires immediately; this is fallback)
+const MAX_RAW_BUFFER = 256 * 1024; // 256KB per-subscriber snapshot-pending buffer
+const REBIND_DELAYS_MS = [1000, 2000, 4000, 8000, 16000, 30000];
+const MAX_REBIND_ATTEMPTS = 5;
+
+function shouldSuppressPaneIdInlineError(sessionName: string): boolean {
+  const session = getSession(sessionName);
+  // Transport sessions never have a tmux pane — suppress the inline error.
+  if (session?.runtimeType === 'transport') return true;
+  if (typeof session?.agentType === 'string' && isTransportAgent(session.agentType)) return true;
+  // Session not yet in the store. Reached here only after startPipe already
+  // tried `getPaneId(sessionName)` and got undefined — meaning no tmux pane
+  // AND no session record. Two races produce this shape:
+  //   (a) Transport launch race: subscribe arrives before
+  //       launchTransportSession persists the session record.
+  //   (b) Stale subscribe for a session that has been deleted.
+  // In both cases, permanently stamping "Terminal stream unavailable: pane
+  // id not available. Restart the session to fix." into a newly-created
+  // (or vanished) transport session's timeline is misleading. The E2E
+  // "mode-aware-terminal-subscribe" path is unaffected: that test's tmux
+  // session has a real pane, so `getPaneId` succeeds and execution never
+  // reaches the inline-error branch that consults this helper.
+  if (!session) return true;
+  return false;
+}
+
+/** Transport sessions don't have tmux panes; all tmux-backed streamer
+ *  operations (snapshot, pipe, rebind) are no-ops for them.
+ *  NOTE: returns false for sessions not yet in the store so that genuine
+ *  tmux sessions created outside the daemon's session store (e.g. E2E
+ *  tests calling `newSession` directly) can still subscribe via the pane
+ *  path. Pre-creation race suppression for transport sessions lives in
+ *  {@link shouldSuppressPaneIdInlineError}. */
+function isTransportSessionName(sessionName: string): boolean {
+  const session = getSession(sessionName);
+  return session?.runtimeType === 'transport'
+    || (typeof session?.agentType === 'string' && isTransportAgent(session.agentType));
+}
+
+export type { TerminalDiff, TerminalHistory } from '../shared/transport/terminal.js';
+
+export interface StreamSubscriber {
+  sessionName: string;
+  /** Send a fullFrame snapshot or diff (snapshot uses fullFrame: true). */
+  send: (diff: TerminalDiff) => void;
+  /** Send raw PTY bytes directly to the terminal renderer. */
+  sendRaw?: (data: Buffer) => void;
+  /** Send a control message (e.g. terminal.stream_reset). */
+  sendControl?: (msg: { type: string; [key: string]: unknown }) => void;
+  sendHistory?: (history: TerminalHistory) => void;
+  onError?: (err: Error) => void;
+}
+
+interface SubscriberState {
+  snapshotPending: boolean;
+  rawBuffer: Buffer[];
+  rawBufferBytes: number;
+}
+
+interface PipeState {
+  stream: Readable;
+  cleanup: () => Promise<void>;
+  retryCount: number;
+  /** tmux paneId the pipe-pane was attached to. Used by `subscribe()` to
+   *  detect "session was killed and re-created with the same name behind
+   *  our back" — a real-production scenario when session-manager rebuilds
+   *  a session under the same name with a fresh pane, AND a test-isolation
+   *  scenario when a test's afterEach kills the tmux session and the next
+   *  beforeEach recreates it before the previous pipe's cat subprocess saw
+   *  EOF. In both cases the recorded paneId is stale; reusing the pipe
+   *  reads from a dead pipe-pane and bytes silently never arrive. */
+  paneId?: string;
+}
+
+// ── TerminalStreamer ───────────────────────────────────────────────────────────
+
+export class TerminalStreamer {
+  /** session → subscriber → state */
+  private subscribers = new Map<string, Map<StreamSubscriber, SubscriberState>>();
+  private pipes = new Map<string, PipeState>();
+  private retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Per-session "startPipe in flight" lock. `startPipe` is async; between
+   *  its `await startPipePaneStream(...)` and its later `this.pipes.set(...)`
+   *  assignment there is a window where `this.pipes.has(sessionName)` is
+   *  still false. Without this lock two concurrent calls (e.g. two web
+   *  subscribes arriving within the same tick after a network flap) both
+   *  see "no pipe yet", both spawn their own `cat /tmp/.../stream.fifo`,
+   *  and the second one's `pipes.set()` overwrites the first — the first
+   *  `cat` is then orphaned. Observed a ~5% orphan rate (10 of 215 pipe
+   *  starts) on a leaking production daemon before this guard. */
+  private pipeStartLocks = new Set<string>();
+
+  /** Grace period before tearing down a pipe whose subscriber count
+   *  dropped to zero. Without it, any browser-side subscriber churn
+   *  (component remount, transient WS hiccup, route flip) immediately
+   *  stops the pipe-pane stream — and the next subscribe restarts it.
+   *  On a dock with N visible sub-sessions a single re-render storm
+   *  produces N×2 pipe restart events in a few hundred ms; the user
+   *  sees the terminal "freeze for several seconds" while every pipe
+   *  spins back up + re-snapshots. The grace timer keeps the pipe
+   *  alive across the gap so a re-attaching subscriber attaches to the
+   *  SAME live pipe — no restart, no snapshot, no perceived freeze.
+   *
+   *  30s is comfortably longer than any plausible browser-side
+   *  unsubscribe→resubscribe round-trip while still being short
+   *  enough that a genuinely-departed user releases tmux capture-pane
+   *  / FIFO resources promptly.
+   */
+  private pipeStopGraceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private static readonly PIPE_STOP_GRACE_MS = 30_000;
+
+  // Idle detection
+  private lastRawAt = new Map<string, number>();
+  private idleTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private idleState = new Map<string, boolean>();
+
+  // Size cache for snapshots (refreshed every 5s)
+  private sizeCache = new Map<string, { cols: number; rows: number; ts: number }>();
+  private static readonly SIZE_CACHE_MS = 5_000;
+
+  private frameSeqs = new Map<string, number>();
+
+  subscribe(subscriber: StreamSubscriber): () => void {
+    const { sessionName } = subscriber;
+
+    // Transport sessions don't have a tmux pane — every tmux op fails noisily.
+    // Return a no-op unsubscribe without registering the subscriber so that
+    // `bootstrapSubscriber` (snapshot + pipe-pane start) never runs for them.
+    if (isTransportSessionName(sessionName)) {
+      logger.debug({ sessionName }, 'Terminal streamer subscribe skipped for transport session');
+      return () => { /* no-op */ };
+    }
+
+    // Cancel any pending teardown — a new subscriber arrived during the
+    // grace window, the existing pipe is still alive, no need to stop +
+    // restart. This is the path that turns a re-mount churn into a
+    // zero-cost no-op for the user.
+    const pendingStop = this.pipeStopGraceTimers.get(sessionName);
+    if (pendingStop) {
+      clearTimeout(pendingStop);
+      this.pipeStopGraceTimers.delete(sessionName);
+      logger.debug({ sessionName }, 'pipe-stop grace cancelled — new subscriber attached');
+    }
+
+    if (!this.subscribers.has(sessionName)) {
+      this.subscribers.set(sessionName, new Map());
+    }
+    const subs = this.subscribers.get(sessionName)!;
+    // Probe pipe health — `handlePipeClose` runs ASYNCHRONOUSLY when the cat
+    // subprocess sees EOF (tmux pane killed, pipe-pane dropped). If a
+    // subscribe arrives in the race window AFTER the pane died but BEFORE
+    // handlePipeClose fired (or for an idempotent restart-after-rename
+    // scenario where the pane was replaced under the same session name),
+    // `pipes.has(sessionName)` is still true but the underlying stream is
+    // destroyed. Treating that as a live pipe results in bootstrap reading
+    // from a dead cat → "no bytes ever arrive" symptom. Force a fresh
+    // start in that case.
+    const existingPipe = this.pipes.get(sessionName);
+    const pipeStale = existingPipe !== undefined
+      && (existingPipe.stream.destroyed || existingPipe.stream.readableEnded);
+    if (pipeStale) {
+      this.pipes.delete(sessionName);
+      try { existingPipe.stream.destroy(); } catch { /* ignore */ }
+      void existingPipe.cleanup().catch(() => { /* best-effort */ });
+      logger.debug({ sessionName }, 'subscribe: stale pipe detected, forcing fresh start');
+    }
+    const hasPipe = !pipeStale && this.pipes.has(sessionName);
+
+    const subState: SubscriberState = {
+      // If pipe already running, buffer raw bytes until snapshot delivered
+      snapshotPending: hasPipe,
+      rawBuffer: [],
+      rawBufferBytes: 0,
+    };
+    subs.set(subscriber, subState);
+
+    // Async: take snapshot then start pipe (for first subscriber) or flush buffer
+    void this.bootstrapSubscriber(sessionName, subscriber, subState, hasPipe);
+
+    return () => this.unsubscribe(subscriber);
+  }
+
+  private async bootstrapSubscriber(
+    sessionName: string,
+    subscriber: StreamSubscriber,
+    subState: SubscriberState,
+    hasPipe: boolean,
+  ): Promise<void> {
+    // Stale-pipe check (production + test): if we believed `hasPipe` was
+    // true based on the synchronous map check in subscribe(), verify the
+    // recorded paneId still matches tmux's current paneId for this
+    // session. Mismatch means the pane was destroyed and re-created
+    // under the same session name (real prod cases: session-manager
+    // restart, container respawn; test case: afterEach kills tmux,
+    // beforeEach recreates with same name). The old pipe-pane attaches
+    // to the dead pane and silently delivers no bytes — bootstrap would
+    // sit forever with snapshotPending=true. Force a fresh restart so
+    // the new subscriber gets a working pipe.
+    if (hasPipe && BACKEND !== 'conpty' && BACKEND !== 'wezterm') {
+      const existingPipe = this.pipes.get(sessionName);
+      const recordedPaneId = existingPipe?.paneId;
+      // Use sync getSession first (fast, no tmux call) and fall back to
+      // async tmux probe only when session-store doesn't know.
+      let currentPaneId = getSession(sessionName)?.paneId;
+      if (!currentPaneId) {
+        const fetched = getPaneId(sessionName);
+        currentPaneId = fetched != null ? await fetched.catch(() => undefined) : undefined;
+      }
+      if (recordedPaneId && currentPaneId && recordedPaneId !== currentPaneId) {
+        logger.info({ sessionName, recordedPaneId, currentPaneId }, 'subscribe: pane changed under us, restarting pipe');
+        if (existingPipe) {
+          this.pipes.delete(sessionName);
+          try { existingPipe.stream.destroy(); } catch { /* ignore */ }
+          void existingPipe.cleanup().catch(() => { /* best-effort */ });
+          try { await stopPipePaneStream(sessionName); } catch { /* best-effort */ }
+        }
+        // Drop snapshotPending — we'll get a fresh snapshot through the
+        // startPipe path below with the new pipe.
+        subState.snapshotPending = false;
+        // Drain any buffered raw bytes from the stale pipe — they're
+        // garbage from the dead pane, would corrupt the new screen state.
+        subState.rawBuffer = [];
+        subState.rawBufferBytes = 0;
+        // Treat as fresh subscriber — bootstrap will fall through to the
+        // `if (!hasPipe)` branch at the end of this function.
+        hasPipe = false;
+      }
+    }
+
+    // 1. Take snapshot
+    try {
+      const size = await this.getSize(sessionName);
+      const raw = await capturePaneVisible(sessionName);
+      const lines = raw.split('\n').slice(0, size.rows);
+      while (lines.length < size.rows) lines.push('');
+
+      const diff: TerminalDiff = {
+        sessionName,
+        timestamp: Date.now(),
+        lines: lines.map((l, i) => [i, l] as [number, string]),
+        cols: size.cols,
+        rows: size.rows,
+        frameSeq: this.nextFrameSeq(sessionName),
+        fullFrame: true,
+        snapshotRequested: false,
+        scrolled: false,
+        newLineCount: 0,
+      };
+
+      // Check subscriber is still active
+      if (!this.subscribers.get(sessionName)?.has(subscriber)) return;
+      subscriber.send(diff);
+    } catch (err) {
+      logger.warn({ sessionName, err }, 'Snapshot failed during subscribe');
+      // Continue — raw stream may still recover state
+    }
+
+    // ConPTY: replay raw screen buffer after snapshot for accurate terminal state
+    if (BACKEND === 'conpty') {
+      try {
+        const { conptyGetScreenBuffer } = await import('../agent/conpty.js');
+        const screen = conptyGetScreenBuffer(sessionName);
+        if (screen && this.subscribers.get(sessionName)?.has(subscriber)) {
+          try { subscriber.sendRaw?.(Buffer.from(screen)); } catch { /* ignore */ }
+        }
+      } catch { /* conpty not available */ }
+    }
+
+    // 2. Flush buffered raw bytes immediately after snapshot — never block live
+    //    PTY forwarding for history capture (which can be slow under load).
+    subState.snapshotPending = false;
+    for (const chunk of subState.rawBuffer) {
+      if (!this.subscribers.get(sessionName)?.has(subscriber)) break;
+      try { subscriber.sendRaw?.(chunk); } catch { /* ignore */ }
+    }
+    subState.rawBuffer = [];
+    subState.rawBufferBytes = 0;
+
+    // 3. Send scrollback history asynchronously (best-effort, never blocks raw stream)
+    if (subscriber.sendHistory) {
+      void (async () => {
+        try {
+          const historyContent = await capturePaneHistory(sessionName);
+          if (historyContent && this.subscribers.get(sessionName)?.has(subscriber)) {
+            subscriber.sendHistory!({ sessionName, content: historyContent });
+          }
+        } catch { /* best-effort */ }
+      })();
+    }
+
+    // 4. Start pipe if this was the first subscriber
+    if (!hasPipe && this.subscribers.get(sessionName)?.has(subscriber)) {
+      await this.startPipe(sessionName, 0);
+    }
+  }
+
+  unsubscribe(subscriber: StreamSubscriber): void {
+    const { sessionName } = subscriber;
+    const subs = this.subscribers.get(sessionName);
+    if (!subs) return;
+
+    subs.delete(subscriber);
+
+    if (subs.size === 0) {
+      this.scheduleGracedStop(sessionName);
+    }
+  }
+
+  /**
+   * Schedule a graced pipe teardown when the subscriber count for a session
+   * dropped to zero. If a new subscriber attaches within the grace window
+   * (`subscribe()` cancels the timer), the existing pipe stays alive and the
+   * re-attach is a no-op — no pipe-pane stop+start, no snapshot, no
+   * perceptible "freeze". Used by both `unsubscribe()` (the user path) and
+   * `removeSubscriber()` (the internal overflow / error path).
+   */
+  private scheduleGracedStop(sessionName: string): void {
+    const existingTimer = this.pipeStopGraceTimers.get(sessionName);
+    if (existingTimer) clearTimeout(existingTimer);
+    const timer = setTimeout(() => {
+      this.pipeStopGraceTimers.delete(sessionName);
+      // Re-check: a subscriber may have attached during the grace window
+      // (and not yet left). Only tear down if subs are still 0.
+      const currentSubs = this.subscribers.get(sessionName);
+      if (!currentSubs || currentSubs.size > 0) return;
+      this.subscribers.delete(sessionName);
+      void this.stopPipe(sessionName);
+      this.clearIdleTimer(sessionName);
+      this.lastRawAt.delete(sessionName);
+      this.idleState.delete(sessionName);
+      this.sizeCache.delete(sessionName);
+      this.frameSeqs.delete(sessionName);
+      resetParser(sessionName);
+    }, TerminalStreamer.PIPE_STOP_GRACE_MS);
+    this.pipeStopGraceTimers.set(sessionName, timer);
+    logger.debug({ sessionName, graceMs: TerminalStreamer.PIPE_STOP_GRACE_MS }, 'pipe-stop scheduled with grace');
+  }
+
+  /** Request an on-demand snapshot for all subscribers of a session. */
+  requestSnapshot(sessionName: string): void {
+    // Transport sessions have no tmux pane — snapshot requests are no-ops.
+    if (isTransportSessionName(sessionName)) return;
+    const subs = this.subscribers.get(sessionName);
+    if (!subs || subs.size === 0) return;
+
+    void (async () => {
+      try {
+        const size = await this.getSize(sessionName);
+        const raw = await capturePaneVisible(sessionName);
+        const lines = raw.split('\n').slice(0, size.rows);
+        while (lines.length < size.rows) lines.push('');
+
+        const diff: TerminalDiff = {
+          sessionName,
+          timestamp: Date.now(),
+          lines: lines.map((l, i) => [i, l] as [number, string]),
+          cols: size.cols,
+          rows: size.rows,
+          frameSeq: this.nextFrameSeq(sessionName),
+          fullFrame: true,
+          snapshotRequested: true,
+          scrolled: false,
+          newLineCount: 0,
+        };
+
+        for (const [sub] of subs) {
+          try { sub.send(diff); } catch { /* ignore */ }
+        }
+
+        // ConPTY: ring buffer snapshot is approximate (no cursor/ANSI state).
+        // Replay recent raw PTY output so xterm.js can render the real screen.
+        if (BACKEND === 'conpty') {
+          try {
+            const { conptyGetScreenBuffer } = await import('../agent/conpty.js');
+            const screen = conptyGetScreenBuffer(sessionName);
+            if (screen) {
+              const buf = Buffer.from(screen);
+              for (const [sub] of subs) {
+                try { sub.sendRaw?.(buf); } catch { /* ignore */ }
+              }
+            }
+          } catch { /* conpty not available */ }
+        }
+
+        timelineEmitter.emit(sessionName, 'terminal.snapshot', { lines, cols: size.cols, rows: size.rows });
+      } catch (err) {
+        logger.warn({ sessionName, err }, 'requestSnapshot failed');
+      }
+    })();
+  }
+
+  /** Invalidate size cache (call after resize events). */
+  invalidateSize(sessionName: string): void {
+    this.sizeCache.delete(sessionName);
+  }
+
+  /** No-op in new design (no polling loop to nudge). Kept for API compat. */
+  nudge(_sessionName: string): void {
+    // Raw stream is always live — no nudge needed
+  }
+
+  /** Called by session-manager when a session restarts with a new pane. */
+  async rebindSession(sessionName: string): Promise<void> {
+    // Cancel any pending graced stop — rebind is an explicit "reattach
+    // pipe to fresh pane" signal that supersedes a passive teardown. If
+    // the grace fired AFTER rebind completed, it'd tear down the
+    // newly-started pipe.
+    const pendingStop = this.pipeStopGraceTimers.get(sessionName);
+    if (pendingStop) {
+      clearTimeout(pendingStop);
+      this.pipeStopGraceTimers.delete(sessionName);
+    }
+    const subs = this.subscribers.get(sessionName);
+    if (!subs || subs.size === 0) return;
+    // Transport sessions don't have a pane to rebind — skip rather than
+    // trigger the "paneId not available" error on every relaunch.
+    if (isTransportSessionName(sessionName)) return;
+    await this.stopPipe(sessionName);
+    await this.startPipe(sessionName, 0);
+    // Re-snapshot all subscribers
+    this.requestSnapshot(sessionName);
+  }
+
+  async destroyAsync(): Promise<void> {
+    const sessionNames = new Set([
+      ...this.subscribers.keys(),
+      ...this.pipes.keys(),
+    ]);
+    for (const timer of this.retryTimers.values()) clearTimeout(timer);
+    for (const timer of this.pipeStopGraceTimers.values()) clearTimeout(timer);
+    for (const sessionName of sessionNames) {
+      this.clearIdleTimer(sessionName);
+    }
+    await Promise.all([...sessionNames].map((sessionName) => this.stopPipe(sessionName)));
+    this.subscribers.clear();
+    this.pipes.clear();
+    this.pipeStartLocks.clear();
+    this.retryTimers.clear();
+    this.pipeStopGraceTimers.clear();
+    this.lastRawAt.clear();
+    this.idleTimers.clear();
+    this.idleState.clear();
+    this.sizeCache.clear();
+    this.frameSeqs.clear();
+  }
+
+  destroy(): void {
+    void this.destroyAsync();
+  }
+
+  // ── Pipe lifecycle ──────────────────────────────────────────────────────────
+
+  private async startPipe(sessionName: string, retryCount: number): Promise<void> {
+    // ConPTY doesn't need paneId — it uses session name directly from the in-memory map
+    let paneId: string | undefined;
+    if (BACKEND !== 'conpty') {
+      // Transport sessions (claude-code-sdk, codex-sdk, qwen, …) don't have a
+      // tmux pane to pipe. If a stale subscribe path lands here for a transport
+      // session, bail out cleanly instead of producing a misleading
+      // "paneId not available" error that the session-manager mistakes for a
+      // dead pane and tries to restart in a 3-strikes loop.
+      if (isTransportSessionName(sessionName)) return;
+    }
+
+    // Concurrent-start guard. If a previous `startPipe` for this session
+    // has already persisted a pipeState OR is currently awaiting
+    // `startPipePaneStream` (lock held), bail — don't race to overwrite.
+    // The only caller that legitimately needs a fresh pipe while one is
+    // "alive" in the map is `rebindSession`, and that path explicitly
+    // calls `stopPipe` first; and `scheduleRebind` only fires after
+    // `handlePipeClose` has already removed the dead entry from the map.
+    // So reaching this guard with a non-empty state is always a race we
+    // should drop.
+    if (this.pipes.has(sessionName) || this.pipeStartLocks.has(sessionName)) {
+      logger.debug({ sessionName }, 'startPipe: concurrent start skipped');
+      return;
+    }
+    this.pipeStartLocks.add(sessionName);
+    try {
+    if (BACKEND !== 'conpty') {
+      const session = getSession(sessionName);
+      paneId = session?.paneId;
+      // A STORED paneId can be stale: a migrated sessions.json on a fresh box,
+      // or one left over after a tmux-server restart, points at a `%N` that no
+      // longer exists. Piping into it would fail downstream and burn rebind
+      // attempts. If the stored pane is gone, try to swap in a freshly-resolved
+      // live pane (and persist it). We only DROP the stored id when a live one
+      // is actually resolvable — if we can't resolve one either (e.g. a
+      // transient tmux hiccup), keep the stored id and let startPipePaneStream's
+      // own hard guard + the normal rebind path decide. (paneExists never
+      // throws — it returns false on any lookup error.)
+      if (paneId && !(await paneExists(paneId))) {
+        const fetched = getPaneId(sessionName);
+        const fresh = fetched != null ? await fetched.catch(() => undefined) : undefined;
+        if (fresh && fresh !== paneId) {
+          logger.warn({ sessionName, stalePaneId: paneId, paneId: fresh }, 'startPipe: stored paneId is stale — re-resolved live pane');
+          paneId = fresh;
+          if (session) upsertSession({ ...session, paneId: fresh });
+        } else if (!fresh) {
+          logger.warn({ sessionName, paneId }, 'startPipe: stored paneId appears stale but no live pane resolved — proceeding (pipe guard will reject if truly gone)');
+        }
+      }
+      if (!paneId) {
+        // Fetch paneId from tmux. For transport sessions that were just created
+        // and not yet registered in the session store, getPaneId will return
+        // undefined and we'll emit the "not available" error (transported sessions
+        // that genuinely have no pane are filtered above by
+        // isTransportSessionName — this path only fires for unregistered process
+        // sessions or sessions created before paneId persistence).
+        // For genuine tmux sessions (e.g. E2E test sessions), getPaneId succeeds
+        // even when the daemon's session store has no record for them yet.
+        const fetched = getPaneId(sessionName);
+        paneId = fetched != null ? await fetched.catch(() => undefined) : undefined;
+        if (paneId && session) {
+          upsertSession({ ...session, paneId });
+        }
+      }
+      if (!paneId) {
+        logger.error({ sessionName }, 'Cannot start pipe-pane: paneId not available — restart session to fix');
+        if (!shouldSuppressPaneIdInlineError(sessionName)) {
+          this.emitSessionStreamError(sessionName, 'Terminal stream unavailable: pane id not available. Restart the session to fix.');
+        }
+        // Do not remove subscribers: they can still receive on-demand snapshots
+        return;
+      }
+    }
+
+    try {
+      const { stream, cleanup } = await startPipePaneStream(sessionName, paneId ?? '');
+
+      const pipeState: PipeState = { stream, cleanup, retryCount, paneId };
+      this.pipes.set(sessionName, pipeState);
+
+      stream.on('data', (chunk: unknown) => {
+        this.onRawData(sessionName, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string));
+      });
+
+      stream.on('error', (err) => {
+        logger.warn({ sessionName, err }, 'Pipe stream error');
+        this.handlePipeClose(sessionName);
+      });
+
+      stream.on('close', () => {
+        // Unexpected close (e.g. FIFO fd error)
+        if (this.pipes.has(sessionName)) {
+          this.handlePipeClose(sessionName);
+        }
+      });
+
+      logger.info({ sessionName, paneId }, 'Pipe-pane stream started');
+    } catch (err) {
+      logger.error({ sessionName, err }, 'Failed to start pipe-pane stream');
+      if (retryCount < MAX_REBIND_ATTEMPTS) {
+        this.scheduleRebind(sessionName, retryCount + 1);
+      } else {
+        this.errorAllSubscribers(sessionName, err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+    } finally {
+      this.pipeStartLocks.delete(sessionName);
+    }
+  }
+
+  private async stopPipe(sessionName: string): Promise<void> {
+    const timer = this.retryTimers.get(sessionName);
+    if (timer) {
+      clearTimeout(timer);
+      this.retryTimers.delete(sessionName);
+    }
+
+    const pipeState = this.pipes.get(sessionName);
+    if (!pipeState) return;
+    this.pipes.delete(sessionName);
+
+    pipeState.stream.destroy();
+    try { await pipeState.cleanup(); } catch (err) {
+      logger.warn({ sessionName, err }, 'Pipe cleanup error');
+    }
+    try { await stopPipePaneStream(sessionName); } catch { /* best-effort */ }
+  }
+
+  private handlePipeClose(sessionName: string): void {
+    // Tear down the previous pipeState so the underlying
+    // `cat /tmp/.../stream.fifo` subprocess gets reaped and the Node stream
+    // stops accumulating buffered data in its internal read queue. Without
+    // this, unexpected pipe close (stream `error` / `close`) leaves a
+    // dangling FIFO reader that keeps draining data into the daemon with no
+    // subscriber consuming it — the readable buffer grows unbounded until
+    // OOM. Empirically we saw 10 orphan `cat` processes accumulate and RSS
+    // climb ~425MB/min before the daemon crashed.
+    const pipeState = this.pipes.get(sessionName);
+    this.pipes.delete(sessionName);
+    if (pipeState) {
+      try { pipeState.stream.destroy(); } catch { /* ignore */ }
+      void pipeState.cleanup().catch((err) => {
+        logger.warn({ sessionName, err }, 'Pipe cleanup error in handlePipeClose');
+      });
+      void stopPipePaneStream(sessionName).catch(() => { /* best-effort */ });
+    }
+
+    // If still have active subscribers, attempt rebind
+    const subs = this.subscribers.get(sessionName);
+    if (subs && subs.size > 0) {
+      logger.info({ sessionName }, 'Pipe closed unexpectedly — scheduling rebind');
+      this.scheduleRebind(sessionName, 0);
+    }
+  }
+
+  /** Called after a session is newly created to start the pipe for any waiting subscribers. */
+  retryPipeIfSubscribers(sessionName: string): void {
+    const subs = this.subscribers.get(sessionName);
+    if (!subs || subs.size === 0) return;
+    if (this.pipes.has(sessionName)) return;
+    if (this.retryTimers.has(sessionName)) return;
+    void this.startPipe(sessionName, 0);
+  }
+
+  private scheduleRebind(sessionName: string, attempt: number): void {
+    const delay = REBIND_DELAYS_MS[Math.min(attempt, REBIND_DELAYS_MS.length - 1)];
+    const timer = setTimeout(async () => {
+      this.retryTimers.delete(sessionName);
+
+      // Check if still have subscribers
+      const subs = this.subscribers.get(sessionName);
+      if (!subs || subs.size === 0) return;
+
+      if (attempt >= MAX_REBIND_ATTEMPTS) {
+        logger.error({ sessionName }, 'Pipe rebind: max retries exceeded');
+        this.errorAllSubscribers(sessionName, new Error('Terminal stream unavailable after max retries'));
+        return;
+      }
+
+      // Check if session still alive
+      const alive = await sessionExists(sessionName).catch(() => false);
+      if (!alive) {
+        logger.warn({ sessionName }, 'Session gone, stopping pipe rebind');
+        this.errorAllSubscribers(sessionName, new Error('Session no longer exists'));
+        return;
+      }
+
+      logger.info({ sessionName, attempt }, 'Rebinding pipe-pane stream');
+      await this.startPipe(sessionName, attempt);
+    }, delay);
+
+    this.retryTimers.set(sessionName, timer);
+  }
+
+  // ── Raw data handling ───────────────────────────────────────────────────────
+
+  private onRawData(sessionName: string, data: Buffer): void {
+    const hasStructuredWatcher = isWatching(sessionName) || isCodexWatching(sessionName) || isGeminiWatching(sessionName);
+
+    // Idle detection: skip for sessions with a structured watcher (CC/Codex).
+    // Those sessions get authoritative idle/running signals via hooks and JSONL events,
+    // so raw bytes (cursor blink, prompt redraws) must not cause spurious oscillation.
+    if (!hasStructuredWatcher) {
+      const wasIdle = this.idleState.get(sessionName) ?? false;
+      this.lastRawAt.set(sessionName, Date.now());
+      if (wasIdle) {
+        this.idleState.set(sessionName, false);
+        timelineEmitter.emit(sessionName, 'session.state', { state: 'running' });
+        const sess = getSession(sessionName);
+        if (sess) upsertSession({ ...sess, state: 'running', updatedAt: Date.now() });
+      }
+      this.resetIdleTimer(sessionName);
+    }
+
+    // Text extraction — skip if a structured watcher is active (higher quality source),
+    // or if this is a sub-session (deck_sub_*): sub-sessions always use JSONL or TerminalView,
+    // never terminal-parse for chat timeline events. This prevents garbled output during
+    // the window between daemon restart and the codex watcher being re-established.
+    const isSubSession = sessionName.startsWith('deck_sub_');
+    if (!hasStructuredWatcher && !isSubSession) {
+      processRawPtyData(sessionName, data);
+    }
+
+    // Forward to subscribers
+    const subs = this.subscribers.get(sessionName);
+    if (!subs) return;
+
+    for (const [sub, state] of subs) {
+      if (state.snapshotPending) {
+        // Buffer raw bytes while snapshot is pending
+        state.rawBuffer.push(data);
+        state.rawBufferBytes += data.length;
+        if (state.rawBufferBytes > MAX_RAW_BUFFER) {
+          this.failSubscriber(sessionName, sub, state);
+        }
+      } else {
+        try {
+          sub.sendRaw?.(data);
+        } catch (err) {
+          sub.onError?.(err instanceof Error ? err : new Error(String(err)));
+          this.removeSubscriber(sessionName, sub);
+        }
+      }
+    }
+  }
+
+  private failSubscriber(sessionName: string, sub: StreamSubscriber, state: SubscriberState): void {
+    // Discard buffer and remove subscriber
+    state.rawBuffer = [];
+    state.rawBufferBytes = 0;
+    this.removeSubscriber(sessionName, sub);
+
+    // Notify client to reset and resubscribe
+    try {
+      sub.sendControl?.({ type: 'terminal.stream_reset', session: sessionName, reason: 'raw_buffer_overflow' });
+    } catch {
+      sub.onError?.(new Error('raw_buffer_overflow'));
+    }
+  }
+
+  private removeSubscriber(sessionName: string, sub: StreamSubscriber): void {
+    const subs = this.subscribers.get(sessionName);
+    if (!subs) return;
+    subs.delete(sub);
+    if (subs.size === 0) {
+      // Same grace path as unsubscribe — a fresh subscriber may attach
+      // immediately after an overflow / error removal (the client sees
+      // `terminal.stream_reset` and resubscribes). Without grace we'd
+      // re-restart the pipe; with grace we keep it alive across the gap.
+      this.scheduleGracedStop(sessionName);
+    }
+  }
+
+  private errorAllSubscribers(sessionName: string, err: Error): void {
+    const subs = this.subscribers.get(sessionName);
+    if (!subs) return;
+    this.emitSessionStreamError(sessionName, err.message);
+    for (const [sub] of subs) {
+      try { sub.onError?.(err); } catch { /* ignore */ }
+    }
+    // Fundamentally broken — cancel any pending graced stop and tear down
+    // immediately. There's nothing recoverable to keep alive.
+    const pendingStop = this.pipeStopGraceTimers.get(sessionName);
+    if (pendingStop) {
+      clearTimeout(pendingStop);
+      this.pipeStopGraceTimers.delete(sessionName);
+    }
+    this.subscribers.delete(sessionName);
+    void this.stopPipe(sessionName);
+    this.clearIdleTimer(sessionName);
+  }
+
+  private emitSessionStreamError(sessionName: string, message: string): void {
+    emitSessionInlineError(sessionName, message);
+  }
+
+  // ── Idle detection ──────────────────────────────────────────────────────────
+
+  private resetIdleTimer(sessionName: string): void {
+    this.clearIdleTimer(sessionName);
+    const timer = setTimeout(() => {
+      this.idleTimers.delete(sessionName);
+      const currentlyIdle = this.idleState.get(sessionName) ?? false;
+      const sess = getSession(sessionName);
+      if (sess?.agentType === 'codex' && isCodexWatching(sessionName)) {
+        return; // Codex has stronger structured idle signals via JSONL/hook
+      }
+      if (sess?.agentType === 'gemini' && isGeminiWatching(sessionName)) {
+        return; // Gemini has stronger structured idle signals via JSON watcher
+      }
+      if (!currentlyIdle) {
+        this.idleState.set(sessionName, true);
+        timelineEmitter.emit(sessionName, 'session.state', { state: 'idle' });
+        if (sess) upsertSession({ ...sess, state: 'idle', updatedAt: Date.now() });
+      }
+    }, IDLE_THRESHOLD_MS);
+    this.idleTimers.set(sessionName, timer);
+  }
+
+  private clearIdleTimer(sessionName: string): void {
+    const timer = this.idleTimers.get(sessionName);
+    if (timer) {
+      clearTimeout(timer);
+      this.idleTimers.delete(sessionName);
+    }
+  }
+
+  // ── Helpers ─────────────────────────────────────────────────────────────────
+
+  private async getSize(sessionName: string): Promise<{ cols: number; rows: number }> {
+    const cached = this.sizeCache.get(sessionName);
+    if (cached && Date.now() - cached.ts < TerminalStreamer.SIZE_CACHE_MS) {
+      return { cols: cached.cols, rows: cached.rows };
+    }
+    try {
+      const size = await getPaneSize(sessionName);
+      this.sizeCache.set(sessionName, { ...size, ts: Date.now() });
+      return size;
+    } catch {
+      return { cols: 80, rows: 24 };
+    }
+  }
+
+  private nextFrameSeq(sessionName: string): number {
+    const seq = (this.frameSeqs.get(sessionName) ?? 0) + 1;
+    this.frameSeqs.set(sessionName, seq);
+    return seq;
+  }
+}
+
+// ── Singleton ─────────────────────────────────────────────────────────────────
+
+export const terminalStreamer = new TerminalStreamer();

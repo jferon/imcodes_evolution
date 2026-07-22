@@ -1,0 +1,21 @@
+{
+  "tasteSkill": {
+    "enabled": true,
+    "required": false,
+    "command": "imcodes-taste-skill",
+    "args": [
+      "--prompt",
+      "{promptPath}",
+      "--design-handoff",
+      "{designHandoffPath}",
+      "--output",
+      "{outputPath}",
+      "--reference-output",
+      "{referencePath}"
+    ],
+    "cwd": ".",
+    "outputRelativePath": "design/taste-hifi-output.md",
+    "referenceRelativePath": "design/taste-hifi-reference.svg",
+    "timeoutMs": 600000
+  }
+}

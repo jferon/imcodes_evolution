@@ -1,0 +1,723 @@
+/**
+ * Local HTTP server for agent hook callbacks.
+ *
+ * POST /notify  { event: "idle"|"notification"|"tool_start"|"tool_end", session, ... }
+ * POST /send    { from, to, message, files?, context?, depth? }
+ *
+ * Port selection:
+ *   1. Load persisted port from ~/.imcodes/hook-port (remembered across restarts)
+ *   2. Try to bind; if EADDRINUSE, increment and retry (up to 20 attempts)
+ *   3. Save the successfully bound port back to the file
+ *
+ * After startHookServer() resolves, `activeHookPort` holds the actual port.
+ * All hook scripts and plugins read this value at write time.
+ */
+import http from 'http';
+import { promises as fs } from 'fs';
+import { dirname } from 'path';
+import logger from '../util/logger.js';
+import { timelineEmitter } from './timeline-emitter.js';
+import { getSession, upsertSession, listSessions } from '../store/session-store.js';
+import type { SessionRecord } from '../store/session-store.js';
+import { refreshSessionWatcher } from './watcher-controls.js';
+import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
+import { dispatchHookSend } from './send-tool.js';
+import { DEFAULT_HOOK_PORT, HOOK_PORT_FILE } from './hook-port.js';
+
+export { DEFAULT_HOOK_PORT };
+
+
+/** Max body size: 1 MB */
+const MAX_BODY_SIZE = 1024 * 1024;
+
+/** Queue message expiry: 5 minutes */
+const QUEUE_EXPIRY_MS = 5 * 60 * 1000;
+/** Max send depth (circular send prevention) */
+const MAX_SEND_DEPTH = 3;
+/** Rate limit: max messages per source per window */
+const RATE_LIMIT_MAX = 10;
+/** Rate limit window: 60 seconds */
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+/** Max broadcast recipients */
+const MAX_BROADCAST_RECIPIENTS = 8;
+
+/** The port the hook server is currently listening on. Set after startHookServer() resolves. */
+export let activeHookPort: number = DEFAULT_HOOK_PORT;
+
+export type HookPayload =
+  | { event: 'idle'; session: string; agentType: string }
+  | { event: 'notification'; session: string; title: string; message: string }
+  | { event: 'tool_start'; session: string; tool: string }
+  | { event: 'tool_end'; session: string };
+
+export type HookCallback = (payload: HookPayload) => void;
+
+/** @deprecated Use HookCallback instead */
+export type IdleCallback = (sessionName: string, agentType: string) => void;
+
+// ─── Queue-when-busy ─────────────────────────────────────────────────────────
+
+export interface QueuedMessage {
+  from: string;
+  message: string;
+  queuedAt: number;
+  depth: number;
+}
+
+/** In-memory queue: target session name → queued messages (FIFO) */
+const messageQueue = new Map<string, QueuedMessage[]>();
+
+/** Rate limiter: source session → timestamps of recent sends */
+const rateLimiter = new Map<string, number[]>();
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+async function loadSavedPort(): Promise<number> {
+  try {
+    const raw = await fs.readFile(HOOK_PORT_FILE, 'utf-8');
+    const p = parseInt(raw.trim(), 10);
+    return Number.isFinite(p) && p > 1024 && p < 65536 ? p : DEFAULT_HOOK_PORT;
+  } catch {
+    return DEFAULT_HOOK_PORT;
+  }
+}
+
+async function savePort(port: number): Promise<void> {
+  await fs.mkdir(dirname(HOOK_PORT_FILE), { recursive: true });
+  await fs.writeFile(HOOK_PORT_FILE, String(port));
+}
+
+function tryBind(server: http.Server, port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', () => {
+      server.removeListener('error', reject);
+      resolve();
+    });
+  });
+}
+
+function extractToolSummary(tool: string, input?: Record<string, unknown>): string {
+  if (!input) return '';
+  switch (tool) {
+    case 'Bash': {
+      const cmd = String(input['command'] ?? '');
+      return cmd.split('\n').find((l) => l.trim()) ?? cmd;
+    }
+    case 'Read':
+    case 'Write':
+    case 'Edit':
+      return String(input['file_path'] ?? '');
+    case 'Glob':
+      return String(input['pattern'] ?? '');
+    case 'Grep':
+      return `${input['pattern'] ?? ''}${input['path'] ? ` in ${input['path']}` : ''}`;
+    case 'Agent':
+      return String(input['description'] ?? '');
+    default:
+      return '';
+  }
+}
+
+// ─── Target Resolution ───────────────────────────────────────────────────────
+
+export type ResolveResult = {
+  ok: true;
+  targets: SessionRecord[];
+} | {
+  ok: false;
+  error: string;
+  available: string[];
+}
+
+function resolveSenderRecord(from: string, allSessions: SessionRecord[]): SessionRecord | null | 'ambiguous' {
+  if (from === IMCODES_EXTERNAL_CLI_SENDER) return null;
+
+  const byName = getSession(from);
+  if (byName) return byName;
+
+  const byLabel = allSessions.filter((s) => s.state !== 'stopped' && s.label && s.label.toLowerCase() === from.toLowerCase());
+  if (byLabel.length === 1) return byLabel[0];
+  if (byLabel.length > 1) return 'ambiguous';
+  return null;
+}
+
+/**
+ * Resolve a target session name from the `to` field.
+ *
+ * Managed-session sender:
+ * - Priority: label (case-insensitive) → session name → agent type.
+ * - Scope: siblings of `from` session (same parentSession or same project).
+ *
+ * External CLI sender:
+ * - There is no trustworthy sender scope, so only an exact non-stopped session
+ *   name is accepted. This preserves shell-originated callback commands such as
+ *   `imcodes send --no-reply "deck_proj_brain" ...` without enabling global
+ *   label/type/broadcast fan-out.
+ */
+export function resolveTarget(from: string, to: string): ResolveResult {
+  const allSessions = listSessions();
+  const fromRecord = resolveSenderRecord(from, allSessions);
+
+  if (fromRecord === 'ambiguous') {
+    return {
+      ok: false,
+      error: `sender session label "${from}" is ambiguous; set IMCODES_SESSION to the exact session name`,
+      available: allSessions.filter((s) => s.state !== 'stopped').map((s) => s.name),
+    };
+  }
+
+  if (!fromRecord) {
+    const activeSessions = allSessions.filter((s) => s.state !== 'stopped');
+    const byExactName = activeSessions.filter((s) => s.name === to);
+    if (byExactName.length === 1) {
+      return { ok: true, targets: [byExactName[0]] };
+    }
+    return {
+      ok: false,
+      error: 'sender session not found; exact active session name required when sending from outside a managed session',
+      available: activeSessions.map((s) => s.name),
+    };
+  }
+
+  // Determine siblings: sessions sharing the same parent or project (exclude stopped)
+  const siblings = allSessions.filter((s) => {
+    if (s.name === fromRecord.name) return false; // exclude self
+    if (s.state === 'stopped') return false; // exclude stopped sessions
+    // Sub-sessions: match by parentSession
+    if (fromRecord.parentSession) {
+      return s.parentSession === fromRecord.parentSession || s.name === fromRecord.parentSession;
+    }
+    // Main sessions: match by projectName
+    return s.projectName === fromRecord.projectName || s.parentSession === from;
+  });
+
+  const availableNames = siblings.map((s) => s.label || s.name);
+
+  if (to === '*' || to === '--all') {
+    const targets = siblings.slice(0, MAX_BROADCAST_RECIPIENTS);
+    if (targets.length === 0) {
+      return { ok: false, error: 'no sibling sessions found', available: availableNames };
+    }
+    return { ok: true, targets };
+  }
+
+  // 1. Match by label (case-insensitive)
+  const byLabel = siblings.filter((s) => s.label && s.label.toLowerCase() === to.toLowerCase());
+  if (byLabel.length === 1) return { ok: true, targets: [byLabel[0]] };
+  if (byLabel.length > 1) {
+    return { ok: false, error: `ambiguous target "${to}" matches ${byLabel.length} sessions`, available: availableNames };
+  }
+
+  // 2. Match by session name (exact, siblings only — no cross-project)
+  const byName = siblings.filter((s) => s.name === to);
+  if (byName.length === 1) return { ok: true, targets: [byName[0]] };
+
+  // 3. Match by agent type
+  const byType = siblings.filter((s) => s.agentType === to);
+  if (byType.length === 1) return { ok: true, targets: [byType[0]] };
+  if (byType.length > 1) {
+    return { ok: false, error: `ambiguous target "${to}" matches ${byType.length} sessions by agent type`, available: availableNames };
+  }
+
+  return { ok: false, error: `target "${to}" not found`, available: availableNames };
+}
+
+// ─── Message Dispatch ────────────────────────────────────────────────────────
+
+// ─── Circuit Breakers ────────────────────────────────────────────────────────
+
+function checkRateLimit(from: string): boolean {
+  const now = Date.now();
+  const timestamps = rateLimiter.get(from) ?? [];
+  const recent = timestamps.filter((t) => t > now - RATE_LIMIT_WINDOW_MS);
+  rateLimiter.set(from, recent);
+  return recent.length < RATE_LIMIT_MAX;
+}
+
+function recordSend(from: string): void {
+  const timestamps = rateLimiter.get(from) ?? [];
+  timestamps.push(Date.now());
+  rateLimiter.set(from, timestamps);
+}
+
+/**
+ * Drain queued messages for a session that just became idle.
+ * Delivers FIFO, skipping expired messages.
+ */
+export async function drainQueue(sessionName: string): Promise<void> {
+  const queue = messageQueue.get(sessionName);
+  if (!queue || queue.length === 0) return;
+
+  const now = Date.now();
+
+  // Drain ONE message at a time. After sending, the session goes running → idle,
+  // which triggers drainQueue again for the next message. This prevents burst-injecting
+  // the entire backlog into a session that can only process one message at a time.
+  while (queue.length > 0) {
+    const msg = queue.shift()!;
+    if (now - msg.queuedAt > QUEUE_EXPIRY_MS) {
+      logger.debug({ target: sessionName, from: msg.from }, 'Skipping expired queued message');
+      continue; // skip expired, try next
+    }
+    // Found a non-expired message — deliver it and stop
+    const record = getSession(sessionName);
+    if (!record) break;
+    try {
+      await dispatchHookSend({ from: msg.from, targetRecords: [record], message: msg.message });
+      logger.info({ target: sessionName, from: msg.from }, 'Delivered queued message');
+    } catch (err) {
+      logger.warn({ err, target: sessionName, from: msg.from }, 'Failed to deliver queued message');
+    }
+    // Stop after one delivery — next idle transition will drain the next message
+    break;
+  }
+  // Clean up empty queue entry
+  if (queue.length === 0) messageQueue.delete(sessionName);
+}
+
+/** Get current queue for a target (for testing) */
+export function getQueue(target: string): QueuedMessage[] {
+  return messageQueue.get(target) ?? [];
+}
+
+/** Clear all queues (for testing) */
+export function clearQueues(): void {
+  messageQueue.clear();
+  rateLimiter.clear();
+}
+
+// ─── /send Handler ───────────────────────────────────────────────────────────
+
+interface SendRequest {
+  from: string;
+  to: string;
+  message: string;
+  files?: string[];
+  context?: string;
+  depth?: number;
+}
+
+async function handleSend(body: SendRequest): Promise<{ status: number; body: Record<string, unknown> }> {
+  const { from, to, message, depth = 0 } = body;
+
+  // Validate required fields
+  if (!from || !to || !message) {
+    return { status: 400, body: { ok: false, error: 'missing required fields: from, to, message' } };
+  }
+
+  if (body.context) {
+    return { status: 501, body: { ok: false, error: 'context is not yet supported — send plain message only' } };
+  }
+
+  // Circuit breaker: depth limit
+  if (depth >= MAX_SEND_DEPTH) {
+    return { status: 429, body: { ok: false, error: 'depth limit exceeded' } };
+  }
+
+  // Circuit breaker: rate limit
+  if (!checkRateLimit(from)) {
+    return { status: 429, body: { ok: false, error: 'rate limit exceeded' } };
+  }
+
+  // Resolve target
+  const result = resolveTarget(from, to);
+  if (!result.ok) {
+    return { status: 404, body: { ok: false, error: result.error, available: result.available } };
+  }
+
+  // Record send after successful resolution (prevents invalid senders from polluting rate-limit map)
+  recordSend(from);
+
+  // Transport command liveness mandate (CLAUDE.md): `/stop` is a CONTROL
+  // command and must take the priority stop path from EVERY ingress — never
+  // the ordinary send queue. Without this, `imcodes send <target> "/stop"`
+  // (CLI / MCP send_message pipeline) queues "/stop" as an ordinary message
+  // behind the running turn and eventually delivers it to the MODEL as text
+  // (observed live on 211: deck_cd_w41 answered "/stop isn't available in
+  // this environment." while its running turn kept going). Exact-match only:
+  // messages that merely contain "/stop" stay ordinary text.
+  if (message.trim() === '/stop') {
+    // Lazy import — same heavy-module-cycle rationale as handleStop below.
+    const { stopSessionNow } = await import('./command-handler.js');
+    const stopped: string[] = [];
+    const notStopped: string[] = [];
+    for (const target of result.targets) {
+      if (stopSessionNow(target.name)) stopped.push(target.name);
+      else notStopped.push(target.name);
+    }
+    if (result.targets.length === 1) {
+      const target = result.targets[0].name;
+      const ok = stopped.length === 1;
+      return {
+        status: 200,
+        body: { ok, stopped: ok, target, ...(ok ? {} : { error: 'session not found or not stoppable' }) },
+      };
+    }
+    return {
+      status: 200,
+      body: { ok: notStopped.length === 0, stopped, ...(notStopped.length > 0 ? { notStopped } : {}) },
+    };
+  }
+
+  const sender = resolveSenderRecord(from, listSessions());
+  const projectRoot = sender && sender !== 'ambiguous' ? sender.projectDir : null;
+  let dispatch;
+  try {
+    dispatch = await dispatchHookSend({ from, targetRecords: result.targets, message, files: body.files, projectRoot });
+  } catch (err) {
+    return { status: 400, body: { ok: false, error: (err as Error).message } };
+  }
+
+  if (result.targets.length === 1) {
+    const target = result.targets[0].name;
+    const messageId = dispatch.messages[0]?.messageId;
+    if (dispatch.delivered.length === 1) {
+      return { status: 200, body: { ok: true, delivered: true, target, dispatchId: dispatch.dispatchId, messageId } };
+    }
+    if (dispatch.queued.length === 1) {
+      return { status: 200, body: { ok: true, queued: true, target, dispatchId: dispatch.dispatchId, messageId } };
+    }
+    return { status: 500, body: { ok: false, error: dispatch.errors[0] ?? 'dispatch failed' } };
+  }
+
+  // Broadcast response
+  return {
+    status: 200,
+    body: {
+      ok: dispatch.errors.length === 0,
+      delivered: dispatch.delivered,
+      queued: dispatch.queued,
+      dispatchId: dispatch.dispatchId,
+      messages: dispatch.messages,
+      ...(dispatch.errors.length > 0 ? { errors: dispatch.errors } : {}),
+    },
+  };
+}
+
+// ─── /stop Handler ───────────────────────────────────────────────────────────
+
+interface StopRequest {
+  from: string;
+  to: string;
+}
+
+/**
+ * Force-stop the active turn of a resolved sibling target. Mirrors /send target
+ * resolution (label/name/type, sibling-scoped, broadcast via "*") but instead of
+ * delivering a message it runs stopSessionNow on the priority lane. Used by the
+ * send_stop MCP tool so a busy session (which would otherwise just queue a
+ * message) can be interrupted.
+ */
+async function handleStop(body: StopRequest): Promise<{ status: number; body: Record<string, unknown> }> {
+  const { from, to } = body;
+  if (!from || !to) {
+    return { status: 400, body: { ok: false, error: 'missing required fields: from, to' } };
+  }
+  if (!checkRateLimit(from)) {
+    return { status: 429, body: { ok: false, error: 'rate limit exceeded' } };
+  }
+
+  const result = resolveTarget(from, to);
+  if (!result.ok) {
+    return { status: 404, body: { ok: false, error: result.error, available: result.available } };
+  }
+  recordSend(from);
+
+  // Lazy import: command-handler pulls in the whole daemon graph, so importing
+  // it eagerly here would create a heavy module cycle (and broke hook-server's
+  // own tests). Only loaded when /stop is actually called.
+  const { stopSessionNow } = await import('./command-handler.js');
+  const stopped: string[] = [];
+  const notStopped: string[] = [];
+  for (const target of result.targets) {
+    if (stopSessionNow(target.name)) stopped.push(target.name);
+    else notStopped.push(target.name);
+  }
+
+  if (result.targets.length === 1) {
+    const target = result.targets[0].name;
+    const ok = stopped.length === 1;
+    return {
+      status: 200,
+      body: { ok, stopped: ok, target, ...(ok ? {} : { error: 'session not found or not stoppable' }) },
+    };
+  }
+
+  return {
+    status: 200,
+    body: { ok: notStopped.length === 0, stopped, ...(notStopped.length > 0 ? { notStopped } : {}) },
+  };
+}
+
+// ─── Body Parser ─────────────────────────────────────────────────────────────
+
+function readBody(req: http.IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    let size = 0;
+    let rejected = false;
+    req.on('data', (chunk: Buffer) => {
+      if (rejected) return;
+      size += chunk.length;
+      if (size > MAX_BODY_SIZE) {
+        rejected = true;
+        reject(new Error('body too large'));
+        req.resume(); // drain remaining data without storing
+        return;
+      }
+      body += chunk.toString();
+    });
+    req.on('end', () => {
+      if (!rejected) resolve(body);
+    });
+    req.on('error', (err) => {
+      if (!rejected) reject(err);
+    });
+  });
+}
+
+// ─── Server ──────────────────────────────────────────────────────────────────
+
+export async function startHookServer(onHook: HookCallback): Promise<{ server: http.Server; port: number }> {
+  const preferredPort = await loadSavedPort();
+
+  const server = http.createServer(async (req, res) => {
+    if (req.method !== 'POST') {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+
+    const url = req.url;
+
+    if (url === '/list') {
+      try {
+        const body = await readBody(req);
+        const parsed = JSON.parse(body) as { from?: string };
+        const from = parsed.from || '';
+        const fromRecord = from ? getSession(from) : null;
+        const allSess = listSessions();
+        const siblings = fromRecord
+          ? allSess.filter((s) => {
+              if (s.name === from) return false;
+              if (s.state === 'stopped') return false;
+              if (fromRecord.parentSession) {
+                return s.parentSession === fromRecord.parentSession || s.name === fromRecord.parentSession;
+              }
+              return s.projectName === fromRecord.projectName || s.parentSession === from;
+            })
+          : allSess.filter((s) => s.state !== 'stopped');
+        const sessions = siblings.map((s) => ({
+          name: s.name,
+          label: s.label || undefined,
+          agentType: s.agentType,
+          state: s.state,
+        }));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, sessions }));
+      } catch {
+        res.writeHead(400);
+        res.end(JSON.stringify({ ok: false, error: 'bad request' }));
+      }
+      return;
+    }
+
+    if (url === '/send') {
+      // Content-Type validation for /send
+      const contentType = req.headers['content-type'] ?? '';
+      if (!contentType.includes('application/json')) {
+        res.writeHead(415);
+        res.end(JSON.stringify({ ok: false, error: 'Content-Type must be application/json' }));
+        return;
+      }
+
+      try {
+        const body = await readBody(req);
+        const parsed = JSON.parse(body) as SendRequest;
+        const result = await handleSend(parsed);
+        res.writeHead(result.status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result.body));
+      } catch (err) {
+        if ((err as Error).message === 'body too large') {
+          res.writeHead(413);
+          res.end(JSON.stringify({ ok: false, error: 'request body too large' }));
+        } else {
+          res.writeHead(400);
+          res.end(JSON.stringify({ ok: false, error: 'bad request' }));
+        }
+      }
+      return;
+    }
+
+    if (url === '/stop') {
+      const contentType = req.headers['content-type'] ?? '';
+      if (!contentType.includes('application/json')) {
+        res.writeHead(415);
+        res.end(JSON.stringify({ ok: false, error: 'Content-Type must be application/json' }));
+        return;
+      }
+      try {
+        const body = await readBody(req);
+        const parsed = JSON.parse(body) as StopRequest;
+        const result = await handleStop(parsed);
+        res.writeHead(result.status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result.body));
+      } catch (err) {
+        if ((err as Error).message === 'body too large') {
+          res.writeHead(413);
+          res.end(JSON.stringify({ ok: false, error: 'request body too large' }));
+        } else {
+          res.writeHead(400);
+          res.end(JSON.stringify({ ok: false, error: 'bad request' }));
+        }
+      }
+      return;
+    }
+
+    if (url === '/sessions/live') {
+      // Authoritative live session states for local tooling (`imcodes status`).
+      // sessions.json is a multi-writer read-modify-write file whose `state`
+      // can be resurrected stale (a slow spread-writer can bring back
+      // 'running' minutes after the runtime settled idle). For sessions with a
+      // live transport runtime the runtime IS the truth — report it, and
+      // self-heal the drifted record so every record reader converges.
+      try {
+        // Lazy import — session-manager pulls in the whole daemon graph (same
+        // heavy-module-cycle rationale as the command-handler import above).
+        const { getTransportRuntime } = await import('../agent/session-manager.js');
+        const sessions = listSessions().map((record) => {
+          const runtime = getTransportRuntime(record.name);
+          if (!runtime) {
+            return { name: record.name, state: record.state, live: false };
+          }
+          const status = runtime.getStatus();
+          const state = status === 'idle' ? 'idle' : status === 'error' ? 'error' : 'running';
+          if (record.state !== state && record.state !== 'stopped') {
+            const fresh = getSession(record.name);
+            if (fresh && fresh.state !== state && fresh.state !== 'stopped') {
+              upsertSession({ ...fresh, state, updatedAt: Date.now() });
+              logger.debug(
+                { sessionName: record.name, recordState: fresh.state, runtimeState: state },
+                'sessions/live: repaired drifted session record state from live runtime',
+              );
+            }
+          }
+          return { name: record.name, state, live: true, pendingCount: runtime.pendingCount };
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, sessions }));
+      } catch (err) {
+        logger.warn({ err }, 'sessions/live: failed to assemble live session states');
+        res.writeHead(500);
+        res.end(JSON.stringify({ ok: false, error: 'failed to assemble live session states' }));
+      }
+      return;
+    }
+
+    if (url === '/notify') {
+      // /notify handler — existing CC hook behavior (no Content-Type enforcement)
+      let body = '';
+      let size = 0;
+      req.on('data', (chunk: Buffer) => {
+        size += chunk.length;
+        if (size > MAX_BODY_SIZE) {
+          req.destroy();
+          return;
+        }
+        body += chunk.toString();
+      });
+      req.on('end', async () => {
+        try {
+          const msg = JSON.parse(body) as Record<string, unknown>;
+          const event = msg['event'] as string | undefined;
+          const session = msg['session'] as string | undefined;
+
+          if (!event || !session) {
+            res.writeHead(400);
+            res.end('missing event or session');
+            return;
+          }
+
+          // Layer 2: verify session belongs to a daemon-managed CC session.
+          // Hooks are global (~/.claude/settings.json) so any CC instance triggers
+          // them. Without this check, a manually-started CC whose tmux pane happens
+          // to live in a deck_ session would misroute events.
+          const record = getSession(session);
+          if (!record || record.agentType !== 'claude-code') {
+            logger.debug({ session, event, agentType: record?.agentType }, 'Hook: ignored — not a managed claude-code session');
+            res.writeHead(200);
+            res.end('ignored');
+            return;
+          }
+
+          if (event === 'idle') {
+            const agentType = (msg['agentType'] as string | undefined) ?? 'unknown';
+            logger.info({ session, agentType }, 'Hook: session idle');
+            await refreshSessionWatcher(session);
+            onHook({ event: 'idle', session, agentType });
+            timelineEmitter.emit(session, 'session.state', { state: 'idle' }, { source: 'hook' });
+            const sess = getSession(session);
+            if (sess) upsertSession({ ...sess, state: 'idle', updatedAt: Date.now() });
+            // Drain queued messages when session becomes idle
+            void drainQueue(session);
+          } else if (event === 'notification') {
+            const title = (msg['title'] as string | undefined) ?? '';
+            const message = (msg['message'] as string | undefined) ?? '';
+            logger.info({ session, title }, 'Hook: CC notification');
+            onHook({ event: 'notification', session, title, message });
+          } else if (event === 'tool_start') {
+            const tool = (msg['tool'] as string | undefined) ?? 'unknown';
+            const toolInput = msg['tool_input'] as Record<string, unknown> | undefined;
+            const input = extractToolSummary(tool, toolInput);
+            logger.debug({ session, tool }, 'Hook: tool start');
+            onHook({ event: 'tool_start', session, tool });
+            timelineEmitter.emit(session, 'session.state', { state: 'running' }, { source: 'hook' });
+            timelineEmitter.emit(session, 'tool.call', { tool, ...(input ? { input } : {}) }, { source: 'hook' });
+          } else if (event === 'tool_end') {
+            logger.debug({ session }, 'Hook: tool end');
+            onHook({ event: 'tool_end', session });
+            timelineEmitter.emit(session, 'tool.result', {}, { source: 'hook' });
+          } else if (event === 'mode_change') {
+            const mode = (msg['mode'] as string | undefined) ?? '';
+            const active = msg['active'] !== false;
+            logger.debug({ session, mode, active }, 'Hook: mode change');
+            timelineEmitter.emit(session, 'mode.state', { mode, active }, { source: 'hook' });
+          }
+
+          res.writeHead(200);
+          res.end('ok');
+        } catch {
+          res.writeHead(400);
+          res.end('bad request');
+        }
+      });
+      return;
+    }
+
+    // Unknown route
+    res.writeHead(404);
+    res.end();
+  });
+
+  // Try preferred port first, then increment on conflict
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const port = preferredPort + attempt;
+    try {
+      await tryBind(server, port);
+      activeHookPort = port;
+      await savePort(port);
+      if (port !== preferredPort) {
+        logger.info({ port, preferredPort }, 'Hook server: port conflict, using new port (saved)');
+      } else {
+        logger.info({ port }, 'Hook server listening');
+      }
+      return { server, port };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw err;
+      logger.debug({ port }, 'Hook server: port in use, trying next');
+    }
+  }
+
+  throw new Error(`Hook server: could not bind to any port in range ${preferredPort}–${preferredPort + 19}`);
+}

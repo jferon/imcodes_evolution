@@ -1,0 +1,1430 @@
+import type { Database } from './client.js';
+import type { ContextModelConfig } from '../../../shared/context-types.js';
+import type {
+  ShareAuthorizationSnapshot,
+  SharedActorEnvelope,
+  ShareTarget,
+} from '../../../shared/tab-sharing.js';
+import { EXECUTION_CLONE_KIND } from '../../../shared/execution-clone.js';
+
+// ── Types ─────────────────────────────────────────────────────────────────
+
+export interface DbUser {
+  id: string;
+  created_at: number;
+  username: string | null;
+  password_hash: string | null;
+  display_name: string | null;
+  password_must_change: boolean | null;
+  is_admin: boolean;
+  status: 'active' | 'pending' | 'disabled';
+}
+
+export interface DbPlatformIdentity {
+  id: string;
+  user_id: string;
+  platform: string;
+  platform_user_id: string;
+  created_at: number;
+}
+
+export interface DbServer {
+  id: string;
+  user_id: string;
+  team_id: string | null;
+  name: string;
+  token_hash: string;
+  last_heartbeat_at: number | null;
+  status: string;
+  daemon_version: string | null;
+  shared_context_runtime_config?: Record<string, unknown> | string | null;
+  bound_with_key_id: string | null;
+  created_at: number;
+}
+
+export interface DbChannelBinding {
+  id: string;
+  server_id: string;
+  platform: string;
+  channel_id: string;
+  binding_type: string;
+  target: string;
+  bot_id: string | null;
+  created_at: number;
+}
+
+export interface DbCronJob {
+  id: string;
+  server_id: string;
+  user_id: string;
+  name: string;
+  cron_expr: string;
+  action: string;
+  project_name: string | null;
+  target_role: string;
+  target_session_name: string | null;
+  timezone: string | null;
+  status: string;
+  last_run_at: number | null;
+  next_run_at: number | null;
+  expires_at: number | null;
+  created_at: number;
+  updated_at: number | null;
+}
+
+export interface DbSession {
+  id: string;
+  server_id: string;
+  name: string;
+  project_name: string;
+  role: string;
+  agent_type: string;
+  agent_version: string | null;
+  project_dir: string;
+  state: string;
+  label: string | null;
+  runtime_type: string | null;
+  provider_id: string | null;
+  provider_session_id: string | null;
+  description: string | null;
+  requested_model: string | null;
+  active_model: string | null;
+  effort: string | null;
+  transport_config: Record<string, unknown> | string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface QuickData {
+  history: string[];
+  sessionHistory?: Record<string, string[]>;
+  commands: string[];
+  phrases: string[];
+}
+
+export const SESSION_TEXT_TAIL_CACHE_LIMIT = 50;
+export const SESSION_TEXT_TAIL_TEXT_MAX_CHARS = 1024;
+
+export interface SessionTextTailCacheItem {
+  eventId: string;
+  ts: number;
+  type: 'user.message' | 'assistant.text';
+  text: string;
+  source?: string;
+  confidence?: string;
+}
+
+interface DbSessionTextTailCacheRow {
+  server_id: string;
+  session_name: string;
+  events: SessionTextTailCacheItem[] | string | null;
+  latest_ts: number | null;
+  updated_at: Date;
+}
+
+interface ClassifiedSessionTextTailEvent {
+  sessionName: string;
+  item: SessionTextTailCacheItem;
+}
+
+function normalizeSessionTextTailText(text: unknown): string | null {
+  if (typeof text !== 'string') return null;
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  return trimmed.length > SESSION_TEXT_TAIL_TEXT_MAX_CHARS
+    ? trimmed.slice(0, SESSION_TEXT_TAIL_TEXT_MAX_CHARS)
+    : trimmed;
+}
+
+function isSessionTextTailType(type: unknown): type is SessionTextTailCacheItem['type'] {
+  return type === 'user.message' || type === 'assistant.text';
+}
+
+function parseSessionTextTailCacheEvents(
+  raw: SessionTextTailCacheItem[] | string | null | undefined,
+): SessionTextTailCacheItem[] {
+  let parsed: unknown = raw;
+  if (typeof parsed === 'string') {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(parsed)) return [];
+  const items: SessionTextTailCacheItem[] = [];
+  for (const entry of parsed) {
+    if (!entry || typeof entry !== 'object') return [];
+    const row = entry as Record<string, unknown>;
+    if (
+      typeof row.eventId !== 'string'
+      || typeof row.ts !== 'number'
+      || !isSessionTextTailType(row.type)
+      || typeof row.text !== 'string'
+    ) {
+      return [];
+    }
+    const text = normalizeSessionTextTailText(row.text);
+    if (!text) return [];
+    const item: SessionTextTailCacheItem = {
+      eventId: row.eventId,
+      ts: row.ts,
+      type: row.type,
+      text,
+    };
+    if (typeof row.source === 'string' && row.source.trim()) item.source = row.source.trim();
+    if (typeof row.confidence === 'string' && row.confidence.trim()) item.confidence = row.confidence.trim();
+    items.push(item);
+  }
+  return items;
+}
+
+function mergeSessionTextTailCacheEvents(
+  existing: SessionTextTailCacheItem[],
+  incoming: SessionTextTailCacheItem,
+): SessionTextTailCacheItem[] {
+  const deduped = new Map<string, SessionTextTailCacheItem>();
+  for (const item of existing) deduped.set(item.eventId, item);
+  deduped.set(incoming.eventId, incoming);
+  const merged = [...deduped.values()].sort((a, b) => {
+    if (a.ts !== b.ts) return a.ts - b.ts;
+    return a.eventId.localeCompare(b.eventId);
+  });
+  return merged.length > SESSION_TEXT_TAIL_CACHE_LIMIT
+    ? merged.slice(merged.length - SESSION_TEXT_TAIL_CACHE_LIMIT)
+    : merged;
+}
+
+export function mergeSessionTextTailCacheItems(
+  existing: SessionTextTailCacheItem[],
+  incoming: SessionTextTailCacheItem[],
+): SessionTextTailCacheItem[] {
+  const deduped = new Map<string, SessionTextTailCacheItem>();
+  for (const item of existing) deduped.set(item.eventId, item);
+  for (const item of incoming) deduped.set(item.eventId, item);
+  const merged = [...deduped.values()].sort((a, b) => {
+    if (a.ts !== b.ts) return a.ts - b.ts;
+    return a.eventId.localeCompare(b.eventId);
+  });
+  return merged.length > SESSION_TEXT_TAIL_CACHE_LIMIT
+    ? merged.slice(merged.length - SESSION_TEXT_TAIL_CACHE_LIMIT)
+    : merged;
+}
+
+export function classifySessionTextTailEvent(rawEvent: Record<string, unknown>): ClassifiedSessionTextTailEvent | null {
+  const sessionName = typeof rawEvent.sessionId === 'string' ? rawEvent.sessionId : null;
+  const eventId = typeof rawEvent.eventId === 'string' ? rawEvent.eventId : null;
+  const ts = typeof rawEvent.ts === 'number' ? rawEvent.ts : null;
+  const type = isSessionTextTailType(rawEvent.type) ? rawEvent.type : null;
+  const payload = rawEvent.payload && typeof rawEvent.payload === 'object'
+    ? rawEvent.payload as Record<string, unknown>
+    : null;
+  if (!sessionName || !eventId || ts === null || !type || !payload) return null;
+  if (type === 'assistant.text' && payload.streaming === true) return null;
+  const text = normalizeSessionTextTailText(payload.text);
+  if (!text) return null;
+  const item: SessionTextTailCacheItem = { eventId, ts, type, text };
+  if (typeof rawEvent.source === 'string' && rawEvent.source.trim()) item.source = rawEvent.source.trim();
+  if (typeof rawEvent.confidence === 'string' && rawEvent.confidence.trim()) item.confidence = rawEvent.confidence.trim();
+  return { sessionName, item };
+}
+
+export function collectSessionTextTailCacheItems(
+  sessionName: string,
+  rawEvents: unknown[],
+): SessionTextTailCacheItem[] {
+  const items: SessionTextTailCacheItem[] = [];
+  for (const raw of rawEvents) {
+    if (!raw || typeof raw !== 'object') continue;
+    const classified = classifySessionTextTailEvent(raw as Record<string, unknown>);
+    if (!classified || classified.sessionName !== sessionName) continue;
+    items.push(classified.item);
+  }
+  return mergeSessionTextTailCacheItems([], items);
+}
+
+// ── Users ─────────────────────────────────────────────────────────────────
+
+export async function createUser(db: Database, id: string): Promise<DbUser> {
+  const now = Date.now();
+  await db.execute('INSERT INTO users (id, created_at) VALUES ($1, $2)', [id, now]);
+  return { id, created_at: now, username: null, password_hash: null, display_name: null, password_must_change: null, is_admin: false, status: 'active' };
+}
+
+export async function getUserById(db: Database, id: string): Promise<DbUser | null> {
+  return db.queryOne<DbUser>('SELECT * FROM users WHERE id = $1', [id]);
+}
+
+export async function getUserByUsername(db: Database, username: string): Promise<DbUser | null> {
+  return db.queryOne<DbUser>('SELECT * FROM users WHERE username = $1', [username]);
+}
+
+export async function listAllUsers(db: Database): Promise<DbUser[]> {
+  return db.query<DbUser>('SELECT * FROM users ORDER BY created_at ASC');
+}
+
+export async function updateUserStatus(db: Database, userId: string, status: 'active' | 'pending' | 'disabled'): Promise<void> {
+  await db.execute('UPDATE users SET status = $1 WHERE id = $2', [status, userId]);
+}
+
+export async function deleteUser(db: Database, userId: string): Promise<void> {
+  // Cascade: revoke all auth artifacts before deleting user
+  await db.execute('DELETE FROM refresh_tokens WHERE user_id = $1', [userId]);
+  await db.execute('UPDATE api_keys SET revoked_at = $1 WHERE user_id = $2 AND revoked_at IS NULL', [Date.now(), userId]);
+  await db.execute('DELETE FROM passkey_credentials WHERE user_id = $1', [userId]);
+  await db.execute('DELETE FROM users WHERE id = $1', [userId]);
+}
+
+export async function countActiveAdmins(db: Database): Promise<number> {
+  const row = await db.queryOne<{ cnt: number }>("SELECT COUNT(*) as cnt FROM users WHERE is_admin = TRUE AND status = 'active'");
+  return Number(row?.cnt ?? 0);
+}
+
+export async function getSetting(db: Database, key: string): Promise<string | null> {
+  const row = await db.queryOne<{ value: string }>('SELECT value FROM settings WHERE key = $1', [key]);
+  return row?.value ?? null;
+}
+
+export async function setSetting(db: Database, key: string, value: string): Promise<void> {
+  await db.execute(
+    'INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, $3) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at',
+    [key, value, Date.now()],
+  );
+}
+
+export async function getAllSettings(db: Database): Promise<Record<string, string>> {
+  const rows = await db.query<{ key: string; value: string }>('SELECT key, value FROM settings');
+  const map: Record<string, string> = {};
+  for (const row of rows) map[row.key] = row.value;
+  return map;
+}
+
+// ── Platform identities ───────────────────────────────────────────────────
+
+export async function upsertPlatformIdentity(
+  db: Database,
+  id: string,
+  userId: string,
+  platform: string,
+  platformUserId: string,
+): Promise<void> {
+  await db.execute(
+    'INSERT INTO platform_identities (id, user_id, platform, platform_user_id, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT(platform, platform_user_id) DO NOTHING',
+    [id, userId, platform, platformUserId, Date.now()],
+  );
+}
+
+export async function getUserByPlatformId(
+  db: Database,
+  platform: string,
+  platformUserId: string,
+): Promise<DbUser | null> {
+  return db.queryOne<DbUser>(
+    'SELECT u.* FROM users u JOIN platform_identities pi ON u.id = pi.user_id WHERE pi.platform = $1 AND pi.platform_user_id = $2',
+    [platform, platformUserId],
+  );
+}
+
+// ── Servers ───────────────────────────────────────────────────────────────
+
+export async function createServer(
+  db: Database,
+  id: string,
+  userId: string,
+  name: string,
+  tokenHash: string,
+  keyId?: string,
+): Promise<DbServer> {
+  const now = Date.now();
+  await db.execute(
+    'INSERT INTO servers (id, user_id, name, token_hash, status, created_at, bound_with_key_id) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+    [id, userId, name, tokenHash, 'offline', now, keyId ?? null],
+  );
+  return { id, user_id: userId, team_id: null, name, token_hash: tokenHash, last_heartbeat_at: null, status: 'offline', daemon_version: null, bound_with_key_id: keyId ?? null, created_at: now };
+}
+
+export async function getServerById(db: Database, id: string): Promise<DbServer | null> {
+  return db.queryOne<DbServer>('SELECT * FROM servers WHERE id = $1', [id]);
+}
+
+export async function getServerSharedContextRuntimeConfig(
+  db: Database,
+  serverId: string,
+): Promise<ContextModelConfig | null> {
+  const row = await db.queryOne<{ shared_context_runtime_config: Record<string, unknown> | string | null }>(
+    'SELECT shared_context_runtime_config FROM servers WHERE id = $1',
+    [serverId],
+  );
+  if (!row?.shared_context_runtime_config) return null;
+  const raw = typeof row.shared_context_runtime_config === 'string'
+    ? JSON.parse(row.shared_context_runtime_config)
+    : row.shared_context_runtime_config;
+  if (!raw || typeof raw !== 'object') return null;
+  const primaryContextBackend = typeof raw.primaryContextBackend === 'string' ? raw.primaryContextBackend.trim() : undefined;
+  const primaryContextModel = typeof raw.primaryContextModel === 'string' ? raw.primaryContextModel.trim() : '';
+  const primaryContextPreset = typeof raw.primaryContextPreset === 'string' ? raw.primaryContextPreset.trim() : '';
+  const backupContextBackend = typeof raw.backupContextBackend === 'string' ? raw.backupContextBackend.trim() : undefined;
+  const backupContextModel = typeof raw.backupContextModel === 'string' ? raw.backupContextModel.trim() : '';
+  const backupContextPreset = typeof raw.backupContextPreset === 'string' ? raw.backupContextPreset.trim() : '';
+  const memoryRecallMinScore = typeof raw.memoryRecallMinScore === 'number' && Number.isFinite(raw.memoryRecallMinScore)
+    ? raw.memoryRecallMinScore
+    : undefined;
+  const rawMemoryScoringWeights = raw.memoryScoringWeights && typeof raw.memoryScoringWeights === 'object'
+    ? raw.memoryScoringWeights as Record<string, unknown>
+    : undefined;
+  const memoryScoringWeights = rawMemoryScoringWeights
+    ? {
+        similarity: typeof rawMemoryScoringWeights.similarity === 'number' ? rawMemoryScoringWeights.similarity : undefined,
+        recency: typeof rawMemoryScoringWeights.recency === 'number' ? rawMemoryScoringWeights.recency : undefined,
+        frequency: typeof rawMemoryScoringWeights.frequency === 'number' ? rawMemoryScoringWeights.frequency : undefined,
+        project: typeof rawMemoryScoringWeights.project === 'number' ? rawMemoryScoringWeights.project : undefined,
+      }
+    : undefined;
+  const enablePersonalMemorySync = raw.enablePersonalMemorySync !== false;
+  if (!primaryContextModel) return null;
+  return {
+    primaryContextBackend,
+    primaryContextModel,
+    primaryContextPreset: primaryContextPreset || undefined,
+    backupContextBackend: backupContextBackend || undefined,
+    backupContextModel: backupContextModel || undefined,
+    backupContextPreset: backupContextPreset || undefined,
+    memoryRecallMinScore,
+    memoryScoringWeights,
+    enablePersonalMemorySync,
+  };
+}
+
+export async function updateServerSharedContextRuntimeConfig(
+  db: Database,
+  serverId: string,
+  userId: string,
+  config: ContextModelConfig,
+): Promise<boolean> {
+  const result = await db.execute(
+    `UPDATE servers
+        SET shared_context_runtime_config = $1::jsonb
+      WHERE id = $2
+        AND user_id = $3`,
+    [JSON.stringify(config), serverId, userId],
+  );
+  return result.changes > 0;
+}
+
+export async function updateServerHeartbeat(db: Database, id: string, daemonVersion?: string | null): Promise<void> {
+  if (daemonVersion) {
+    await db.execute('UPDATE servers SET last_heartbeat_at = $1, status = $2, daemon_version = $3 WHERE id = $4', [Date.now(), 'online', daemonVersion, id]);
+  } else {
+    await db.execute('UPDATE servers SET last_heartbeat_at = $1, status = $2 WHERE id = $3', [Date.now(), 'online', id]);
+  }
+}
+
+export async function updateServerStatus(db: Database, id: string, status: string): Promise<void> {
+  await db.execute('UPDATE servers SET status = $1 WHERE id = $2', [status, id]);
+}
+
+export async function updateProviderStatus(db: Database, serverId: string, providerId: string, connected: boolean): Promise<void> {
+  if (connected) {
+    await db.execute(
+      `UPDATE servers SET connected_providers = coalesce(connected_providers, '{}'::jsonb) || $1::jsonb WHERE id = $2`,
+      [JSON.stringify({ [providerId]: true }), serverId],
+    );
+  } else {
+    await db.execute(
+      `UPDATE servers SET connected_providers = coalesce(connected_providers, '{}'::jsonb) - $1 WHERE id = $2`,
+      [providerId, serverId],
+    );
+  }
+}
+
+export async function clearProviderStatus(db: Database, serverId: string): Promise<void> {
+  await db.execute(`UPDATE servers SET connected_providers = '{}'::jsonb WHERE id = $1`, [serverId]);
+}
+
+export async function getProviderStatus(db: Database, serverId: string): Promise<Record<string, boolean>> {
+  const row = await db.queryOne<{ connected_providers: Record<string, boolean> | string }>(
+    'SELECT connected_providers FROM servers WHERE id = $1',
+    [serverId],
+  );
+  if (!row) return {};
+  const val = row.connected_providers;
+  if (typeof val === 'string') return JSON.parse(val);
+  return val ?? {};
+}
+
+export async function updateProviderRemoteSessions(
+  db: Database,
+  serverId: string,
+  providerId: string,
+  sessions: unknown[],
+): Promise<void> {
+  await db.execute(
+    `UPDATE servers SET provider_remote_sessions = coalesce(provider_remote_sessions, '{}'::jsonb) || $1::jsonb WHERE id = $2`,
+    [JSON.stringify({ [providerId]: sessions }), serverId],
+  );
+}
+
+export async function getProviderRemoteSessions(
+  db: Database,
+  serverId: string,
+): Promise<Record<string, unknown[]>> {
+  const row = await db.queryOne<{ provider_remote_sessions: Record<string, unknown[]> | string }>(
+    'SELECT provider_remote_sessions FROM servers WHERE id = $1',
+    [serverId],
+  );
+  if (!row) return {};
+  const val = row.provider_remote_sessions;
+  if (typeof val === 'string') return JSON.parse(val);
+  return val ?? {};
+}
+
+export async function updateServerName(db: Database, id: string, userId: string, name: string): Promise<boolean> {
+  const result = await db.execute('UPDATE servers SET name = $1 WHERE id = $2 AND user_id = $3', [name, id, userId]);
+  return (result.changes ?? 0) > 0;
+}
+
+export async function updateServerToken(db: Database, id: string, userId: string, tokenHash: string, name: string, keyId?: string): Promise<boolean> {
+  const result = await db.execute('UPDATE servers SET token_hash = $1, name = $2, bound_with_key_id = $3 WHERE id = $4 AND user_id = $5', [tokenHash, name, keyId ?? null, id, userId]);
+  return (result.changes ?? 0) > 0;
+}
+
+export async function deleteServer(db: Database, id: string, userId: string): Promise<boolean> {
+  await db.execute('DELETE FROM channel_bindings WHERE server_id = $1', [id]);
+  await db.execute('DELETE FROM sessions WHERE server_id = $1', [id]);
+  const result = await db.execute('DELETE FROM servers WHERE id = $1 AND user_id = $2', [id, userId]);
+  return (result.changes ?? 0) > 0;
+}
+
+export async function getServersByUserId(db: Database, userId: string): Promise<DbServer[]> {
+  const ownRows = await db.query<DbServer>(
+    'SELECT * FROM servers WHERE user_id = $1 ORDER BY created_at DESC',
+    [userId],
+  );
+
+  const teamRows = await db.query<DbServer>(
+    `SELECT s.* FROM servers s
+     JOIN team_members tm ON s.team_id = tm.team_id
+     WHERE tm.user_id = $1 AND s.user_id != $2
+     ORDER BY s.created_at DESC`,
+    [userId, userId],
+  );
+
+  const seen = new Set<string>();
+  const servers: DbServer[] = [];
+  for (const s of [...ownRows, ...teamRows]) {
+    if (!seen.has(s.id)) {
+      seen.add(s.id);
+      servers.push(s);
+    }
+  }
+  return servers;
+}
+
+// ── Channel bindings ──────────────────────────────────────────────────────
+
+export async function upsertChannelBinding(
+  db: Database,
+  id: string,
+  serverId: string,
+  platform: string,
+  channelId: string,
+  bindingType: string,
+  target: string,
+  botId: string,
+): Promise<void> {
+  await db.execute(
+    'INSERT INTO channel_bindings (id, server_id, platform, channel_id, binding_type, target, bot_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT(platform, channel_id, bot_id) DO UPDATE SET binding_type = excluded.binding_type, target = excluded.target, server_id = excluded.server_id',
+    [id, serverId, platform, channelId, bindingType, target, botId, Date.now()],
+  );
+}
+
+export async function getChannelBinding(
+  db: Database,
+  platform: string,
+  channelId: string,
+  serverId: string,
+): Promise<DbChannelBinding | null> {
+  return db.queryOne<DbChannelBinding>(
+    'SELECT * FROM channel_bindings WHERE platform = $1 AND channel_id = $2 AND server_id = $3',
+    [platform, channelId, serverId],
+  );
+}
+
+export async function findChannelBindingByPlatformChannel(
+  db: Database,
+  platform: string,
+  channelId: string,
+  botId: string,
+): Promise<DbChannelBinding | null> {
+  return db.queryOne<DbChannelBinding>(
+    'SELECT * FROM channel_bindings WHERE platform = $1 AND channel_id = $2 AND bot_id = $3',
+    [platform, channelId, botId],
+  );
+}
+
+// ── Sessions ──────────────────────────────────────────────────────────────
+
+export async function getDbSessionsByServer(db: Database, serverId: string): Promise<DbSession[]> {
+  return db.query<DbSession>(
+    'SELECT * FROM sessions WHERE server_id = $1 ORDER BY created_at ASC',
+    [serverId],
+  );
+}
+
+export async function upsertDbSession(
+  db: Database,
+  id: string,
+  serverId: string,
+  name: string,
+  projectName: string,
+  role: string,
+  agentType: string,
+  projectDir: string,
+  state: string,
+  label?: string | null,
+  agentVersion?: string | null,
+  runtimeType?: string | null,
+  providerId?: string | null,
+  providerSessionId?: string | null,
+  description?: string | null,
+  requestedModel?: string | null,
+  activeModel?: string | null,
+  effort?: string | null,
+  transportConfig?: Record<string, unknown> | null,
+): Promise<void> {
+  const now = Date.now();
+  await db.execute(
+    `INSERT INTO sessions (id, server_id, name, project_name, role, agent_type, agent_version, project_dir, state, label, runtime_type, provider_id, provider_session_id, description, requested_model, active_model, effort, transport_config, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18::jsonb, $19, $20)
+     ON CONFLICT(server_id, name) DO UPDATE SET
+       role = excluded.role,
+       agent_type = excluded.agent_type,
+       agent_version = excluded.agent_version,
+       project_dir = excluded.project_dir,
+       state = excluded.state,
+       label = COALESCE(excluded.label, sessions.label),
+       runtime_type = excluded.runtime_type,
+       provider_id = excluded.provider_id,
+       provider_session_id = excluded.provider_session_id,
+       description = excluded.description,
+       requested_model = excluded.requested_model,
+       active_model = excluded.active_model,
+       effort = excluded.effort,
+       transport_config = excluded.transport_config,
+       updated_at = excluded.updated_at`,
+    [
+      id,
+      serverId,
+      name,
+      projectName,
+      role,
+      agentType,
+      agentVersion ?? null,
+      projectDir,
+      state,
+      label ?? null,
+      runtimeType ?? null,
+      providerId ?? null,
+      providerSessionId ?? null,
+      description ?? null,
+      requestedModel ?? null,
+      activeModel ?? null,
+      effort ?? null,
+      JSON.stringify(transportConfig ?? {}),
+      now,
+      now,
+    ],
+  );
+}
+
+export async function deleteDbSession(db: Database, serverId: string, name: string): Promise<void> {
+  await db.execute('DELETE FROM sessions WHERE server_id = $1 AND name = $2', [serverId, name]);
+}
+
+export async function updateSessionLabel(db: Database, serverId: string, name: string, label: string | null): Promise<void> {
+  await db.execute(
+    'UPDATE sessions SET label = $1, updated_at = $2 WHERE server_id = $3 AND name = $4',
+    [label, Date.now(), serverId, name],
+  );
+}
+
+export async function updateProjectName(db: Database, serverId: string, sessionName: string, projectName: string): Promise<void> {
+  await db.execute(
+    'UPDATE sessions SET project_name = $1, updated_at = $2 WHERE server_id = $3 AND name = $4',
+    [projectName, Date.now(), serverId, sessionName],
+  );
+}
+
+export async function updateSession(
+  db: Database,
+  serverId: string,
+  name: string,
+  fields: {
+    label?: string | null;
+    description?: string | null;
+    project_dir?: string | null;
+    requested_model?: string | null;
+    active_model?: string | null;
+    effort?: string | null;
+    transport_config?: Record<string, unknown> | null;
+  },
+): Promise<void> {
+  const parts: string[] = [];
+  const vals: unknown[] = [];
+  let idx = 1;
+  if ('label' in fields) { parts.push(`label = $${idx++}`); vals.push(fields.label ?? null); }
+  if ('description' in fields) { parts.push(`description = $${idx++}`); vals.push(fields.description ?? null); }
+  if ('project_dir' in fields) { parts.push(`project_dir = $${idx++}`); vals.push(fields.project_dir ?? null); }
+  if ('requested_model' in fields) { parts.push(`requested_model = $${idx++}`); vals.push(fields.requested_model ?? null); }
+  if ('active_model' in fields) { parts.push(`active_model = $${idx++}`); vals.push(fields.active_model ?? null); }
+  if ('effort' in fields) { parts.push(`effort = $${idx++}`); vals.push(fields.effort ?? null); }
+  if ('transport_config' in fields) { parts.push(`transport_config = $${idx++}::jsonb`); vals.push(JSON.stringify(fields.transport_config ?? {})); }
+  if (parts.length === 0) return;
+  parts.push(`updated_at = $${idx++}`);
+  vals.push(Date.now());
+  vals.push(serverId, name);
+  await db.execute(
+    `UPDATE sessions SET ${parts.join(', ')} WHERE server_id = $${idx++} AND name = $${idx++}`,
+    vals,
+  );
+}
+
+export async function upsertSessionTextTailCacheEvent(
+  db: Database,
+  serverId: string,
+  rawEvent: Record<string, unknown>,
+): Promise<void> {
+  const classified = classifySessionTextTailEvent(rawEvent);
+  if (!classified) return;
+  await db.transaction(async (tx) => {
+    const row = await tx.queryOne<Pick<DbSessionTextTailCacheRow, 'events'>>(
+      `SELECT events
+         FROM session_text_tail_cache
+        WHERE server_id = $1 AND session_name = $2
+        FOR UPDATE`,
+      [serverId, classified.sessionName],
+    );
+    const existing = parseSessionTextTailCacheEvents(row?.events ?? null);
+    const events = mergeSessionTextTailCacheEvents(existing, classified.item);
+    const latestTs = events.length > 0 ? events[events.length - 1]!.ts : null;
+    await tx.execute(
+      `INSERT INTO session_text_tail_cache (server_id, session_name, events, latest_ts, updated_at)
+       VALUES ($1, $2, $3::jsonb, $4, NOW())
+       ON CONFLICT (server_id, session_name)
+       DO UPDATE SET events = EXCLUDED.events, latest_ts = EXCLUDED.latest_ts, updated_at = NOW()`,
+      [serverId, classified.sessionName, JSON.stringify(events), latestTs],
+    );
+  });
+}
+
+export async function getSessionTextTailCache(
+  db: Database,
+  serverId: string,
+  sessionName: string,
+): Promise<SessionTextTailCacheItem[]> {
+  const row = await db.queryOne<Pick<DbSessionTextTailCacheRow, 'events'>>(
+    `SELECT events
+       FROM session_text_tail_cache
+      WHERE server_id = $1 AND session_name = $2`,
+    [serverId, sessionName],
+  );
+  const events = parseSessionTextTailCacheEvents(row?.events ?? null);
+  return events.length > SESSION_TEXT_TAIL_CACHE_LIMIT
+    ? events.slice(events.length - SESSION_TEXT_TAIL_CACHE_LIMIT)
+    : events;
+}
+
+export async function replaceSessionTextTailCache(
+  db: Database,
+  serverId: string,
+  sessionName: string,
+  events: SessionTextTailCacheItem[],
+): Promise<void> {
+  const bounded = mergeSessionTextTailCacheItems([], events);
+  const latestTs = bounded.length > 0 ? bounded[bounded.length - 1]!.ts : null;
+  await db.execute(
+    `INSERT INTO session_text_tail_cache (server_id, session_name, events, latest_ts, updated_at)
+     VALUES ($1, $2, $3::jsonb, $4, NOW())
+     ON CONFLICT (server_id, session_name)
+     DO UPDATE SET events = EXCLUDED.events, latest_ts = EXCLUDED.latest_ts, updated_at = NOW()`,
+    [serverId, sessionName, JSON.stringify(bounded), latestTs],
+  );
+}
+
+// ── Quick data ────────────────────────────────────────────────────────────
+
+const EMPTY_QUICK_DATA: QuickData = { history: [], sessionHistory: {}, commands: [], phrases: [] };
+
+export async function getQuickData(db: Database, userId: string): Promise<QuickData> {
+  const row = await db.queryOne<{ data: string }>('SELECT data FROM user_quick_data WHERE user_id = $1', [userId]);
+  if (!row) return { ...EMPTY_QUICK_DATA };
+  try {
+    return JSON.parse(row.data) as QuickData;
+  } catch {
+    return { ...EMPTY_QUICK_DATA };
+  }
+}
+
+export async function upsertQuickData(db: Database, userId: string, data: QuickData): Promise<void> {
+  await db.execute(
+    'INSERT INTO user_quick_data (user_id, data, updated_at) VALUES ($1, $2, $3) ON CONFLICT(user_id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at',
+    [userId, JSON.stringify(data), Date.now()],
+  );
+}
+
+// ── Sub-sessions ──────────────────────────────────────────────────────────
+
+export interface DbSubSession {
+  id: string;
+  server_id: string;
+  type: string;
+  shell_bin: string | null;
+  cwd: string | null;
+  label: string | null;
+  closed_at: number | null;
+  created_at: number;
+  updated_at: number;
+  cc_session_id: string | null;
+  gemini_session_id: string | null;
+  parent_session: string | null;
+  sort_order: number | null;
+  runtime_type: string | null;
+  provider_id: string | null;
+  provider_session_id: string | null;
+  description: string | null;
+  cc_preset_id: string | null;
+  requested_model: string | null;
+  active_model: string | null;
+  effort: string | null;
+  transport_config: Record<string, unknown> | string | null;
+  execution_clone_metadata: Record<string, unknown> | string | null;
+  /**
+   * Projected from `execution_clone_metadata` by {@link projectSubSessionRow}.
+   * Present only for execution-clone rows; lets the grouped execution-detail
+   * view discriminate clones and group them by `parentRunId`. Never persisted
+   * as its own column.
+   */
+  executionCloneKind?: typeof EXECUTION_CLONE_KIND;
+  /** Projected parent run id from `execution_clone_metadata`; clones only. */
+  parentRunId?: string;
+}
+
+/**
+ * Coerce the `execution_clone_metadata` JSONB column (which the driver may hand
+ * back as a parsed object OR a raw JSON string) into a plain record, or null.
+ */
+function coerceExecutionCloneMetadata(
+  raw: Record<string, unknown> | string | null | undefined,
+): Record<string, unknown> | null {
+  if (raw == null) return null;
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : null;
+    } catch {
+      return null;
+    }
+  }
+  if (typeof raw === 'object' && !Array.isArray(raw)) return raw;
+  return null;
+}
+
+/**
+ * Pure predicate: is this sub-session row a dedicated execution clone? True only
+ * when `execution_clone_metadata.kind === EXECUTION_CLONE_KIND`. Tolerant of the
+ * column arriving as either a parsed object or a JSON string.
+ */
+export function isExecutionCloneRow(row: Pick<DbSubSession, 'execution_clone_metadata'>): boolean {
+  const meta = coerceExecutionCloneMetadata(row.execution_clone_metadata);
+  return meta?.kind === EXECUTION_CLONE_KIND;
+}
+
+/**
+ * Pure projection: derive `executionCloneKind` / `parentRunId` from
+ * `execution_clone_metadata` onto a copy of the row. Non-clone rows are returned
+ * with the projected fields absent. Existing fields are preserved verbatim.
+ */
+export function projectSubSessionRow(row: DbSubSession): DbSubSession {
+  const meta = coerceExecutionCloneMetadata(row.execution_clone_metadata);
+  if (meta?.kind !== EXECUTION_CLONE_KIND) return row;
+  const parentRunId = typeof meta.parentRunId === 'string' ? meta.parentRunId : undefined;
+  return {
+    ...row,
+    executionCloneKind: EXECUTION_CLONE_KIND,
+    ...(parentRunId !== undefined ? { parentRunId } : {}),
+  };
+}
+
+export interface GetSubSessionsOptions {
+  /**
+   * When false (default), execution clones
+   * (`execution_clone_metadata.kind === 'execution_clone'`) are EXCLUDED so they
+   * never clutter the normal session/sub-session listing surfaces. Set true only
+   * for the grouped execution-detail projection, which groups by `parentRunId`.
+   */
+  includeExecutionClones?: boolean;
+}
+
+export async function getSubSessionsByServer(
+  db: Database,
+  serverId: string,
+  opts?: GetSubSessionsOptions,
+): Promise<DbSubSession[]> {
+  const rows = await db.query<DbSubSession>(
+    'SELECT * FROM sub_sessions WHERE server_id = $1 AND closed_at IS NULL ORDER BY sort_order ASC NULLS LAST, created_at ASC',
+    [serverId],
+  );
+  const includeClones = opts?.includeExecutionClones === true;
+  const result: DbSubSession[] = [];
+  for (const row of rows) {
+    if (!includeClones && isExecutionCloneRow(row)) continue;
+    result.push(projectSubSessionRow(row));
+  }
+  return result;
+}
+
+export async function getSubSessionByProviderSessionId(
+  db: Database,
+  serverId: string,
+  providerSessionId: string,
+): Promise<DbSubSession | null> {
+  return db.queryOne<DbSubSession>(
+    'SELECT * FROM sub_sessions WHERE server_id = $1 AND provider_session_id = $2 AND closed_at IS NULL',
+    [serverId, providerSessionId],
+  );
+}
+
+export async function getSubSessionById(db: Database, id: string, serverId: string): Promise<DbSubSession | null> {
+  return db.queryOne<DbSubSession>(
+    'SELECT * FROM sub_sessions WHERE id = $1 AND server_id = $2',
+    [id, serverId],
+  );
+}
+
+export async function createSubSession(
+  db: Database,
+  id: string,
+  serverId: string,
+  type: string,
+  shellBin: string | null,
+  cwd: string | null,
+  label: string | null,
+  ccSessionId: string | null,
+  geminiSessionId: string | null = null,
+  parentSession: string | null = null,
+  runtimeType: string | null = null,
+  providerId: string | null = null,
+  providerSessionId: string | null = null,
+  description: string | null = null,
+  ccPresetId: string | null = null,
+  requestedModel: string | null = null,
+  activeModel: string | null = null,
+  effort: string | null = null,
+  transportConfig: Record<string, unknown> | null = null,
+  executionCloneMetadata: Record<string, unknown> | null = null,
+): Promise<DbSubSession> {
+  const now = Date.now();
+  // Clone-aware identity upsert: when the INCOMING row is an execution clone
+  // (its execution_clone_metadata.kind === 'execution_clone'), the runtime
+  // identity columns are written from EXCLUDED (expected NULL) WITHOUT the
+  // COALESCE fallback to the prior row — so stale identity never survives a
+  // conflict for a clone. Non-clone rows keep the existing COALESCE behavior.
+  await db.execute(
+    `INSERT INTO sub_sessions (id, server_id, type, shell_bin, cwd, label, closed_at, cc_session_id, gemini_session_id, parent_session, runtime_type, provider_id, provider_session_id, description, created_at, updated_at, cc_preset_id, requested_model, active_model, effort, transport_config, execution_clone_metadata)
+     VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20::jsonb, $21::jsonb)
+     ON CONFLICT (id, server_id) DO UPDATE SET type = EXCLUDED.type, shell_bin = EXCLUDED.shell_bin, cwd = EXCLUDED.cwd, label = COALESCE(EXCLUDED.label, sub_sessions.label), closed_at = NULL, cc_session_id = CASE WHEN EXCLUDED.execution_clone_metadata->>'kind' = 'execution_clone' THEN EXCLUDED.cc_session_id ELSE COALESCE(EXCLUDED.cc_session_id, sub_sessions.cc_session_id) END, gemini_session_id = CASE WHEN EXCLUDED.execution_clone_metadata->>'kind' = 'execution_clone' THEN EXCLUDED.gemini_session_id ELSE COALESCE(EXCLUDED.gemini_session_id, sub_sessions.gemini_session_id) END, parent_session = COALESCE(EXCLUDED.parent_session, sub_sessions.parent_session), runtime_type = COALESCE(EXCLUDED.runtime_type, sub_sessions.runtime_type), provider_id = COALESCE(EXCLUDED.provider_id, sub_sessions.provider_id), provider_session_id = CASE WHEN EXCLUDED.execution_clone_metadata->>'kind' = 'execution_clone' THEN EXCLUDED.provider_session_id ELSE COALESCE(EXCLUDED.provider_session_id, sub_sessions.provider_session_id) END, description = COALESCE(EXCLUDED.description, sub_sessions.description), updated_at = EXCLUDED.updated_at, cc_preset_id = COALESCE(EXCLUDED.cc_preset_id, sub_sessions.cc_preset_id), requested_model = COALESCE(EXCLUDED.requested_model, sub_sessions.requested_model), active_model = COALESCE(EXCLUDED.active_model, sub_sessions.active_model), effort = COALESCE(EXCLUDED.effort, sub_sessions.effort), transport_config = CASE WHEN EXCLUDED.transport_config = '{}'::jsonb THEN sub_sessions.transport_config ELSE EXCLUDED.transport_config END, execution_clone_metadata = EXCLUDED.execution_clone_metadata`,
+    [
+      id,
+      serverId,
+      type,
+      shellBin,
+      cwd,
+      label,
+      ccSessionId,
+      geminiSessionId,
+      parentSession,
+      runtimeType,
+      providerId,
+      providerSessionId,
+      description,
+      now,
+      now,
+      ccPresetId,
+      requestedModel,
+      activeModel,
+      effort,
+      JSON.stringify(transportConfig ?? {}),
+      executionCloneMetadata == null ? null : JSON.stringify(executionCloneMetadata),
+    ],
+  );
+  return {
+    id,
+    server_id: serverId,
+    type,
+    shell_bin: shellBin,
+    cwd,
+    label,
+    closed_at: null,
+    cc_session_id: ccSessionId,
+    gemini_session_id: geminiSessionId,
+    parent_session: parentSession,
+    sort_order: null,
+    runtime_type: runtimeType,
+    provider_id: providerId,
+    provider_session_id: providerSessionId,
+    description,
+    created_at: now,
+    updated_at: now,
+    cc_preset_id: ccPresetId,
+    requested_model: requestedModel,
+    active_model: activeModel,
+    effort,
+    transport_config: transportConfig ?? {},
+    execution_clone_metadata: executionCloneMetadata,
+  };
+}
+
+export async function updateSubSession(
+  db: Database,
+  id: string,
+  serverId: string,
+  fields: {
+    label?: string | null;
+    closed_at?: number | null;
+    gemini_session_id?: string | null;
+    sort_order?: number | null;
+    description?: string | null;
+    cwd?: string | null;
+    cc_preset_id?: string | null;
+    requested_model?: string | null;
+    active_model?: string | null;
+    effort?: string | null;
+    transport_config?: Record<string, unknown> | null;
+  },
+): Promise<void> {
+  const parts: string[] = [];
+  const vals: unknown[] = [];
+  let idx = 1;
+  if ('label' in fields) { parts.push(`label = $${idx++}`); vals.push(fields.label ?? null); }
+  if ('closed_at' in fields) { parts.push(`closed_at = $${idx++}`); vals.push(fields.closed_at ?? null); }
+  if ('gemini_session_id' in fields) { parts.push(`gemini_session_id = $${idx++}`); vals.push(fields.gemini_session_id ?? null); }
+  if ('sort_order' in fields) { parts.push(`sort_order = $${idx++}`); vals.push(fields.sort_order ?? null); }
+  if ('description' in fields) { parts.push(`description = $${idx++}`); vals.push(fields.description ?? null); }
+  if ('cwd' in fields) { parts.push(`cwd = $${idx++}`); vals.push(fields.cwd ?? null); }
+  if ('cc_preset_id' in fields) { parts.push(`cc_preset_id = $${idx++}`); vals.push(fields.cc_preset_id ?? null); }
+  if ('requested_model' in fields) { parts.push(`requested_model = $${idx++}`); vals.push(fields.requested_model ?? null); }
+  if ('active_model' in fields) { parts.push(`active_model = $${idx++}`); vals.push(fields.active_model ?? null); }
+  if ('effort' in fields) { parts.push(`effort = $${idx++}`); vals.push(fields.effort ?? null); }
+  if ('transport_config' in fields) { parts.push(`transport_config = $${idx++}::jsonb`); vals.push(JSON.stringify(fields.transport_config ?? {})); }
+  if (parts.length === 0) return;
+  parts.push(`updated_at = $${idx++}`);
+  vals.push(Date.now());
+  vals.push(id, serverId);
+  await db.execute(
+    `UPDATE sub_sessions SET ${parts.join(', ')} WHERE id = $${idx++} AND server_id = $${idx++}`,
+    vals,
+  );
+}
+
+export async function reorderSubSessions(db: Database, serverId: string, ids: string[]): Promise<void> {
+  const now = Date.now();
+  for (let i = 0; i < ids.length; i++) {
+    await db.execute(
+      'UPDATE sub_sessions SET sort_order = $1, updated_at = $2 WHERE id = $3 AND server_id = $4',
+      [i, now, ids[i], serverId],
+    );
+  }
+}
+
+export async function deleteSubSession(db: Database, id: string, serverId: string): Promise<void> {
+  await db.execute('DELETE FROM sub_sessions WHERE id = $1 AND server_id = $2', [id, serverId]);
+}
+
+// ── User preferences ──────────────────────────────────────────────────────
+
+export async function getUserPref(db: Database, userId: string, key: string): Promise<string | null> {
+  const row = await db.queryOne<{ value: string }>(
+    'SELECT value FROM user_preferences WHERE user_id = $1 AND key = $2',
+    [userId, key],
+  );
+  return row?.value ?? null;
+}
+
+export async function setUserPref(db: Database, userId: string, key: string, value: string): Promise<void> {
+  await db.execute(
+    'INSERT INTO user_preferences (user_id, key, value, updated_at) VALUES ($1, $2, $3, $4) ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at',
+    [userId, key, value, Date.now()],
+  );
+}
+
+export async function deleteUserPref(db: Database, userId: string, key: string): Promise<void> {
+  await db.execute('DELETE FROM user_preferences WHERE user_id = $1 AND key = $2', [userId, key]);
+}
+
+// ── Discussions ───────────────────────────────────────────────────────────
+
+export interface DbDiscussion {
+  id: string;
+  server_id: string;
+  topic: string;
+  state: string;
+  max_rounds: number;
+  current_round: number;
+  total_rounds: number;
+  completed_hops: number;
+  total_hops: number;
+  current_speaker: string | null;
+  participants: string | null;
+  file_path: string | null;
+  conclusion: string | null;
+  file_content: string | null;
+  error: string | null;
+  started_at: number;
+  finished_at: number | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface DbDiscussionRound {
+  id: string;
+  discussion_id: string;
+  server_id: string;
+  round: number;
+  speaker_role: string;
+  speaker_agent: string;
+  speaker_model: string | null;
+  response: string;
+  created_at: number;
+}
+
+export async function getDiscussionsByServer(db: Database, serverId: string): Promise<DbDiscussion[]> {
+  return db.query<DbDiscussion>(
+    'SELECT * FROM discussions WHERE server_id = $1 ORDER BY created_at DESC LIMIT 50',
+    [serverId],
+  );
+}
+
+export async function getDiscussionById(db: Database, id: string, serverId: string): Promise<DbDiscussion | null> {
+  return db.queryOne<DbDiscussion>('SELECT * FROM discussions WHERE id = $1 AND server_id = $2', [id, serverId]);
+}
+
+export async function upsertDiscussion(
+  db: Database,
+  d: {
+    id: string;
+    serverId: string;
+    topic: string;
+    state: string;
+    maxRounds: number;
+    currentRound?: number;
+    totalRounds?: number;
+    completedHops?: number;
+    totalHops?: number;
+    currentSpeaker?: string | null;
+    participants?: string | null;
+    filePath?: string | null;
+    conclusion?: string | null;
+    fileContent?: string | null;
+    error?: string | null;
+    startedAt: number;
+    finishedAt?: number | null;
+  },
+): Promise<void> {
+  const now = Date.now();
+  await db.execute(
+    `INSERT INTO discussions (id, server_id, topic, state, max_rounds, current_round, total_rounds, completed_hops, total_hops, current_speaker, participants, file_path, conclusion, file_content, error, started_at, finished_at, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+     ON CONFLICT(id, server_id) DO UPDATE SET
+       state = excluded.state,
+       current_round = excluded.current_round,
+       total_rounds = excluded.total_rounds,
+       completed_hops = excluded.completed_hops,
+       total_hops = excluded.total_hops,
+       current_speaker = excluded.current_speaker,
+       participants = excluded.participants,
+       file_path = excluded.file_path,
+       conclusion = excluded.conclusion,
+       file_content = excluded.file_content,
+       error = excluded.error,
+       finished_at = excluded.finished_at,
+       updated_at = excluded.updated_at`,
+    [
+      d.id, d.serverId, d.topic, d.state, d.maxRounds,
+      d.currentRound ?? 0, d.totalRounds ?? 1, d.completedHops ?? 0, d.totalHops ?? 0,
+      d.currentSpeaker ?? null, d.participants ?? null,
+      d.filePath ?? null, d.conclusion ?? null, d.fileContent ?? null, d.error ?? null,
+      d.startedAt, d.finishedAt ?? null, now, now,
+    ],
+  );
+}
+
+export async function insertDiscussionRound(
+  db: Database,
+  r: {
+    id: string;
+    discussionId: string;
+    serverId: string;
+    round: number;
+    speakerRole: string;
+    speakerAgent: string;
+    speakerModel?: string | null;
+    response: string;
+  },
+): Promise<void> {
+  await db.execute(
+    'INSERT INTO discussion_rounds (id, discussion_id, server_id, round, speaker_role, speaker_agent, speaker_model, response, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+    [r.id, r.discussionId, r.serverId, r.round, r.speakerRole, r.speakerAgent, r.speakerModel ?? null, r.response, Date.now()],
+  );
+}
+
+export async function getDiscussionRounds(db: Database, discussionId: string, serverId: string): Promise<DbDiscussionRound[]> {
+  return db.query<DbDiscussionRound>(
+    'SELECT * FROM discussion_rounds WHERE discussion_id = $1 AND server_id = $2 ORDER BY round, created_at',
+    [discussionId, serverId],
+  );
+}
+
+// ── P2P orchestration runs ────────────────────────────────────────────────
+
+export interface DbOrchestrationRun {
+  id: string;
+  discussion_id: string;
+  server_id: string;
+  main_session: string;
+  initiator_session: string;
+  current_target_session: string | null;
+  final_return_session: string;
+  remaining_targets: string; // JSON
+  mode_key: string;
+  status: string;
+  request_message_id: string | null;
+  callback_message_id: string | null;
+  context_ref: string; // JSON
+  timeout_ms: number;
+  result_summary: string | null;
+  error: string | null;
+  progress_snapshot: string;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  scope_kind?: ShareTarget['kind'] | null;
+  scope_server_id?: string | null;
+  scope_session_name?: string | null;
+  scope_sub_session_id?: string | null;
+  created_by_user_id?: string | null;
+  authorization_snapshot?: ShareAuthorizationSnapshot | string | null;
+  primary_share_id?: string | null;
+  covering_share_ids?: string[] | string | null;
+  visible_after_ms?: number | null;
+  history_cutoff_at_ms?: number | null;
+  share_target_snapshot?: ShareTarget | string | null;
+}
+
+export async function upsertOrchestrationRun(db: Database, r: DbOrchestrationRun): Promise<void> {
+  await db.execute(`
+    INSERT INTO discussion_orchestration_runs
+      (id, discussion_id, server_id, main_session, initiator_session, current_target_session, final_return_session,
+       remaining_targets, mode_key, status, request_message_id, callback_message_id, context_ref, timeout_ms,
+       result_summary, error, progress_snapshot, created_at, updated_at, completed_at,
+       scope_kind, scope_server_id, scope_session_name, scope_sub_session_id, created_by_user_id,
+       authorization_snapshot, primary_share_id, covering_share_ids, visible_after_ms,
+       history_cutoff_at_ms, share_target_snapshot)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13::jsonb, $14, $15, $16, $17::jsonb, $18, $19, $20,
+            $21, $22, $23, $24, $25, $26::jsonb, $27, $28::jsonb, $29, $30, $31::jsonb)
+    ON CONFLICT (id, server_id) DO UPDATE SET
+      current_target_session = EXCLUDED.current_target_session,
+      remaining_targets = EXCLUDED.remaining_targets,
+      status = EXCLUDED.status,
+      callback_message_id = EXCLUDED.callback_message_id,
+      result_summary = EXCLUDED.result_summary,
+      error = EXCLUDED.error,
+      progress_snapshot = EXCLUDED.progress_snapshot,
+      updated_at = EXCLUDED.updated_at,
+      completed_at = EXCLUDED.completed_at,
+      scope_kind = COALESCE(EXCLUDED.scope_kind, discussion_orchestration_runs.scope_kind),
+      scope_server_id = COALESCE(EXCLUDED.scope_server_id, discussion_orchestration_runs.scope_server_id),
+      scope_session_name = COALESCE(EXCLUDED.scope_session_name, discussion_orchestration_runs.scope_session_name),
+      scope_sub_session_id = COALESCE(EXCLUDED.scope_sub_session_id, discussion_orchestration_runs.scope_sub_session_id),
+      created_by_user_id = COALESCE(EXCLUDED.created_by_user_id, discussion_orchestration_runs.created_by_user_id),
+      authorization_snapshot = COALESCE(EXCLUDED.authorization_snapshot, discussion_orchestration_runs.authorization_snapshot),
+      primary_share_id = COALESCE(EXCLUDED.primary_share_id, discussion_orchestration_runs.primary_share_id),
+      covering_share_ids = CASE
+        WHEN EXCLUDED.scope_kind IS NULL
+          AND EXCLUDED.authorization_snapshot IS NULL
+          AND EXCLUDED.primary_share_id IS NULL
+        THEN discussion_orchestration_runs.covering_share_ids
+        ELSE EXCLUDED.covering_share_ids
+      END,
+      visible_after_ms = COALESCE(EXCLUDED.visible_after_ms, discussion_orchestration_runs.visible_after_ms),
+      history_cutoff_at_ms = COALESCE(EXCLUDED.history_cutoff_at_ms, discussion_orchestration_runs.history_cutoff_at_ms),
+      share_target_snapshot = COALESCE(EXCLUDED.share_target_snapshot, discussion_orchestration_runs.share_target_snapshot)
+  `, [
+    r.id, r.discussion_id, r.server_id, r.main_session, r.initiator_session, r.current_target_session, r.final_return_session,
+    r.remaining_targets, r.mode_key, r.status, r.request_message_id, r.callback_message_id, r.context_ref, r.timeout_ms,
+    r.result_summary, r.error, r.progress_snapshot, r.created_at, r.updated_at, r.completed_at,
+    r.scope_kind ?? null,
+    r.scope_server_id ?? null,
+    r.scope_session_name ?? null,
+    r.scope_sub_session_id ?? null,
+    r.created_by_user_id ?? null,
+    r.authorization_snapshot == null ? null : JSON.stringify(r.authorization_snapshot),
+    r.primary_share_id ?? null,
+    r.covering_share_ids == null ? JSON.stringify([]) : JSON.stringify(r.covering_share_ids),
+    r.visible_after_ms ?? null,
+    r.history_cutoff_at_ms ?? null,
+    r.share_target_snapshot == null ? null : JSON.stringify(r.share_target_snapshot),
+  ]);
+}
+
+export async function getOrchestrationRunsByDiscussion(db: Database, discussionId: string, serverId: string): Promise<DbOrchestrationRun[]> {
+  return db.query<DbOrchestrationRun>(
+    'SELECT * FROM discussion_orchestration_runs WHERE discussion_id = $1 AND server_id = $2 ORDER BY created_at DESC',
+    [discussionId, serverId],
+  );
+}
+
+export async function getOrchestrationRunById(db: Database, id: string, serverId: string): Promise<DbOrchestrationRun | null> {
+  return db.queryOne<DbOrchestrationRun>('SELECT * FROM discussion_orchestration_runs WHERE id = $1 AND server_id = $2', [id, serverId]);
+}
+
+export async function getActiveOrchestrationRuns(db: Database, serverId: string): Promise<DbOrchestrationRun[]> {
+  return db.query<DbOrchestrationRun>(
+    "SELECT * FROM discussion_orchestration_runs WHERE server_id = $1 AND status IN ('dispatched','running','awaiting_next_hop','queued')",
+    [serverId],
+  );
+}
+
+export async function getRecentOrchestrationRuns(db: Database, serverId: string, limit = 50): Promise<DbOrchestrationRun[]> {
+  return db.query<DbOrchestrationRun>(
+    'SELECT * FROM discussion_orchestration_runs WHERE server_id = $1 ORDER BY updated_at DESC LIMIT $2',
+    [serverId, limit],
+  );
+}
+
+export async function getShareScopedOrchestrationRunsByDiscussion(db: Database, discussionId: string, serverId: string): Promise<DbOrchestrationRun[]> {
+  return db.query<DbOrchestrationRun>(
+    'SELECT * FROM discussion_orchestration_runs WHERE discussion_id = $1 AND server_id = $2 AND scope_kind IS NOT NULL ORDER BY created_at DESC',
+    [discussionId, serverId],
+  );
+}
+
+export async function getShareScopedRecentOrchestrationRuns(db: Database, serverId: string, limit = 50): Promise<DbOrchestrationRun[]> {
+  return db.query<DbOrchestrationRun>(
+    'SELECT * FROM discussion_orchestration_runs WHERE server_id = $1 AND scope_kind IS NOT NULL ORDER BY updated_at DESC LIMIT $2',
+    [serverId, limit],
+  );
+}
+
+export async function getShareScopedOrchestrationRunById(db: Database, id: string, serverId: string): Promise<DbOrchestrationRun | null> {
+  return db.queryOne<DbOrchestrationRun>(
+    'SELECT * FROM discussion_orchestration_runs WHERE id = $1 AND server_id = $2 AND scope_kind IS NOT NULL',
+    [id, serverId],
+  );
+}
+
+export interface DbDiscussionComment {
+  id: string;
+  server_id: string;
+  thread_id: string | null;
+  scope_kind: ShareTarget['kind'];
+  scope_server_id: string;
+  scope_session_name: string | null;
+  scope_sub_session_id: string | null;
+  created_by_user_id: string;
+  actor_envelope: SharedActorEnvelope | string;
+  authorization_snapshot: ShareAuthorizationSnapshot | string;
+  primary_share_id: string | null;
+  covering_share_ids: string[] | string;
+  visible_after_ms: number;
+  history_cutoff_at_ms: number;
+  body: string;
+  created_at: number;
+}
+
+export async function insertDiscussionComment(db: Database, params: {
+  id: string;
+  serverId: string;
+  threadId?: string | null;
+  scope: ShareTarget;
+  createdByUserId: string;
+  actorEnvelope: SharedActorEnvelope;
+  authorizationSnapshot: ShareAuthorizationSnapshot;
+  body: string;
+  createdAt: number;
+}): Promise<DbDiscussionComment> {
+  await db.execute(
+    `INSERT INTO discussion_comments (
+       id, server_id, thread_id, scope_kind, scope_server_id, scope_session_name,
+       scope_sub_session_id, created_by_user_id, actor_envelope, authorization_snapshot,
+       primary_share_id, covering_share_ids, visible_after_ms, history_cutoff_at_ms,
+       body, created_at
+     )
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11, $12::jsonb, $13, $14, $15, $16)`,
+    [
+      params.id,
+      params.serverId,
+      params.threadId ?? null,
+      params.scope.kind,
+      params.scope.serverId,
+      params.scope.kind === 'main' ? params.scope.sessionName : null,
+      params.scope.kind === 'subsession' ? params.scope.subSessionId : null,
+      params.createdByUserId,
+      JSON.stringify(params.actorEnvelope),
+      JSON.stringify(params.authorizationSnapshot),
+      params.authorizationSnapshot.primaryShareId,
+      JSON.stringify(params.authorizationSnapshot.coveringShareIds),
+      params.createdAt,
+      params.authorizationSnapshot.historyCutoffAt,
+      params.body,
+      params.createdAt,
+    ],
+  );
+  const row = await db.queryOne<DbDiscussionComment>(
+    'SELECT * FROM discussion_comments WHERE id = $1 AND server_id = $2',
+    [params.id, params.serverId],
+  );
+  if (!row) throw new Error('discussion_comment_insert_failed');
+  return row;
+}
+
+export async function getDiscussionCommentsByThread(db: Database, serverId: string, threadId: string): Promise<DbDiscussionComment[]> {
+  return db.query<DbDiscussionComment>(
+    'SELECT * FROM discussion_comments WHERE server_id = $1 AND thread_id = $2 ORDER BY created_at ASC',
+    [serverId, threadId],
+  );
+}
+
+export async function getDiscussionCommentsByScope(db: Database, serverId: string, scope: ShareTarget): Promise<DbDiscussionComment[]> {
+  const scopeSessionName = scope.kind === 'main' ? scope.sessionName : null;
+  const scopeSubSessionId = scope.kind === 'subsession' ? scope.subSessionId : null;
+  return db.query<DbDiscussionComment>(
+    `SELECT *
+       FROM discussion_comments
+      WHERE server_id = $1
+        AND scope_kind = $2
+        AND scope_server_id = $3
+        AND ($4::text IS NULL OR scope_session_name = $4)
+        AND ($5::text IS NULL OR scope_sub_session_id = $5)
+      ORDER BY created_at ASC`,
+    [serverId, scope.kind, scope.serverId, scopeSessionName, scopeSubSessionId],
+  );
+}
+
+// ── Audit log ─────────────────────────────────────────────────────────────
+
+export async function writeAuditLog(
+  db: Database,
+  id: string,
+  userId: string,
+  serverId: string | null,
+  action: string,
+  details: unknown,
+  ipAddress: string,
+): Promise<void> {
+  await db.execute(
+    'INSERT INTO audit_log (id, user_id, server_id, action, details, ip, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+    [id, userId, serverId, action, JSON.stringify(details), ipAddress, Date.now()],
+  );
+}

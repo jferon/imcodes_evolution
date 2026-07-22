@@ -1,0 +1,1289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IM.codes — The IM for agents. Shared memory, OpenSpec Auto Deliver, collaborative coding, managed MCP tools, and cross-agent audit.</title>
+<meta name="description" content="The IM for agents. Shared memory, OpenSpec Auto Deliver with automatic module scoring, collaborative coding, managed MCP tools, supervised execution, and cross-agent audit — recall solved work, message sibling agents, schedule cron sends, supervise task completion, and run audit/rework loops across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, and OpenClaw.">
+<style>
+:root {
+  --bg: #0a0a0a;
+  --fg: #c8c8c8;
+  --dim: #555;
+  --accent: #22c55e;
+  --accent2: #3b82f6;
+  --border: #1a1a1a;
+  --code-bg: #111;
+  --font: 'SF Mono', 'Cascadia Code', 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.7;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.container { max-width: 720px; margin: 0 auto; padding: 60px 24px 80px; }
+
+header { margin-bottom: 48px; display: flex; justify-content: space-between; align-items: flex-start; }
+.header-left { }
+h1 { font-size: 20px; font-weight: 600; color: #fff; margin-bottom: 8px; }
+h1 span { color: var(--accent); }
+.tagline { color: var(--dim); font-size: 13px; }
+.lang-switch { display: flex; gap: 6px; margin-top: 4px; }
+.lang-switch button { background: none; border: 1px solid var(--border); color: var(--dim); border-radius: 3px; padding: 2px 8px; cursor: pointer; font-family: var(--font); font-size: 11px; }
+.lang-switch button.active { color: var(--accent); border-color: var(--accent); }
+.lang-switch button:hover { border-color: #333; }
+
+.hero-couplet { margin: 18px 0 8px; padding: 10px 0 10px 12px; border-left: 2px solid var(--accent); color: #fff; font-size: 15px; line-height: 1.6; }
+.hero-couplet cite { display: block; margin-top: 6px; font-style: normal; opacity: 0.65; font-size: 13px; }
+@media (max-width: 600px) { .hero-couplet { font-size: 14px; margin: 12px 0 6px; } }
+
+.prompt::before { content: '$ '; color: var(--accent); }
+.prompt { color: #fff; margin-bottom: 4px; }
+.output { color: var(--dim); margin-bottom: 20px; padding-left: 18px; }
+.lead { color: var(--fg); max-width: 660px; margin-bottom: 18px; }
+
+.warning { background: #1a1000; border: 1px solid #4a3000; border-radius: 4px; padding: 10px 14px; margin-bottom: 20px; font-size: 12px; color: #fbbf24; }
+.spotlight { background: linear-gradient(135deg, rgba(34,197,94,0.10), rgba(59,130,246,0.08)); border: 1px solid rgba(34,197,94,0.28); border-radius: 6px; padding: 18px 20px; }
+.spotlight h2 { color: #d7ffe5; border-bottom-color: rgba(34,197,94,0.22); }
+.score-tags { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 12px; }
+.score-tags span { border: 1px solid rgba(34,197,94,0.30); border-radius: 999px; padding: 2px 8px; color: #d7ffe5; background: rgba(0,0,0,0.18); font-size: 11px; }
+
+section { margin-bottom: 40px; }
+h2 {
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  margin-bottom: 16px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.screenshots { margin-bottom: 24px; }
+.screenshots p { margin-bottom: 4px; color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
+.screenshots .row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+.screenshots .row a { display: block; border-radius: 4px; overflow: hidden; border: 1px solid var(--border); transition: border-color 0.15s; }
+.screenshots .row a:hover { border-color: #333; }
+.screenshots .row img { display: block; height: auto; }
+.screenshots .row.desktop a { width: 23%; }
+.screenshots .row.desktop img { width: 100%; }
+.screenshots .row.mobile a { width: 18%; }
+.screenshots .row.mobile img { width: 100%; }
+.screenshots .row.watch a { width: 31%; }
+.screenshots .row.watch img { width: 100%; }
+.download-note { color: var(--dim); font-size: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.download-note .watch-pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px; border: 1px solid var(--border); border-radius: 999px; background: var(--code-bg); color: var(--fg); }
+
+.arch {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 20px;
+  font-size: 13px;
+  overflow-x: auto;
+  white-space: pre;
+  line-height: 1.5;
+}
+.arch .label { color: var(--accent2); }
+.arch .arrow { color: var(--dim); }
+.arch .proto { color: var(--accent); }
+
+.features {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2px;
+}
+@media (max-width: 540px) { .features { grid-template-columns: 1fr; } }
+.feat {
+  padding: 12px 14px;
+  border-radius: 4px;
+}
+.feat-name { color: #fff; font-size: 13px; }
+.feat-desc { color: var(--dim); font-size: 12px; margin-top: 2px; }
+
+.install-block {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 16px 20px;
+  position: relative;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.install-block:hover { border-color: #333; }
+.install-block code { color: #fff; font-size: 14px; }
+.install-block code span { color: var(--accent); }
+.install-block .copy-hint {
+  position: absolute;
+  right: 16px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--dim);
+  font-size: 11px;
+  transition: color 0.15s;
+}
+.install-block:hover .copy-hint { color: var(--fg); }
+
+.steps { list-style: none; counter-reset: step; }
+.steps li {
+  counter-increment: step;
+  padding: 6px 0;
+  padding-left: 28px;
+  position: relative;
+  color: var(--fg);
+}
+.steps li::before {
+  content: counter(step);
+  position: absolute;
+  left: 0;
+  color: var(--dim);
+  font-size: 12px;
+  width: 20px;
+  text-align: right;
+}
+.steps code {
+  background: var(--code-bg);
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 13px;
+  color: #fff;
+}
+
+.code-block {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 12px 16px;
+  font-size: 13px;
+  overflow-x: auto;
+  white-space: pre;
+  margin: 8px 0 16px;
+  color: #fff;
+}
+.code-block .comment { color: var(--dim); }
+
+.agents {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+.agent-tag {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--fg);
+}
+
+.reqs { color: var(--dim); font-size: 13px; }
+.reqs li { padding: 3px 0; list-style: none; }
+.reqs li::before { content: '→ '; color: var(--accent); }
+
+footer {
+  margin-top: 48px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+  color: var(--dim);
+  font-size: 12px;
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.cursor {
+  display: inline-block;
+  width: 8px;
+  height: 15px;
+  background: var(--accent);
+  margin-left: 2px;
+  animation: blink 1s step-end infinite;
+  vertical-align: text-bottom;
+}
+@keyframes blink { 50% { opacity: 0; } }
+
+.lightbox { display: none; position: fixed; inset: 0; z-index: 9000; background: rgba(0,0,0,0.92); align-items: center; justify-content: center; }
+.lightbox.open { display: flex; }
+.lightbox img { max-width: 90vw; max-height: 85vh; border-radius: 6px; box-shadow: 0 4px 40px rgba(0,0,0,0.6); }
+.lightbox .lb-close { position: absolute; top: 16px; right: 20px; background: none; border: none; color: #888; font-size: 28px; cursor: pointer; z-index: 1; }
+.lightbox .lb-close:hover { color: #fff; }
+.lightbox .lb-nav { position: absolute; top: 50%; transform: translateY(-50%); background: none; border: none; color: #666; font-size: 36px; cursor: pointer; padding: 12px; user-select: none; }
+.lightbox .lb-nav:hover { color: #fff; }
+.lightbox .lb-prev { left: 8px; }
+.lightbox .lb-next { right: 8px; }
+.lightbox .lb-counter { position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%); color: #555; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<header>
+  <div class="header-left">
+    <h1>IM<span>.</span>codes</h1>
+    <div class="tagline" data-i18n="tagline">The IM for agents. Shared memory, OpenSpec Auto Deliver, collaborative coding, managed MCP tools, and cross-agent audit.</div>
+  </div>
+  <div class="lang-switch">
+    <button onclick="setLang('en')" data-lang="en" class="active">EN</button>
+    <button onclick="setLang('zh-CN')" data-lang="zh-CN">简中</button>
+    <button onclick="setLang('zh-TW')" data-lang="zh-TW">繁中</button>
+    <button onclick="setLang('ja')" data-lang="ja">日本語</button>
+    <button onclick="setLang('ko')" data-lang="ko">한국어</button>
+    <button onclick="setLang('es')" data-lang="es">ES</button>
+    <button onclick="setLang('ru')" data-lang="ru">RU</button>
+  </div>
+</header>
+
+<section>
+  <blockquote class="hero-couplet">
+    <span data-i18n="couplet_l1">Two heads are better than one.</span><br>
+    <span data-i18n="couplet_l2">But minds in concert don't answer fate, they author it.</span><br>
+    <cite>— IM.codes</cite>
+  </blockquote>
+  <p class="lead" data-i18n="hero_intro">IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. OpenSpec Auto Deliver can drive a change from proposal/spec audit through implementation, validation hints, Team audit/rework, automatic module scoring, and final quality gates. Session sharing also supports pair or multi-person collaborative coding around live agent sessions. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. Team discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.</p>
+  <div class="prompt">imcodes bind https://app.im.codes/bind/&lt;key&gt;<span class="cursor"></span></div>
+  <div class="output" data-i18n="hero_output">bound to app.im.codes &middot; daemon started &middot; registered as system service</div>
+</section>
+
+<section class="warning" data-i18n="self_host_warning">
+  <strong>Self-hosting is strongly recommended.</strong> <code>app.im.codes</code> is a shared test instance with no uptime guarantees — it may be rate-limited, targeted, or unavailable. This is a personal project with no commercial support. For anything beyond evaluation, deploy on your own infrastructure.
+</section>
+
+<section>
+  <h2 data-i18n="h_screenshots">screenshots</h2>
+  <div class="screenshots">
+    <p>Desktop</p>
+    <div class="row desktop">
+      <a href="#" onclick="openLightbox(0);return false"><img src="imcodes-sidebar.png" alt="Sidebar" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(1);return false"><img src="imcodes0.png" alt="Desktop 1" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(2);return false"><img src="imcodes1.png" alt="Desktop 2" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(3);return false"><img src="imcodes2.png" alt="Desktop 3" loading="lazy" /></a>
+    </div>
+    <p>iPad / Tablet</p>
+    <div class="row" style="margin-bottom:12px;gap:8px"><a href="#" onclick="openLightbox(4);return false" style="width:48%;border-radius:4px;overflow:hidden;border:1px solid var(--border)"><img src="imcodes-ipad2.png" alt="iPad 1" style="width:100%;display:block" loading="lazy" /></a><a href="#" onclick="openLightbox(5);return false" style="width:48%;border-radius:4px;overflow:hidden;border:1px solid var(--border)"><img src="imcodes-ipad3.png" alt="iPad 2" style="width:100%;display:block" loading="lazy" /></a></div>
+    <p>Mobile</p>
+    <div class="row mobile">
+      <a href="#" onclick="openLightbox(6);return false"><img src="imcodes-m6.png" alt="Scheduled Tasks & CI/CD" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(7);return false"><img src="imcodes-m7.png" alt="Execution History" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(8);return false"><img src="imcodes-m8.png" alt="Local Web Preview" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(9);return false"><img src="imcodes-m5.png" alt="Mobile Files" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(10);return false"><img src="imcodes-m1.png" alt="Mobile 1" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(11);return false"><img src="imcodes-m2.png" alt="Mobile 2" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(12);return false"><img src="imcodes-m3.png" alt="Mobile 3" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(13);return false"><img src="imcodes-m4.png" alt="Mobile 4" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(14);return false"><img src="imcodes-m0.png" alt="Mobile 5" loading="lazy" /></a>
+    </div>
+    <p>Apple Watch</p>
+    <div class="row watch">
+      <a href="#" onclick="openLightbox(15);return false"><img src="imcodes-watch1.png" alt="Watch session list" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(16);return false"><img src="imcodes-watch0.png" alt="Watch quick reply" loading="lazy" /></a>
+      <a href="#" onclick="openLightbox(17);return false"><img src="imcodes-watch2.png" alt="Watch session details" loading="lazy" /></a>
+    </div>
+    <div style="color:var(--dim);font-size:12px;max-width:640px;" data-i18n="watch_intro">Watch support covers quick session monitoring, unread counts, OTA update visibility, push notifications, and quick replies from the wrist.</div>
+  </div>
+</section>
+
+<section>
+  <h2 data-i18n="h_why">why</h2>
+  <p style="color:var(--fg); margin-bottom:16px;" data-i18n="why_text">
+    When you leave your desk, most coding-agent workflows fall apart. The agent is still running in a terminal, but continuing usually means SSH, tmux attach, remote desktop, or waiting for your laptop. That is only half the problem. Hard agent work also needs better judgment: one model can fall into patterns, miss issues, or lose context when you switch providers. IM.codes pairs always-reachable sessions with shared memory for summarized completed work and structured Team cross-model review, so multiple agents can challenge plans before code lands. It does not make output perfect, but it reduces single-model blind spots while keeping the work continuous.
+  </p>
+</section>
+
+<section>
+  <h2 data-i18n="h_memory">shared agent context</h2>
+  <p style="color:var(--fg); margin-bottom:12px;" data-i18n="memory_intro">IM.codes keeps a searchable memory of solved work — structured problem→solution summaries instead of raw prompt logs. Relevant history is recalled automatically for new prompts and session startup, and every injection stays visible in the timeline.</p>
+  <ul class="reqs">
+    <li data-i18n="memory_1">Personal memory stays local by default, with optional cloud sync for processed summaries across your devices.</li>
+    <li data-i18n="memory_2">Enterprise shared context lets teams reuse fixes across workspaces and projects with queryable memory, stats, and inspection UI. It is still under active development and has not been fully production-tested yet.</li>
+    <li data-i18n="memory_3">Multilingual recall uses local embeddings plus pgvector-backed server search, so related fixes can be found across different languages.</li>
+    <li data-i18n="memory_4">Timeline cards show exactly what was injected, with relevance score, recall count, and last-used metadata.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 data-i18n="h_mcp">managed MCP tools</h2>
+  <p style="color:var(--fg); margin-bottom:12px;" data-i18n="mcp_intro">Supported SDK-backed agents receive a daemon-managed stdio MCP server with one runtime-scoped surface for memory, agent messaging, and scheduled follow-ups, without raw auth tokens or ad hoc shell commands.</p>
+  <ul class="reqs">
+    <li data-i18n="mcp_1"><code>search_memory</code> recalls prior work, decisions, preferences, bugs, commits, deployments, and discussed context, returning compact summaries plus <code>projectionId</code> values.</li>
+    <li data-i18n="mcp_2"><code>get_memory_sources</code> expands a relevant memory hit into provenance snippets when exact prior instructions, bug details, or source evidence matter.</li>
+    <li data-i18n="mcp_3"><code>save_observation</code> and <code>save_preference</code> persist useful facts and stable user preferences.</li>
+    <li data-i18n="mcp_4"><code>send_list_targets</code> and <code>send_message</code> let agents discover sibling sessions and send scoped text, file references, replies, or broadcasts.</li>
+    <li data-i18n="mcp_5"><code>cron_create</code>, <code>cron_list</code>, <code>cron_update</code>, and <code>cron_delete</code> manage future structured sends for reminders, recurring checks, delegated reviews, and follow-ups.</li>
+    <li data-i18n="mcp_6">Runtime-bound identity prevents forged namespace, user, server, token, or routing fields; provider-level ready/degraded status and redacted recent calls stay visible in the UI.</li>
+  </ul>
+</section>
+
+<section class="spotlight">
+  <h2 data-i18n="h_autodeliver">OpenSpec Auto Deliver</h2>
+  <p style="color:var(--fg); margin-bottom:12px;" data-i18n="autodeliver_intro">Turn an OpenSpec change folder into a supervised delivery run: proposal/spec audit, implementation, validation hints, Team audit/rework, automatic scoring, and a visible final handoff.</p>
+  <div class="score-tags" aria-label="Auto scoring modules">
+    <span>spec</span><span>tasks</span><span>implementation</span><span>tests</span><span>risk</span>
+  </div>
+  <ul class="reqs">
+    <li data-i18n="autodeliver_1">One-click launch resolves the owning session, reads <code>tasks.md</code>, locks the Team lane, and keeps live progress in the UI.</li>
+    <li data-i18n="autodeliver_2">Spec audit can run before implementation through the normal Team flow, using authoritative JSON instead of trusting chat summaries.</li>
+    <li data-i18n="autodeliver_3">Implementation prompts stay focused on the selected OpenSpec change and surface safe validation command candidates from project manifests.</li>
+    <li data-i18n="autodeliver_4">Automatic module scoring rates <code>spec</code>, <code>tasks</code>, <code>implementation</code>, <code>tests</code>, and <code>risk</code> with evidence visible in run details.</li>
+    <li data-i18n="autodeliver_5">Fail-closed gates ask for human input on bad audit output, exhausted limits, manual interference, or unreadable tasks. Auto Deliver never stages, commits, or pushes code.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 data-i18n="h_collab">collaborative coding</h2>
+  <p style="color:var(--fg); margin-bottom:12px;" data-i18n="collab_intro">Share a live tab, sub-session, or whole source server as a scoped collaborative workspace.</p>
+  <ul class="reqs">
+    <li data-i18n="collab_1">Viewer access is for review; participant access can send prompts into covered sessions.</li>
+    <li data-i18n="collab_2">Works for pair programming or small-group agent supervision, with actor labels and revocable access.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 data-i18n="h_auto">supervised execution</h2>
+  <p style="color:var(--fg); margin-bottom:12px;" data-i18n="auto_intro">IM.codes can supervise supported transport sessions turn by turn instead of relying on blind auto-continue. Auto checks whether the latest turn is done, should continue, or should return control to you.</p>
+  <ul class="reqs">
+    <li data-i18n="auto_1">Per-session Auto modes: Off, Supervised, and Supervised + audit.</li>
+    <li data-i18n="auto_2">At the idle boundary, Auto can classify a turn as complete, continue, or ask_human, then dispatch the next continue prompt in the same session.</li>
+    <li data-i18n="auto_3">Supervised + audit can run an audit→rework loop before handing control back, so finished work is reviewed instead of trusted blindly.</li>
+    <li data-i18n="auto_4">Global defaults seed new sessions. Set a default supervisor backend, model, and timeout once — each session snapshots them at enable time and can still override backend/model/timeout and audit mode individually.</li>
+    <li data-i18n="auto_5">Two-layer custom supervision instructions. Keep a global supervision persona plus a per-session addition — by default the two are concatenated into the prompt, or tick the session's &ldquo;Override global&rdquo; checkbox to ignore the global value for that session. Editing the global persona takes effect on already-enabled sessions on the next turn without re-enabling Auto.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 data-i18n="h_not">what it is not</h2>
+  <ul class="reqs">
+    <li data-i18n="not_1">Not another AI IDE</li>
+    <li data-i18n="not_2">Not just a chat wrapper</li>
+    <li data-i18n="not_3">Not just a remote terminal client</li>
+    <li data-i18n="not_4">Not a replacement for Claude Code, Codex, Gemini CLI, OpenClaw, or Qwen</li>
+    <li data-i18n="not_5">It is the messaging/control layer around them</li>
+  </ul>
+</section>
+
+<section>
+  <h2 data-i18n="h_features">features</h2>
+  <div class="features">
+    <div class="feat"><div class="feat-name" data-i18n="f_memory_name">shared agent context</div><div class="feat-desc" data-i18n="f_memory_desc">problem→solution memory, multilingual recall, automatic per-message and startup injection with visible timeline cards</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_mcp_name">managed MCP tools</div><div class="feat-desc" data-i18n="f_mcp_desc">ten runtime-scoped tools for memory search/sources, preferences, scoped Send, and Cron scheduling</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_autodeliver_name">OpenSpec Auto Deliver</div><div class="feat-desc" data-i18n="f_autodeliver_desc">proposal/spec audit → implementation → Team audit/rework, with automatic module scoring for spec/tasks/implementation/tests/risk</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_collab_name">collaborative coding</div><div class="feat-desc" data-i18n="f_collab_desc">scoped sharing for pair or small-group agent programming</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_auto_name">supervised execution</div><div class="feat-desc" data-i18n="f_auto_desc">turn-level completion checks, auto-continue, and optional audit→rework loops for transport-backed agents</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_remote_name">remote terminal</div><div class="feat-desc" data-i18n="f_remote_desc">browser & mobile, no SSH/VPN, real-time PTY streaming at 12fps</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_file_name">file browser & git</div><div class="feat-desc" data-i18n="f_file_desc">tree view, upload/download, +/- stats, safe HTML quick preview, inline image previews with lightbox zoom</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_preview_name">local web preview</div><div class="feat-desc" data-i18n="f_preview_desc">preview localhost from any device via secure tunnel, supports HMR</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_mobile_name">mobile, watch & notifications</div><div class="feat-desc" data-i18n="f_mobile_desc">biometric auth, push notifications, shell keyboard input, watch quick replies</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_discuss_name">cross-provider audit</div><div class="feat-desc" data-i18n="f_discuss_desc">multi-agent Team discussions with customizable phases (audit, review, brainstorm…) — different models catch different issues before code is written, reducing rework</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_streaming_name">CLI + SDK access</div><div class="feat-desc" data-i18n="f_streaming_desc">Access multiple agents through both CLI and SDK integrations. OpenClaw and Qwen also stream natively with real-time deltas, tool tracking, and session restore.</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_chat_name">terminal + chat</div><div class="feat-desc" data-i18n="f_chat_desc">raw CLI or structured view with parsed tool calls</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_sidebar_name">Discord-style sidebar</div><div class="feat-desc" data-i18n="f_sidebar_desc">server icons, session tree, unread badges, idle flash</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_picker_name">@ picker</div><div class="feat-desc" data-i18n="f_picker_desc">@files, @@agents, @@all(config) for group dispatch</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_multi_name">multi-server</div><div class="feat-desc" data-i18n="f_multi_desc">manage agents across machines from one dashboard</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_pin_name">pinnable panels</div><div class="feat-desc" data-i18n="f_pin_desc">drag any window to sidebar, cross-device sync</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_sub_name">sub-sessions</div><div class="feat-desc" data-i18n="f_sub_desc">spawn parallel agents on the fly</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_repo_name">repository dashboard</div><div class="feat-desc" data-i18n="f_repo_desc">issues, PRs, branches, commits, CI/CD</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_cron_name">scheduled tasks</div><div class="feat-desc" data-i18n="f_cron_desc">cron-style automation, timezone-aware, execution history with jump-to-session</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_sync_name">cross-device sync</div><div class="feat-desc" data-i18n="f_sync_desc">tab order, pinned tabs & panels synced to server</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_i18n_name">7 languages</div><div class="feat-desc" data-i18n="f_i18n_desc">EN, 中文, 繁體, ES, RU, JA, KO</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_stream_name">real-time stream</div><div class="feat-desc" data-i18n="f_stream_desc">live output, zero polling, zero message limits</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_self_name">self-hosted</div><div class="feat-desc" data-i18n="f_self_desc">your infra, your data, one-command deploy</div></div>
+    <div class="feat"><div class="feat-name" data-i18n="f_ota_name">OTA updates</div><div class="feat-desc" data-i18n="f_ota_desc">upgrade daemons from the web UI</div></div>
+  </div>
+</section>
+
+<section>
+  <h2 data-i18n="h_arch">architecture</h2>
+  <div class="arch"><span class="label">You</span> <span class="arrow">(browser / mobile)</span>
+ <span class="arrow">│</span> <span class="proto">WebSocket</span>
+<span class="label">Server</span> <span class="arrow">(self-hosted, relays connections)</span>
+ <span class="arrow">│</span> <span class="proto">WebSocket</span>
+<span class="label">Daemon</span> <span class="arrow">(your machine, manages sessions)</span>
+ <span class="arrow">│</span> <span class="proto">tmux / transport / managed MCP</span>
+<span class="label">Agents</span> <span class="arrow">(multiple agents via CLI + SDK · native transport backends)</span></div>
+  <p style="color:var(--dim); font-size:13px; margin-top:12px;" data-i18n="arch_desc">The daemon runs on your dev machine and manages process-backed sessions through tmux plus transport-backed sessions through SDKs and network protocols. It also owns the managed MCP server for runtime-scoped memory, Send, and Cron tools. The server relays connections between your devices and the daemon. Everything stays on your infrastructure.</p>
+</section>
+
+<section>
+  <h2 data-i18n="h_download">download</h2>
+  <div style="display: flex; gap: 16px; align-items: center; flex-wrap: wrap; margin-bottom: 10px;">
+    <a href="https://apps.apple.com/us/app/im-codes/id6761014424" target="_blank" rel="noopener"><img src="https://developer.apple.com/assets/elements/badges/download-on-the-app-store.svg" height="40" alt="Download on the App Store" style="display:block;" /></a>
+    <span style="color: var(--dim); font-size: 12px;" data-i18n="also_web">Also available as a <a href="https://app.im.codes">web app</a></span>
+  </div>
+  <div class="download-note">
+    <span class="watch-pill">⌚ <span data-i18n="watch_badge">iPhone · iPad · Apple Watch</span></span>
+    <span data-i18n="watch_download">Watch app includes session list, unread counts, and quick replies.</span>
+  </div>
+</section>
+
+<section>
+  <h2 data-i18n="h_install">install</h2>
+  <div style="display:flex;gap:12px;flex-wrap:wrap;">
+    <div class="install-block" onclick="copy(this)">
+      <code><span>$</span> curl -fsSL https://im.codes/install.sh | bash</code>
+      <div class="copy-hint" data-i18n="copy_hint">click to copy</div>
+    </div>
+    <div class="install-block" onclick="copy(this)">
+      <code><span>&gt;</span> irm https://im.codes/install.ps1 | iex</code>
+      <div class="copy-hint" data-i18n="copy_hint">click to copy</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2 data-i18n="h_quick">quick start</h2>
+  <ol class="steps">
+    <li data-i18n="qs_1">Use <a href="https://app.im.codes">app.im.codes</a> or self-host the server</li>
+    <li data-i18n="qs_2">Run <code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code></li>
+    <li data-i18n="qs_3">Open the dashboard &mdash; your agents are live</li>
+  </ol>
+</section>
+
+<section>
+  <h2 data-i18n="h_openclaw">openclaw connect</h2>
+  <p style="color:var(--fg); margin-bottom:12px; font-size:13px;" data-i18n="oc_intro">If OpenClaw is running on the same machine as the daemon, connect IM.codes to the local OpenClaw gateway with:</p>
+  <div class="code-block">imcodes connect openclaw</div>
+  <ul class="reqs" style="margin-bottom:16px;">
+    <li data-i18n="oc_1">Default gateway URL: <code>ws://127.0.0.1:18789</code></li>
+    <li data-i18n="oc_2">Token auto-detected from <code>~/.openclaw/openclaw.json</code>, or pass <code>--token</code> / <code>OPENCLAW_GATEWAY_TOKEN</code></li>
+    <li data-i18n="oc_3">OpenClaw sessions and child sessions sync into IM.codes automatically</li>
+    <li data-i18n="oc_4">Saved to <code>~/.imcodes/openclaw.json</code> so the daemon can reconnect automatically</li>
+    <li data-i18n="oc_5">Use <code>imcodes disconnect openclaw</code> to remove the saved config</li>
+  </ul>
+  <div class="code-block">imcodes connect openclaw --url wss://gateway.example.com
+OPENCLAW_GATEWAY_TOKEN=... imcodes connect openclaw</div>
+  <p style="color:var(--dim); font-size:12px;" data-i18n="oc_note">Only tested on macOS so far. Remote plain-text <code>ws://</code> URLs require <code>--insecure</code>.</p>
+</section>
+
+<section>
+  <h2 data-i18n="h_selfhost">self-host</h2>
+  <p style="color:var(--fg); margin-bottom:12px; font-size:13px;" data-i18n="sh_intro">Deploy server + daemon on a single machine. Requires Docker and a domain with DNS pointing to the server.</p>
+  <div class="code-block">npm install -g imcodes
+mkdir imcodes && cd imcodes
+imcodes setup --domain imc.example.com</div>
+  <p style="color:var(--dim); font-size:12px; margin-bottom:16px;" data-i18n="sh_desc">Generates all config, starts PostgreSQL + server + Caddy with automatic HTTPS, creates admin account, and binds the local daemon. Credentials printed at the end.</p>
+  <p style="color:var(--fg); font-size:13px; margin-bottom:8px;" data-i18n="sh_connect">To connect additional machines:</p>
+  <div class="code-block">npm install -g imcodes
+imcodes bind https://imc.example.com/bind/&lt;api-key&gt;</div>
+  <p style="color:var(--fg); font-size:13px; margin-top:16px; margin-bottom:8px;" data-i18n="sh_manual">Manual setup:</p>
+  <div class="code-block">git clone https://github.com/im4codes/imcodes.git && cd imcodes
+./gen-env.sh imc.example.com <span class="comment"># generates .env, prints admin password</span>
+docker compose up -d</div>
+  <p style="color:var(--dim); font-size:12px; margin-top:8px;" data-i18n="sh_manual_pgvector">Generated docker-compose.yml uses pgvector/pgvector:pg18 for PostgreSQL.</p>
+</section>
+
+<section>
+  <h2 data-i18n="h_agents">supported agents</h2>
+  <p style="color:var(--fg); margin-bottom:12px; font-size:13px;" data-i18n="agents_intro">Multiple agents support both CLI and SDK integrations.</p>
+  <div class="agents">
+    <a class="agent-tag" href="https://github.com/anthropics/claude-code">Claude Code</a>
+    <a class="agent-tag" href="https://github.com/openai/codex">Codex</a>
+    <a class="agent-tag" href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>
+    <a class="agent-tag" href="https://openclaw.com">OpenClaw</a>
+    <a class="agent-tag" href="https://github.com/QwenLM/qwen-agent">Qwen</a>
+    <span class="agent-tag">GitHub Copilot</span>
+    <span class="agent-tag">Cursor</span>
+    <span class="agent-tag">OpenCode</span>
+    <span class="agent-tag">Shell</span>
+    <span class="agent-tag" style="color:var(--dim);border-style:dashed">+ more</span>
+  </div>
+</section>
+
+<section>
+  <h2 data-i18n="h_reqs">requirements</h2>
+  <ul class="reqs">
+    <li data-i18n="req_os">macOS, Linux, or Windows (native experimental; <a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> fully supported)</li>
+    <li>Node.js &ge; 22</li>
+    <li data-i18n="req_mux">tmux (Linux/macOS/WSL). Windows native uses ConPTY (built-in). Multiple agents also support SDK-backed sessions.</li>
+  </ul>
+</section>
+
+<section>
+  <h2 data-i18n="h_about">about</h2>
+  <p style="color:var(--dim); font-size:13px;" data-i18n="about_text">
+    Personal project. Built almost entirely by
+    <a href="https://github.com/anthropics/claude-code">Claude Code</a>,
+    with contributions from
+    <a href="https://github.com/openai/codex">Codex</a> and
+    <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>.
+  </p>
+</section>
+
+<section>
+  <p style="color:var(--dim); font-size:11px; line-height:1.6;" data-i18n="disclaimer">
+    IM.codes is an independent open-source project and is not affiliated with, endorsed by, or sponsored by Anthropic, OpenAI, Google, Alibaba, OpenClaw, or any other company whose products are mentioned. All product names, trademarks, and registered trademarks are the property of their respective owners.
+  </p>
+</section>
+
+<footer>
+  <span>MIT &middot; <a href="https://github.com/im4codes/imcodes">source</a> &middot; <a href="privacy.html">privacy</a> &middot; <a href="terms.html">terms</a> &middot; <a href="support.html">support</a></span>
+  <span><a href="https://app.im.codes">app.im.codes</a></span>
+</footer>
+
+</div>
+
+<div class="lightbox" id="lightbox" onclick="if(event.target===this)closeLightbox()">
+  <button class="lb-close" onclick="closeLightbox()">&times;</button>
+  <button class="lb-nav lb-prev" onclick="navLightbox(-1)">&#8249;</button>
+  <img id="lb-img" src="" alt="" />
+  <button class="lb-nav lb-next" onclick="navLightbox(1)">&#8250;</button>
+  <div class="lb-counter" id="lb-counter"></div>
+</div>
+
+<script>
+const I18N = {
+  en: {
+    watch_intro: 'Watch support covers quick session monitoring, unread counts, OTA update visibility, push notifications, and quick replies from the wrist.',
+    tagline: 'The IM for agents. Shared memory, OpenSpec Auto Deliver, collaborative coding, managed MCP tools, and cross-agent audit.',
+    hero_intro: "IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context, then injects or recalls the right history in future sessions across Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw, and more. OpenSpec Auto Deliver can drive a change from proposal/spec audit through implementation, validation hints, Team audit/rework, automatic module scoring, and final quality gates. Session sharing also supports pair or multi-person collaborative coding around live agent sessions. Built-in Auto supervision can judge completed turns, continue work autonomously, and optionally run an audit/rework loop before handing control back. Team discussion lets multiple models review and audit each other's plans and implementations — an effective way to reduce single-model misses, blind spots, and biases.",
+    watch_badge: 'iPhone · iPad · Apple Watch',
+    watch_download: 'Watch app includes session list, unread counts, and quick replies.',
+    agents_intro: 'Multiple agents support both CLI and SDK integrations.',
+    h_memory: 'shared agent context',
+    memory_intro: 'IM.codes keeps a searchable memory of solved work — structured problem→solution summaries instead of raw prompt logs. Relevant history is recalled automatically for new prompts and session startup, and every injection stays visible in the timeline.',
+    memory_1: 'Personal memory stays local by default, with optional cloud sync for processed summaries across your devices.',
+    memory_2: 'Enterprise shared context lets teams reuse fixes across workspaces and projects with queryable memory, stats, and inspection UI. It is still under active development and has not been fully production-tested yet.',
+    memory_3: 'Multilingual recall uses local embeddings plus pgvector-backed server search, so related fixes can be found across different languages.',
+    memory_4: 'Timeline cards show exactly what was injected, with relevance score, recall count, and last-used metadata.',
+    h_mcp: 'managed MCP tools',
+    mcp_intro: 'Supported SDK-backed agents receive a daemon-managed stdio MCP server with one runtime-scoped surface for memory, agent messaging, and scheduled follow-ups, without raw auth tokens or ad hoc shell commands.',
+    mcp_1: '<code>search_memory</code> recalls prior work, decisions, preferences, bugs, commits, deployments, and discussed context, returning compact summaries plus <code>projectionId</code> values.',
+    mcp_2: '<code>get_memory_sources</code> expands a relevant memory hit into provenance snippets when exact prior instructions, bug details, or source evidence matter.',
+    mcp_3: '<code>save_observation</code> and <code>save_preference</code> persist useful facts and stable user preferences.',
+    mcp_4: '<code>send_list_targets</code> and <code>send_message</code> let agents discover sibling sessions and send scoped text, file references, replies, or broadcasts.',
+    mcp_5: '<code>cron_create</code>, <code>cron_list</code>, <code>cron_update</code>, and <code>cron_delete</code> manage future structured sends for reminders, recurring checks, delegated reviews, and follow-ups.',
+    mcp_6: 'Runtime-bound identity prevents forged namespace, user, server, token, or routing fields; provider-level ready/degraded status and redacted recent calls stay visible in the UI.',
+    h_collab: 'collaborative coding',
+    collab_intro: 'Share a live tab, sub-session, or whole source server as a scoped collaborative workspace.',
+    collab_1: 'Viewer access is for review; participant access can send prompts into covered sessions.',
+    collab_2: 'Works for pair programming or small-group agent supervision, with actor labels and revocable access.',
+    h_autodeliver: 'OpenSpec Auto Deliver',
+    autodeliver_intro: 'Turn an OpenSpec change folder into a supervised delivery run: proposal/spec audit, implementation, validation hints, Team audit/rework, automatic scoring, and a visible final handoff.',
+    autodeliver_1: 'One-click launch resolves the owning session, reads <code>tasks.md</code>, locks the Team lane, and keeps live progress in the UI.',
+    autodeliver_2: 'Spec audit can run before implementation through the normal Team flow, using authoritative JSON instead of trusting chat summaries.',
+    autodeliver_3: 'Implementation prompts stay focused on the selected OpenSpec change and surface safe validation command candidates from project manifests.',
+    autodeliver_4: 'Automatic module scoring rates <code>spec</code>, <code>tasks</code>, <code>implementation</code>, <code>tests</code>, and <code>risk</code> with evidence visible in run details.',
+    autodeliver_5: 'Fail-closed gates ask for human input on bad audit output, exhausted limits, manual interference, or unreadable tasks. Auto Deliver never stages, commits, or pushes code.',
+    h_auto: 'supervised execution',
+    auto_intro: 'IM.codes can supervise supported transport sessions turn by turn instead of relying on blind auto-continue. Auto checks whether the latest turn is done, should continue, or should return control to you.',
+    auto_1: 'Per-session Auto modes: Off, Supervised, and Supervised + audit.',
+    auto_2: 'At the idle boundary, Auto can classify a turn as complete, continue, or ask_human, then dispatch the next continue prompt in the same session.',
+    auto_3: 'Supervised + audit can run an audit→rework loop before handing control back, so finished work is reviewed instead of trusted blindly.',
+    auto_4: 'Global defaults seed new sessions. Set a default supervisor backend, model, and timeout once — each session snapshots them at enable time and can still override backend/model/timeout and audit mode individually.',
+    auto_5: 'Two-layer custom supervision instructions. Keep a global supervision persona plus a per-session addition — by default the two are concatenated into the prompt, or tick the session\'s "Override global" checkbox to ignore the global value for that session. Editing the global persona takes effect on already-enabled sessions on the next turn without re-enabling Auto.',
+    f_memory_name: 'shared agent context',
+    f_memory_desc: 'problem→solution memory, multilingual recall, automatic per-message and startup injection with visible timeline cards',
+    f_mcp_name: 'managed MCP tools',
+    f_mcp_desc: 'ten runtime-scoped tools for memory search/sources, preferences, scoped Send, and Cron scheduling',
+    f_collab_name: 'collaborative coding',
+    f_collab_desc: 'scoped sharing for pair or small-group agent programming',
+    f_autodeliver_name: 'OpenSpec Auto Deliver',
+    f_autodeliver_desc: 'proposal/spec audit → implementation → Team audit/rework, with automatic module scoring for spec/tasks/implementation/tests/risk',
+    f_auto_name: 'supervised execution',
+    f_auto_desc: 'turn-level completion checks, auto-continue, and optional audit→rework loops for transport-backed agents',
+    h_openclaw: 'openclaw connect',
+    oc_intro: 'If OpenClaw is running on the same machine as the daemon, connect IM.codes to the local OpenClaw gateway with:',
+    oc_1: 'Default gateway URL: <code>ws://127.0.0.1:18789</code>',
+    oc_2: 'Token auto-detected from <code>~/.openclaw/openclaw.json</code>, or pass <code>--token</code> / <code>OPENCLAW_GATEWAY_TOKEN</code>',
+    oc_3: 'OpenClaw sessions and child sessions sync into IM.codes automatically',
+    oc_4: 'Saved to <code>~/.imcodes/openclaw.json</code> so the daemon can reconnect automatically',
+    oc_5: 'Use <code>imcodes disconnect openclaw</code> to remove the saved config',
+    oc_note: 'Only tested on macOS so far. Remote plain-text <code>ws://</code> URLs require <code>--insecure</code>.',
+    sh_manual_pgvector: 'Generated docker-compose.yml uses pgvector/pgvector:pg18 for PostgreSQL.',
+  },
+  'zh-CN': {
+    tagline: '给 AI agent 的 IM。共享记忆、OpenSpec 自动交付、协作编程、托管 MCP 工具，以及跨模型审计。',
+    hero_intro: 'IM.codes 为 coding agent 提供一套跨 provider 共享的记忆层，以及一套托管 MCP 工具面。它会把已完成的工作沉淀成可复用上下文，再在后续 session 中注入或召回合适的历史，贯通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。OpenSpec 自动交付可以把一个变更从提案/规格审计一路推进到实现、验证建议、团队审计/返工、自动模块打分和最终质量门控。会话共享也支持围绕实时 agent session 的双人或多人协作编程。内置 Auto supervision 可在每轮完成后判断任务是否完成、是否继续自动执行，并可选进入审计/返工闭环后再把控制权交还给你。团队讨论功能让多个模型相互审阅对方的方案和实现——能有效减少单模型的遗漏、盲点和偏差。',
+    couplet_l1: '三个臭皮匠，顶个诸葛亮。',
+    couplet_l2: '三个诸葛亮，谈笑定阴阳。',
+    hero_output: '已绑定 app.im.codes · 守护进程已启动 · 已注册为系统服务',
+    self_host_warning: '<strong>强烈建议自行部署。</strong><code>app.im.codes</code> 是共享测试实例，无可用性保证，可能被限流、攻击或不可用。这是个人项目，不提供商用保障。正式使用请部署到自己的服务器。',
+    h_screenshots: '截图', h_why: '为什么', h_memory: '共享代理上下文', h_mcp: '托管 MCP 工具', h_not: '它不是什么', h_features: '功能', h_arch: '架构', h_download: '下载', h_install: '安装', h_quick: '快速开始', h_selfhost: '自托管部署', h_agents: '支持的代理', h_reqs: '系统要求', h_about: '关于',
+    also_web: '也可作为 <a href="https://app.im.codes">网页版</a> 使用', watch_intro: 'Watch 支持可在手腕上快速查看会话、未读数、OTA 更新状态、推送通知和快捷回复。', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Watch App 提供会话列表、未读计数和快捷回复。',
+    agents_intro: '支持多个 agent 通过 CLI 和 SDK 两种方式接入。',
+    memory_intro: 'IM.codes 会把已完成的工作持续沉淀成可搜索的记忆——保存的是结构化的问题→解决方案摘要，而不是原始 prompt 日志。相关历史会在新消息和会话启动时自动召回，并且每次注入都会在时间线里可见。',
+    memory_1: '个人记忆默认保留在本地，也可以把处理后的摘要可选同步到云端，在你的多台设备之间共享。',
+    memory_2: '企业共享上下文让团队可以在 workspace / project 范围内复用修复经验，并通过可查询的记忆、统计和检查界面管理它。这部分仍在持续开发中，还没有经过完整的生产级测试。',
+    memory_3: '多语言召回结合本地 embedding 和基于 pgvector 的服务端搜索，可以跨不同语言找到相关历史修复。',
+    memory_4: '时间线卡片会明确显示注入了什么内容，以及相关性分数、召回次数和上次使用时间。',
+    mcp_intro: '支持的 SDK agent 会自动获得 daemon 托管的 stdio MCP server，用同一个运行时作用域工具面处理记忆、agent 消息和定时 follow-up，而不需要接触原始认证 token 或临时 shell 命令。',
+    mcp_1: '<code>search_memory</code> 召回过往工作、决策、偏好、bug、commit、部署和既往讨论上下文，并返回紧凑摘要和 <code>projectionId</code>。',
+    mcp_2: '<code>get_memory_sources</code> 在需要精确历史指令、bug 细节或来源证据时，把相关记忆命中展开成来源片段。',
+    mcp_3: '<code>save_observation</code> 和 <code>save_preference</code> 保存有用事实和稳定用户偏好。',
+    mcp_4: '<code>send_list_targets</code> 和 <code>send_message</code> 让 agent 发现兄弟会话，并发送有作用域的文本、文件引用、回复请求或广播。',
+    mcp_5: '<code>cron_create</code>、<code>cron_list</code>、<code>cron_update</code> 和 <code>cron_delete</code> 管理未来结构化发送任务，用于提醒、周期检查、委托 review 和 follow-up。',
+    mcp_6: '运行时绑定身份可防止伪造 namespace、user、server、token 或路由字段；UI 会显示 provider 级 ready/degraded 状态和脱敏后的最近调用。',
+    h_collab: '协作编程',
+    collab_intro: '把实时标签页、子会话或整台 source server 分享成有作用域的协作空间。',
+    collab_1: 'Viewer 用于旁观 review；participant 可向覆盖范围内的 session 发送 prompt。',
+    collab_2: '适合双人编程或小团队 agent supervision，带真人 actor 标识，权限可撤销。',
+    h_autodeliver: 'OpenSpec 自动交付',
+    autodeliver_intro: '把一个 OpenSpec 变更目录变成可监督的交付运行：提案/规格审计、实现、验证建议、团队审计/返工、自动打分，以及可见的最终交接。',
+    autodeliver_1: '一键启动会解析所属会话、读取 <code>tasks.md</code>、锁定 Team 通道，并在 UI 中持续显示实时进度。',
+    autodeliver_2: '实现前可先跑规格审计，复用常规 Team 流程，并读取权威 JSON，而不是盲信聊天摘要。',
+    autodeliver_3: '实现 prompt 会聚焦选中的 OpenSpec 变更，并从项目 manifest 中提示安全的验证命令候选。',
+    autodeliver_4: '自动模块打分会对 <code>spec</code>、<code>tasks</code>、<code>implementation</code>、<code>tests</code>、<code>risk</code> 评分，证据会显示在运行详情里。',
+    autodeliver_5: '失败即回退：审计输出异常、达到上限、人工干预或 tasks 不可读时都会要求人工处理。自动交付不会 stage、commit 或 push 代码。',
+    h_auto: '受监督执行',
+    auto_intro: 'IM.codes 可对支持的 transport session 做逐轮监督，而不是盲目自动继续。Auto 会判断最近一轮是已经完成、应该继续自动执行，还是该把控制权交还给你。',
+    auto_1: '按 session 配置 Auto 模式：Off、Supervised、Supervised + audit。',
+    auto_2: '在 idle 边界，Auto 会把一轮判成 complete、continue 或 ask_human，并把后续 continue prompt 直接发回同一 session。',
+    auto_3: 'Supervised + audit 可在交还控制权前自动跑审计→返工闭环，不再盲目信任“看起来完成了”的结果。',
+    auto_4: '全局默认为新 session 预填。先把默认的监督后端、模型和超时设一次——每个 session 在启用 Auto 时会把这些快照下来，并可以单独覆盖后端/模型/超时和审计模式。',
+    auto_5: '两层自定义监督提示词。保留一份全局监督人格，再加上每个 session 自己的补充——默认会拼接成 global + 空行 + session 发给监督者，或者在会话里勾上「覆盖全局」让该 session 忽略全局值。改全局人格对已启用的会话下一轮就生效，不用重新开启 Auto。',
+    f_memory_name: '共享代理上下文',
+    f_memory_desc: '问题→解决方案记忆、多语言召回、按消息/启动自动注入，并在时间线中可见',
+    f_mcp_name: '托管 MCP 工具',
+    f_mcp_desc: '十个运行时作用域工具：记忆搜索/来源、偏好、Scoped Send 和 Cron 调度',
+    f_collab_name: '协作编程',
+    f_collab_desc: '有作用域地分享标签页/子会话/source server，支持双人或小团队 agent 编程',
+    f_autodeliver_name: 'OpenSpec 自动交付',
+    f_autodeliver_desc: '提案/规格审计 → 实现 → 团队审计/返工，并自动给 spec/tasks/implementation/tests/risk 模块打分',
+    f_auto_name: '受监督执行',
+    f_auto_desc: '逐轮完成判定、自动继续，以及可选的审计→返工闭环，适用于 transport agent',
+    why_text: '离开桌面后，大多数 coding agent 工作流就断了。代理还在终端里运行，但你通常只能靠 SSH、tmux attach、远程桌面，或者等回到电脑前。这只是问题的一半。复杂 agent 工作还需要更稳的判断：单个模型可能陷入定式、漏掉问题，切换 provider 时也可能丢上下文。IM.codes 把始终可达的会话、已完成工作的共享记忆摘要，以及结构化团队跨模型审阅放在一起，让多个 agent 在代码落地前互相挑战方案。它不能让输出完美，但能减少单模型盲点，并让工作保持连续。',
+    not_1: '不是另一个 AI IDE', not_2: '不只是聊天壳', not_3: '不只是远程终端客户端', not_4: '不是 Claude Code、Codex、Gemini CLI、OpenClaw 或 Qwen 的替代品', not_5: '它是围绕这些 agent 的消息/控制层',
+    f_remote_name: '远程终端', f_remote_desc: '浏览器和手机访问，无需 SSH/VPN，实时 PTY 推流',
+    f_chat_name: '终端 + 聊天', f_chat_desc: '原生 CLI 或结构化视图，解析工具调用',
+    f_discuss_name: '跨模型审计', f_discuss_desc: '多 Agent 团队讨论，可自定义阶段（audit、review、brainstorm…）— 不同模型在写代码前交叉审查，减少单模型常漏掉的问题和返工',
+    f_multi_name: '多服务器', f_multi_desc: '一个面板管理所有机器上的代理',
+    f_sub_name: '子会话', f_sub_desc: '随时启动并行代理',
+    f_file_name: '文件浏览器', f_file_desc: '浏览、上传下载、Git 差异、HTML 快速预览、本地图片原地预览和悬浮放大',
+    f_mobile_name: '移动端和通知', f_mobile_desc: '生物认证，代理需要注意时推送通知',
+    f_ota_name: 'OTA 更新', f_ota_desc: '从 Web UI 升级守护进程',
+    f_stream_name: '实时推流', f_stream_desc: '零轮询、零消息限制',
+    f_self_name: '自托管', f_self_desc: '你的服务器，你的数据，一键部署',
+    f_streaming_name: 'CLI + SDK 接入',
+    f_streaming_desc: '支持多个 agent 通过 CLI 和 SDK 接入。OpenClaw 和 Qwen 继续提供原生流式输出、工具追踪和会话恢复。',
+    f_sidebar_name: 'Discord 风格侧边栏',
+    f_sidebar_desc: '服务器图标、会话树、未读徽章、空闲闪烁',
+    f_picker_name: '@ 选择器',
+    f_picker_desc: '@文件、@@代理、@@all(config) 群组派发',
+    f_pin_name: '可固定面板',
+    f_pin_desc: '拖拽窗口到侧边栏，跨设备同步',
+    f_repo_name: '仓库面板',
+    f_repo_desc: 'Issues、PR、分支、提交、CI/CD',
+    f_cron_name: '定时任务',
+    f_cron_desc: 'Cron 定时自动化，时区感知，执行历史可跳转到会话',
+    f_preview_name: '本地预览',
+    f_preview_desc: '安全隧道预览 localhost，支持 HMR 热更新',
+    f_sync_name: '跨设备同步',
+    f_sync_desc: '标签顺序、固定标签和面板同步到服务器',
+    f_i18n_name: '7 种语言',
+    f_i18n_desc: '中英日韩俄西 + 繁体中文',
+    arch_desc: '守护进程运行在你的开发机上，通过 tmux 管理进程会话，并通过 SDK 和网络协议管理 transport 会话。它也负责托管 MCP server，为支持的 SDK provider 提供运行时作用域内的记忆、Send 和 Cron 工具。服务端在你的设备和守护进程之间中转连接。所有数据留在你的基础设施内。',
+    copy_hint: '点击复制',
+    qs_1: '使用 <a href="https://app.im.codes">app.im.codes</a> 或自行部署服务端',
+    qs_2: '运行 <code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code>',
+    qs_3: '打开面板 —— 你的代理已上线',
+    h_openclaw: '连接 OpenClaw',
+    oc_intro: '如果 OpenClaw 和 daemon 跑在同一台机器上，用下面的命令把 IM.codes 接到本地 OpenClaw gateway：',
+    oc_1: '默认网关地址：<code>ws://127.0.0.1:18789</code>',
+    oc_2: '会自动从 <code>~/.openclaw/openclaw.json</code> 读取 token，也可传 <code>--token</code> 或 <code>OPENCLAW_GATEWAY_TOKEN</code>',
+    oc_3: 'OpenClaw 的 session 和子 session 会自动同步进 IM.codes',
+    oc_4: '配置会保存到 <code>~/.imcodes/openclaw.json</code>，daemon 重启后可自动重连',
+    oc_5: '使用 <code>imcodes disconnect openclaw</code> 删除已保存配置',
+    oc_note: '目前只在 macOS 上测试过。远程明文 <code>ws://</code> 地址需要加 <code>--insecure</code>。',
+    sh_intro: '在一台机器上部署服务端和守护进程。需要 Docker 和指向该服务器的域名。',
+    sh_desc: '自动生成配置、启动 PostgreSQL + 服务端 + Caddy（自动 HTTPS）、创建管理员账户并绑定本地守护进程。凭证在最后打印。',
+    sh_connect: '连接其他机器：', sh_manual: '手动部署：', sh_manual_pgvector: '生成的 docker-compose.yml 已默认使用 pgvector/pgvector:pg18 作为 PostgreSQL 镜像。',
+    req_os: 'macOS、Linux 或 Windows（原生试验性；<a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> 完全支持）',
+    req_mux: 'tmux（Linux/macOS/WSL）。Windows 原生使用 ConPTY（内置）。',
+    about_text: '个人项目。几乎完全由 <a href="https://github.com/anthropics/claude-code">Claude Code</a> 构建，<a href="https://github.com/openai/codex">Codex</a> 和 <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a> 也有重要贡献。',
+    disclaimer: 'IM.codes 是一个独立的开源项目，与 Anthropic、OpenAI、Google、阿里巴巴、OpenClaw 或任何其他被提及的公司无任何关联、认可或赞助关系。所有产品名称和商标均为其各自所有者的财产。',
+  },
+  'zh-TW': {
+    tagline: '給 AI agent 的 IM。共享記憶、OpenSpec 自動交付、協作編程、託管 MCP 工具，以及跨模型審計。',
+    hero_intro: 'IM.codes 為 coding agent 提供一套跨 provider 共享的記憶層，以及一套託管 MCP 工具面。它會把已完成的工作沉澱成可重用上下文，再在後續 session 中注入或召回合適的歷史，貫通 Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw 等。OpenSpec 自動交付可以把一個變更從提案/規格審計一路推進到實作、驗證建議、團隊審計/返工、自動模組打分和最終品質門控。Session 分享也支援圍繞即時 agent session 的雙人或多人協作編程。內建 Auto supervision 可在每輪完成後判斷任務是否完成、是否繼續自動執行，並可選進入審計/返工閉環後再把控制權交還給你。團隊討論功能讓多個模型互相審閱對方的方案和實作——能有效減少單模型的遺漏、盲點和偏差。',
+    couplet_l1: '三個臭皮匠，頂個諸葛亮。',
+    couplet_l2: '三個諸葛亮，談笑定陰陽。',
+    hero_output: '已綁定 app.im.codes · 守護程序已啟動 · 已註冊為系統服務',
+    self_host_warning: '<strong>強烈建議自行部署。</strong><code>app.im.codes</code> 是共享測試實例，無可用性保證，可能被限流、攻擊或不可用。這是個人專案，不提供商用保障。正式使用請部署到自己的伺服器。',
+    h_screenshots: '截圖', h_why: '為什麼', h_memory: '共享代理上下文', h_mcp: '託管 MCP 工具', h_not: '它不是什麼', h_features: '功能', h_arch: '架構', h_download: '下載', h_install: '安裝', h_quick: '快速開始', h_selfhost: '自託管部署', h_agents: '支援的代理', h_reqs: '系統需求', h_about: '關於',
+    also_web: '也可作為 <a href="https://app.im.codes">網頁版</a> 使用', watch_intro: 'Watch 支援可在手腕上快速查看會話、未讀數、OTA 更新狀態、推送通知和快捷回覆。', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Watch App 提供會話列表、未讀計數和快捷回覆。',
+    agents_intro: '支援多個 agent 透過 CLI 和 SDK 兩種方式接入。',
+    memory_intro: 'IM.codes 會把已完成的工作持續沉澱成可搜尋的記憶——保存的是結構化的問題→解決方案摘要，而不是原始 prompt 日誌。相關歷史會在新訊息和工作階段啟動時自動召回，而且每次注入都會在時間線中可見。',
+    memory_1: '個人記憶預設保留在本地，也可以選擇把處理後的摘要同步到雲端，在你的多台裝置之間共享。',
+    memory_2: '企業共享上下文讓團隊能在 workspace / project 範圍內重用修復經驗，並透過可查詢的記憶、統計和檢視介面管理它。這部分仍在持續開發中，還沒有經過完整的生產級測試。',
+    memory_3: '多語言召回結合本地 embedding 與基於 pgvector 的伺服器搜尋，可以跨不同語言找到相關歷史修復。',
+    memory_4: '時間線卡片會明確顯示注入了什麼內容，以及相關性分數、召回次數和上次使用時間。',
+    mcp_intro: '支援的 SDK agent 會自動獲得 daemon 託管的 stdio MCP server，用同一個執行時作用域工具面處理記憶、agent 訊息和定時 follow-up，而不需要接觸原始認證 token 或臨時 shell 命令。',
+    mcp_1: '<code>search_memory</code> 召回過往工作、決策、偏好、bug、commit、部署和既往討論上下文，並返回緊湊摘要和 <code>projectionId</code>。',
+    mcp_2: '<code>get_memory_sources</code> 在需要精確歷史指令、bug 細節或來源證據時，把相關記憶命中展開成來源片段。',
+    mcp_3: '<code>save_observation</code> 和 <code>save_preference</code> 保存有用事實和穩定使用者偏好。',
+    mcp_4: '<code>send_list_targets</code> 和 <code>send_message</code> 讓 agent 發現兄弟 session，並發送有作用域的文字、檔案引用、回覆請求或廣播。',
+    mcp_5: '<code>cron_create</code>、<code>cron_list</code>、<code>cron_update</code> 和 <code>cron_delete</code> 管理未來結構化發送任務，用於提醒、週期檢查、委託 review 和 follow-up。',
+    mcp_6: '執行時綁定身份可防止偽造 namespace、user、server、token 或路由欄位；UI 會顯示 provider 級 ready/degraded 狀態和脫敏後的最近呼叫。',
+    h_collab: '協作編程',
+    collab_intro: '把即時標籤頁、子 session 或整台 source server 分享成有作用域的協作空間。',
+    collab_1: 'Viewer 用於旁觀 review；participant 可向覆蓋範圍內的 session 送出 prompt。',
+    collab_2: '適合雙人編程或小團隊 agent supervision，帶真人 actor 標識，權限可撤銷。',
+    h_autodeliver: 'OpenSpec 自動交付',
+    autodeliver_intro: '把一個 OpenSpec 變更目錄變成可監督的交付執行：提案/規格審計、實作、驗證建議、團隊審計/返工、自動打分，以及可見的最終交接。',
+    autodeliver_1: '一鍵啟動會解析所屬 session、讀取 <code>tasks.md</code>、鎖定 Team 通道，並在 UI 中持續顯示即時進度。',
+    autodeliver_2: '實作前可先跑規格審計，重用常規 Team 流程，並讀取權威 JSON，而不是盲信聊天摘要。',
+    autodeliver_3: '實作 prompt 會聚焦選中的 OpenSpec 變更，並從專案 manifest 中提示安全的驗證命令候選。',
+    autodeliver_4: '自動模組打分會對 <code>spec</code>、<code>tasks</code>、<code>implementation</code>、<code>tests</code>、<code>risk</code> 評分，證據會顯示在執行詳情裡。',
+    autodeliver_5: '失敗即回退：審計輸出異常、達到上限、人工干預或 tasks 不可讀時都會要求人工處理。自動交付不會 stage、commit 或 push 程式碼。',
+    h_auto: '受監督執行',
+    auto_intro: 'IM.codes 可對支援的 transport session 做逐輪監督，而不是盲目自動繼續。Auto 會判斷最近一輪是已完成、應該繼續自動執行，還是該把控制權交還給你。',
+    auto_1: '按 session 設定 Auto 模式：Off、Supervised、Supervised + audit。',
+    auto_2: '在 idle 邊界，Auto 會把一輪判成 complete、continue 或 ask_human，並把後續 continue prompt 直接送回同一個 session。',
+    auto_3: 'Supervised + audit 可在交還控制權前自動跑審計→返工閉環，不再盲目信任「看起來完成了」的結果。',
+    auto_4: '全域預設值會預填新的 session。先把預設監督後端、模型和逾時設一次——每個 session 啟用 Auto 時會把這些快照下來，之後也能單獨覆寫後端/模型/逾時和稽核模式。',
+    auto_5: '雙層自訂監督提示詞。可同時保留一份全域監督人格，以及每個 session 的個別補充——預設會拼接成 global + 空行 + session 後送給監督者；在會話中勾選「覆蓋全域」，該 session 就會忽略全域值。修改全域人格對已啟用的 session 下一輪就生效，不需要重新開啟 Auto。',
+    f_memory_name: '共享代理上下文',
+    f_memory_desc: '問題→解決方案記憶、多語言召回、按訊息/啟動自動注入，並在時間線中可見',
+    f_mcp_name: '託管 MCP 工具',
+    f_mcp_desc: '十個執行時作用域工具：記憶搜尋/來源、偏好、Scoped Send 和 Cron 調度',
+    f_collab_name: '協作編程',
+    f_collab_desc: '有作用域地分享標籤頁/子 session/source server，支援雙人或小團隊 agent 編程',
+    f_autodeliver_name: 'OpenSpec 自動交付',
+    f_autodeliver_desc: '提案/規格審計 → 實作 → 團隊審計/返工，並自動給 spec/tasks/implementation/tests/risk 模組打分',
+    f_auto_name: '受監督執行',
+    f_auto_desc: '逐輪完成判定、自動繼續，以及可選的審計→返工閉環，適用於 transport agent',
+    why_text: '離開桌面後，大多數 coding agent 工作流就斷了。代理還在終端機裡運行，但你通常只能靠 SSH、tmux attach、遠端桌面，或者等回到電腦前。這只是問題的一半。複雜 agent 工作還需要更穩的判斷：單一模型可能陷入固定模式、漏掉問題，切換 provider 時也可能遺失上下文。IM.codes 把始終可達的 session、已完成工作的共享記憶摘要，以及結構化團隊跨模型審閱放在一起，讓多個 agent 在程式碼落地前互相檢視方案。它不能讓輸出完美，但能減少單一模型盲點，並讓工作保持連續。',
+    not_1: '不是另一個 AI IDE', not_2: '不只是聊天殼', not_3: '不只是遠端終端客戶端', not_4: '不是 Claude Code、Codex、Gemini CLI、OpenClaw 或 Qwen 的替代品', not_5: '它是圍繞這些 agent 的訊息/控制層',
+    f_remote_name: '遠端終端機', f_remote_desc: '瀏覽器和手機存取，無需 SSH/VPN，即時 PTY 串流',
+    f_chat_name: '終端機 + 聊天', f_chat_desc: '原生 CLI 或結構化檢視，解析工具呼叫',
+    f_discuss_name: '跨模型稽核', f_discuss_desc: '多 Agent 團隊討論，可自訂階段（audit、review、brainstorm…）— 不同模型在寫程式前交叉審查，減少單一模型常漏掉的問題和返工',
+    f_multi_name: '多伺服器', f_multi_desc: '一個面板管理所有機器上的代理',
+    f_sub_name: '子會話', f_sub_desc: '隨時啟動並行代理',
+    f_file_name: '檔案瀏覽器', f_file_desc: '瀏覽、上傳下載、Git 差異、HTML 快速預覽、本地圖片原地預覽和懸浮放大',
+    f_mobile_name: '行動版和通知', f_mobile_desc: '生物辨識認證，代理需要關注時推播通知',
+    f_ota_name: 'OTA 更新', f_ota_desc: '從 Web UI 升級守護程序',
+    f_stream_name: '即時串流', f_stream_desc: '零輪詢、零訊息限制',
+    f_self_name: '自託管', f_self_desc: '你的伺服器，你的資料，一鍵部署',
+    f_streaming_name: 'CLI + SDK 接入',
+    f_streaming_desc: '支援多個 agent 透過 CLI 和 SDK 接入。OpenClaw 和 Qwen 繼續提供原生串流輸出、工具追蹤和會話恢復。',
+    f_sidebar_name: 'Discord 風格側邊欄',
+    f_sidebar_desc: '伺服器圖示、會話樹、未讀徽章、閒置閃爍',
+    f_picker_name: '@ 選擇器',
+    f_picker_desc: '@檔案、@@代理、@@all(config) 群組派發',
+    f_pin_name: '可固定面板',
+    f_pin_desc: '拖曳視窗到側邊欄，跨裝置同步',
+    f_repo_name: '儲存庫面板',
+    f_repo_desc: 'Issues、PR、分支、提交、CI/CD',
+    f_cron_name: '排程任務',
+    f_cron_desc: 'Cron 定時自動化，時區感知，執行歷史可跳轉至會話',
+    f_preview_name: '本地預覽',
+    f_preview_desc: '安全隧道預覽 localhost，支援 HMR 熱更新',
+    f_sync_name: '跨裝置同步',
+    f_sync_desc: '標籤順序、固定標籤和面板同步到伺服器',
+    f_i18n_name: '7 種語言',
+    f_i18n_desc: '中英日韓俄西 + 繁體中文',
+    arch_desc: '守護程序運行在你的開發機上，透過 tmux 管理進程會話，並透過 SDK 和網路協定管理 transport 會話。它也負責託管 MCP server，為支援的 SDK provider 提供執行時作用域內的記憶、Send 和 Cron 工具。伺服器在你的裝置和守護程序之間中轉連線。所有資料留在你的基礎設施內。',
+    copy_hint: '點擊複製',
+    qs_1: '使用 <a href="https://app.im.codes">app.im.codes</a> 或自行部署伺服器',
+    qs_2: '執行 <code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code>',
+    qs_3: '開啟面板 —— 你的代理已上線',
+    h_openclaw: '連接 OpenClaw',
+    oc_intro: '如果 OpenClaw 和 daemon 跑在同一台機器上，用下面的命令把 IM.codes 接到本地 OpenClaw gateway：',
+    oc_1: '預設 gateway 位址：<code>ws://127.0.0.1:18789</code>',
+    oc_2: '會自動從 <code>~/.openclaw/openclaw.json</code> 讀取 token，也可傳入 <code>--token</code> 或 <code>OPENCLAW_GATEWAY_TOKEN</code>',
+    oc_3: 'OpenClaw 的 session 和子 session 會自動同步進 IM.codes',
+    oc_4: '設定會保存到 <code>~/.imcodes/openclaw.json</code>，daemon 重啟後可自動重連',
+    oc_5: '使用 <code>imcodes disconnect openclaw</code> 刪除已保存設定',
+    oc_note: '目前只在 macOS 上測試過。遠端明文 <code>ws://</code> 位址需要加上 <code>--insecure</code>。',
+    sh_intro: '在一台機器上部署伺服器和守護程序。需要 Docker 和指向該伺服器的網域。',
+    sh_desc: '自動產生設定、啟動 PostgreSQL + 伺服器 + Caddy（自動 HTTPS）、建立管理員帳戶並綁定本地守護程序。憑證在最後列印。',
+    sh_connect: '連接其他機器：', sh_manual: '手動部署：', sh_manual_pgvector: '產生的 docker-compose.yml 已經預設使用 pgvector/pgvector:pg18 作為 PostgreSQL 映像。',
+    req_os: 'macOS、Linux 或 Windows（原生試驗性；<a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> 完全支援）',
+    req_mux: 'tmux（Linux/macOS/WSL）。Windows 原生使用 ConPTY（內建）。',
+    about_text: '個人專案。幾乎完全由 <a href="https://github.com/anthropics/claude-code">Claude Code</a> 建構，<a href="https://github.com/openai/codex">Codex</a> 和 <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a> 也有重要貢獻。',
+    disclaimer: 'IM.codes 是一個獨立的開源專案，與 Anthropic、OpenAI、Google、阿里巴巴、OpenClaw 或任何其他被提及的公司無任何關聯、認可或贊助關係。所有產品名稱和商標均為其各自擁有者的財產。',
+  },
+  ja: {
+    tagline: 'エージェントのための IM。共有メモリ、OpenSpec Auto Deliver、協調プログラミング、managed MCP tools、そしてクロスモデル監査。',
+    hero_intro: 'IM.codes は coding agent のための、プロバイダーをまたぐ共有メモリレイヤーと管理対象 MCP tool surface です。完了した作業を再利用可能なコンテキストとして蓄積し、適切な履歴を後続 session に注入または recall します。Claude Code、Codex、Gemini、GitHub Copilot、Cursor、OpenCode、Qwen、OpenClaw などに対応し、ターミナル、ファイル閲覧、Git 変更、localhost プレビュー、通知、マルチエージェント連携、transport 系 agent のネイティブストリーミングも備えています。OpenSpec Auto Deliver は変更を proposal/spec 監査から実装、検証ヒント、Team 監査/手戻り、自動モジュール採点、最終 quality gate まで進められます。セッション共有も live agent session を中心に pair / multi-person 協調プログラミングを支えます。内蔵の Auto supervision は完了済みターンを判定し、自律的な継続や監査/手戻りループまで行ったうえで制御を返せます。Team ディスカッションにより、複数のモデルが互いの計画と実装をレビュー・監査し合い、単一モデルの見落とし・盲点・バイアスを効果的に減らします。',
+    // TODO(native-review): JA hero couplet — 默认「天下」(可换「乾坤」);「三人の孔明」措辞待母语者确认
+    couplet_l1: '三人寄れば文殊の知恵。',
+    couplet_l2: 'されど三人の孔明、談笑のうちに天下を定む。',
+    hero_output: 'app.im.codes にバインド完了 · デーモン起動 · システムサービスとして登録',
+    self_host_warning: '<strong>セルフホスティングを強く推奨します。</strong><code>app.im.codes</code> は共有テストインスタンスであり、稼働保証はありません。レート制限、攻撃対象、利用不可の可能性があります。個人プロジェクトのため商用サポートはありません。評価以外の用途では自社インフラにデプロイしてください。',
+    h_screenshots: 'スクリーンショット', h_why: '背景', h_memory: '共有エージェントコンテキスト', h_mcp: 'managed MCP tools', h_not: 'これは何ではないか', h_features: '機能', h_arch: 'アーキテクチャ', h_download: 'ダウンロード', h_install: 'インストール', h_quick: 'クイックスタート', h_selfhost: 'セルフホスト', h_agents: '対応エージェント', h_reqs: '要件', h_about: '概要',
+    also_web: '<a href="https://app.im.codes">ウェブ版</a>もあります',
+    agents_intro: '複数のエージェントが CLI と SDK の両方に対応しています。',
+    memory_intro: 'IM.codes は完了済みの作業を検索可能な記憶として蓄積します。保存されるのは生のプロンプトログではなく、構造化された問題→解決の要約です。関連履歴は新しいメッセージ送信時やセッション起動時に自動で再利用され、その注入内容はタイムラインで確認できます。',
+    memory_1: '個人メモリは既定でローカルに保持され、処理済み要約だけを任意でクラウド同期してデバイス間で共有できます。',
+    memory_2: 'Enterprise Shared Context により、チームは workspace / project 単位で修正知見を再利用し、検索・統計・閲覧 UI から管理できます。これはまだ継続開発中で、完全な本番テストは終わっていません。',
+    memory_3: '多言語リコールはローカル embedding と pgvector ベースのサーバー検索を組み合わせ、異なる言語間でも関連修正を見つけます。',
+    memory_4: 'タイムラインカードには注入内容、関連度スコア、再利用回数、最終使用時刻が表示されます。',
+    mcp_intro: '対応する SDK-backed agent は daemon-managed stdio MCP server を受け取り、runtime-scoped surface で memory、agent messaging、scheduled follow-ups を扱えます。raw auth token や ad hoc shell command は不要です。',
+    mcp_1: '<code>search_memory</code> は過去作業、decisions、preferences、bugs、commits、deployments、議論コンテキストを recall し、compact summaries と <code>projectionId</code> を返します。',
+    mcp_2: '<code>get_memory_sources</code> は、正確な過去指示、bug details、source evidence が重要なとき、関連 memory hit を provenance snippets に展開します。',
+    mcp_3: '<code>save_observation</code> と <code>save_preference</code> は有用な facts と安定した user preferences を保存します。',
+    mcp_4: '<code>send_list_targets</code> と <code>send_message</code> は sibling sessions を見つけ、scoped text、file references、replies、broadcasts を送信します。',
+    mcp_5: '<code>cron_create</code>、<code>cron_list</code>、<code>cron_update</code>、<code>cron_delete</code> は reminders、recurring checks、delegated reviews、follow-ups の future structured sends を管理します。',
+    mcp_6: 'Runtime-bound identity は namespace、user、server、token、routing fields の偽造を防ぎます。provider-level ready/degraded status と redacted recent calls は UI で確認できます。',
+    h_collab: '協調プログラミング',
+    collab_intro: '実行中の tab、sub-session、または source server 全体を scoped collaborative workspace として共有できます。',
+    collab_1: 'viewer は review 用、participant は対象 session に prompt を送るための権限です。',
+    collab_2: 'pair programming や小規模チームの agent supervision に向き、actor 表示と取り消し可能なアクセスを備えます。',
+    h_autodeliver: 'OpenSpec Auto Deliver',
+    autodeliver_intro: 'OpenSpec change folder を supervised delivery run に変えます: proposal/spec audit、実装、検証ヒント、Team audit/rework、自動採点、見える final handoff。',
+    autodeliver_1: 'ワンクリック起動で owning session を解決し、<code>tasks.md</code> を読み、Team lane をロックし、UI に live progress を表示します。',
+    autodeliver_2: '実装前に通常の Team flow で spec audit を実行でき、chat summary ではなく authoritative JSON を使います。',
+    autodeliver_3: 'Implementation prompts は選択した OpenSpec change に集中し、project manifests から安全な validation command 候補を提示します。',
+    autodeliver_4: '自動モジュール採点は <code>spec</code>、<code>tasks</code>、<code>implementation</code>、<code>tests</code>、<code>risk</code> を評価し、evidence は run details に表示されます。',
+    autodeliver_5: 'Fail-closed gates は不正な audit output、limit 到達、manual interference、tasks unreadable で human input を求めます。Auto Deliver は code を stage、commit、push しません。',
+    h_auto: '監督付き実行',
+    auto_intro: 'IM.codes は blind auto-continue に頼らず、対応する transport session をターンごとに監督できます。Auto は直近のターンが完了か、継続か、あなたに制御を返すべきかを判断します。',
+    auto_1: 'セッション単位の Auto モード: Off / Supervised / Supervised + audit。',
+    auto_2: 'idle 境界でターンを complete / continue / ask_human に分類し、次の continue prompt を同じ session に送れます。',
+    auto_3: 'Supervised + audit は制御を返す前に audit→rework ループを回せるので、完了したように見える結果を盲信しません。',
+    auto_4: 'グローバル既定値が新しい session の初期値になります。監督 backend・モデル・timeout を一度だけ設定すれば、各 session は Auto 有効化時にそれをスナップショットし、backend/model/timeout や監査モードを個別に上書きすることもできます。',
+    auto_5: '2 層のカスタム監督指示。グローバルな監督ペルソナと session ごとの追加指示を併用できます。既定では両者を「global ＋ 空行 ＋ session」の順で連結して監督者に送ります。session 側の「Override global」をオンにすると、その session はグローバル値を無視して自分の指示のみを使います。グローバル値を編集しても、すでに Auto 有効な session には次のターンから反映され、再有効化は不要です。',
+    f_memory_name: '共有エージェントコンテキスト',
+    f_memory_desc: '問題→解決の記憶、多言語リコール、メッセージ時/起動時の自動注入をタイムラインで可視化',
+    f_mcp_name: 'managed MCP tools',
+    f_mcp_desc: '10 runtime-scoped tools for memory search/sources, preferences, scoped Send, and Cron scheduling',
+    f_collab_name: '協調プログラミング',
+    f_collab_desc: 'tab/sub-session/source server を scoped に共有し、pair または small-team agent programming を支援',
+    f_autodeliver_name: 'OpenSpec Auto Deliver',
+    f_autodeliver_desc: 'proposal/spec audit → implementation → Team audit/rework、自動採点 spec/tasks/implementation/tests/risk',
+    f_auto_name: '監督付き実行',
+    f_auto_desc: 'transport 系エージェント向けのターン単位完了判定、自動継続、任意の audit→rework ループ',
+    why_text: 'デスクを離れると、多くの coding agent ワークフローは途切れます。エージェントはまだターミナルで動いていても、作業を続けるには SSH、tmux attach、リモートデスクトップ、あるいはラップトップに戻るまで待つしかありません。それは問題の半分にすぎません。難しい agent 作業には、より安定した判断も必要です。単一モデルは型にはまった判断に寄り、問題を見落としたり、provider を切り替えた時に文脈を失ったりします。IM.codes は、常に手元から届く session、完了作業の共有メモリ要約、構造化 Team クロスモデルレビューを組み合わせ、コードが入る前に複数の agent が計画を検証できるようにします。出力を完璧にはしませんが、単一モデルの盲点を減らし、作業の連続性を保ちます。',
+    not_1: '別の AI IDE ではありません', not_2: '単なるチャットラッパーではありません', not_3: '単なるリモートターミナルクライアントではありません', not_4: 'Claude Code、Codex、Gemini CLI、OpenClaw、Qwen の置き換えではありません', not_5: 'それらを取り巻くメッセージング／コントロール層です',
+    f_remote_name: 'リモートターミナル', f_remote_desc: 'ブラウザ＆モバイル、SSH/VPN不要、リアルタイムPTYストリーミング',
+    f_chat_name: 'ターミナル＋チャット', f_chat_desc: 'ネイティブCLIまたは構造化ビュー',
+    f_discuss_name: 'クロスモデル監査', f_discuss_desc: 'カスタマイズ可能なフェーズ（audit、review、brainstorm…）のマルチエージェント Team 議論 — 異なるモデルが実装前に交差レビューし、単一モデルが見落としがちな問題と手戻りを減らします',
+    f_multi_name: 'マルチサーバー', f_multi_desc: '複数マシンのエージェントを一元管理',
+    f_sub_name: 'サブセッション', f_sub_desc: '並列エージェントを即座に起動',
+    f_file_name: 'ファイルブラウザ', f_file_desc: '閲覧、アップロード/ダウンロード、Git差分、安全なHTMLクイックプレビュー、ローカル画像のインラインプレビューと拡大表示',
+    f_mobile_name: 'モバイル＆通知', f_mobile_desc: '生体認証、エージェントが注意を必要とする時にプッシュ通知',
+    f_ota_name: 'OTAアップデート', f_ota_desc: 'Web UIからデーモンを更新',
+    f_stream_name: 'リアルタイムストリーム', f_stream_desc: 'ポーリングなし、メッセージ制限なし',
+    f_self_name: 'セルフホスト', f_self_desc: '自分のインフラ、自分のデータ、ワンコマンドデプロイ',
+    f_streaming_name: 'CLI + SDK 接続',
+    f_streaming_desc: '複数のエージェントが CLI と SDK の両方に対応しています。OpenClaw と Qwen は引き続きネイティブストリーミング、ツール追跡、セッション復元を提供します。',
+    f_sidebar_name: 'Discordスタイルサイドバー',
+    f_sidebar_desc: 'サーバーアイコン、セッションツリー、未読バッジ',
+    f_picker_name: '@ ピッカー',
+    f_picker_desc: '@ファイル、@@エージェント、@@all(config)',
+    f_pin_name: 'ピン留めパネル',
+    f_pin_desc: 'ウィンドウをサイドバーにドラッグ、クロスデバイス同期',
+    f_repo_name: 'リポジトリダッシュボード',
+    f_repo_desc: 'Issues、PR、ブランチ、コミット、CI/CD',
+    f_cron_name: 'スケジュールタスク',
+    f_cron_desc: 'Cron 定期自動化、タイムゾーン対応、実行履歴からセッションへジャンプ',
+    f_preview_name: 'ローカルプレビュー',
+    f_preview_desc: 'セキュアトンネルで localhost をプレビュー、HMR 対応',
+    f_sync_name: 'クロスデバイス同期',
+    f_sync_desc: 'タブ順序、ピン留めタブ・パネルをサーバーに同期',
+    f_i18n_name: '7言語',
+    f_i18n_desc: 'EN, 中文, 繁體, ES, RU, JA, KO',
+    arch_desc: 'デーモンは開発マシンで動作し、tmux で process-backed session を、SDK とネットワークプロトコルで transport-backed session を管理します。対応 SDK provider 向けの runtime-scoped memory、Send、Cron tools を提供する managed MCP server もデーモンが所有します。サーバーはデバイスとデーモン間の接続を中継します。すべてのデータは自社インフラ内に留まります。',
+    copy_hint: 'クリックでコピー',
+    qs_1: '<a href="https://app.im.codes">app.im.codes</a> を使用するか、サーバーをセルフホスト',
+    qs_2: '<code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code> を実行',
+    qs_3: 'ダッシュボードを開く — エージェントが稼働中',
+    h_openclaw: 'openclaw connect',
+    oc_intro: 'If OpenClaw is running on the same machine as the daemon, connect IM.codes to the local OpenClaw gateway with:',
+    oc_1: 'Default gateway URL: <code>ws://127.0.0.1:18789</code>',
+    oc_2: 'Token auto-detected from <code>~/.openclaw/openclaw.json</code>, or pass <code>--token</code> / <code>OPENCLAW_GATEWAY_TOKEN</code>',
+    oc_3: 'OpenClaw sessions and child sessions sync into IM.codes automatically',
+    oc_4: 'Saved to <code>~/.imcodes/openclaw.json</code> so the daemon can reconnect automatically',
+    oc_5: 'Use <code>imcodes disconnect openclaw</code> to remove the saved config',
+    oc_note: 'Only tested on macOS so far. Remote plain-text <code>ws://</code> URLs require <code>--insecure</code>.',
+    sh_intro: '1台のマシンにサーバーとデーモンをデプロイ。DockerとDNS設定済みのドメインが必要です。',
+    sh_desc: '設定を自動生成、PostgreSQL + サーバー + Caddy（自動HTTPS）を起動、管理者アカウントを作成しローカルデーモンをバインド。認証情報は最後に表示されます。',
+    sh_connect: '追加マシンの接続：', sh_manual: '手動セットアップ：', sh_manual_pgvector: '生成される docker-compose.yml は PostgreSQL に pgvector/pgvector:pg18 を使用します。',
+    req_os: 'macOS、Linux、または Windows（ネイティブは実験的、<a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> は完全対応）',
+    req_mux: 'tmux（Linux/macOS/WSL）。Windows ネイティブは ConPTY（組み込み）を使用。',
+    about_text: '個人プロジェクト。ほぼ全てを <a href="https://github.com/anthropics/claude-code">Claude Code</a> が構築、<a href="https://github.com/openai/codex">Codex</a> と <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a> も重要な貢献。',
+    disclaimer: 'IM.codes は独立したオープンソースプロジェクトであり、Anthropic、OpenAI、Google、Alibaba、OpenClaw、またはその他の言及された企業との提携、承認、スポンサーシップはありません。すべての製品名および商標は各所有者に帰属します。',
+  },
+  ko: {
+    tagline: '에이전트를 위한 IM. 공유 메모리, OpenSpec Auto Deliver, 협업 코딩, managed MCP tools, 그리고 교차 감사.',
+    hero_intro: 'IM.codes는 coding agent를 위한, provider를 가로지르는 공유 메모리 레이어이자 관리형 MCP tool surface입니다. 완료된 작업을 재사용 가능한 컨텍스트로 축적하고, 적절한 기록을 이후 session에 주입하거나 recall합니다. Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw 등을 지원하며, 터미널, 파일 브라우징, Git 보기, localhost 미리보기, 알림, 멀티 에이전트 워크플로우, transport 기반 agent의 네이티브 스트리밍 출력도 함께 제공합니다. OpenSpec Auto Deliver는 변경을 proposal/spec 감사부터 구현, 검증 힌트, Team 감사/재작업, 자동 모듈 채점, 최종 quality gate까지 진행할 수 있습니다. 세션 공유도 live agent session 중심의 pair 또는 multi-person 협업 코딩을 지원합니다. 내장된 Auto supervision은 완료된 턴을 판정하고, 자동 계속과 감사/재작업 루프까지 수행한 뒤 제어를 돌려줄 수 있습니다. Team 토론 기능은 여러 모델이 서로의 계획과 구현을 리뷰하고 감사하여, 단일 모델의 누락·맹점·편향을 효과적으로 줄입니다.',
+    // TODO(native-review): KO hero couplet — 第一句「백지장도 맞들면 낫다」承接弱,待母语者重写;默认「천하」
+    couplet_l1: '백지장도 맞들면 낫다.',
+    couplet_l2: '허나 세 명의 제갈량, 담소 속에 천하를 정한다.',
+    hero_output: 'app.im.codes에 바인딩 완료 · 데몬 시작됨 · 시스템 서비스로 등록됨',
+    self_host_warning: '<strong>셀프 호스팅을 강력히 권장합니다.</strong> <code>app.im.codes</code>는 공유 테스트 인스턴스로 가동 보장이 없으며, 속도 제한, 공격 대상이 되거나 사용 불가할 수 있습니다. 개인 프로젝트로 상업적 지원은 제공되지 않습니다. 평가 이외의 용도에는 자체 인프라에 배포하세요.',
+    h_screenshots: '스크린샷', h_why: '배경', h_memory: '공유 에이전트 컨텍스트', h_mcp: 'managed MCP tools', h_not: '무엇이 아닌가', h_features: '기능', h_arch: '아키텍처', h_download: '다운로드', h_install: '설치', h_quick: '빠른 시작', h_selfhost: '셀프 호스팅', h_agents: '지원 에이전트', h_reqs: '요구사항', h_about: '소개',
+    also_web: '<a href="https://app.im.codes">웹 앱</a>으로도 이용 가능', watch_intro: 'Watch 지원으로 손목에서 세션 목록, 읽지 않음 수, OTA 업데이트 상태, 푸시 알림, 빠른 답장을 확인할 수 있습니다.', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Watch 앱은 세션 목록, 읽지 않음 수, 빠른 답장을 제공합니다.',
+    agents_intro: '여러 에이전트가 CLI와 SDK 두 방식 모두를 지원합니다.',
+    memory_intro: 'IM.codes는 완료된 작업을 검색 가능한 메모리로 계속 축적합니다. 저장되는 것은 원시 프롬프트 로그가 아니라 구조화된 문제→해결 요약입니다. 관련 기록은 새 메시지 전송과 세션 시작 시 자동으로 재사용되며, 어떤 내용이 주입됐는지도 타임라인에서 확인할 수 있습니다.',
+    memory_1: '개인 메모리는 기본적으로 로컬에 남고, 처리된 요약만 선택적으로 클라우드에 동기화해 여러 기기에서 공유할 수 있습니다.',
+    memory_2: 'Enterprise Shared Context를 통해 팀은 workspace / project 범위에서 수정 경험을 재사용하고, 검색·통계·조회 UI로 관리할 수 있습니다. 이 부분은 아직 계속 개발 중이며 완전한 프로덕션 테스트는 끝나지 않았습니다.',
+    memory_3: '다국어 리콜은 로컬 embedding과 pgvector 기반 서버 검색을 결합해 서로 다른 언어 사이에서도 관련 수정 이력을 찾습니다.',
+    memory_4: '타임라인 카드는 무엇이 주입됐는지와 함께 관련성 점수, 재호출 횟수, 마지막 사용 시각을 보여줍니다.',
+    mcp_intro: '지원되는 SDK-backed agent는 daemon-managed stdio MCP server를 받아 runtime-scoped surface에서 memory, agent messaging, scheduled follow-ups를 처리합니다. raw auth token이나 ad hoc shell command는 필요 없습니다.',
+    mcp_1: '<code>search_memory</code>는 과거 작업, decisions, preferences, bugs, commits, deployments, 논의 컨텍스트를 recall하고 compact summaries와 <code>projectionId</code>를 반환합니다.',
+    mcp_2: '<code>get_memory_sources</code>는 정확한 과거 지시, bug details, source evidence가 중요할 때 관련 memory hit를 provenance snippets로 확장합니다.',
+    mcp_3: '<code>save_observation</code>와 <code>save_preference</code>는 유용한 facts와 안정적인 user preferences를 저장합니다.',
+    mcp_4: '<code>send_list_targets</code>와 <code>send_message</code>는 sibling sessions를 찾고 scoped text, file references, replies, broadcasts를 보냅니다.',
+    mcp_5: '<code>cron_create</code>, <code>cron_list</code>, <code>cron_update</code>, <code>cron_delete</code>는 reminders, recurring checks, delegated reviews, follow-ups용 future structured sends를 관리합니다.',
+    mcp_6: 'Runtime-bound identity는 namespace, user, server, token, routing fields 위조를 막습니다. provider-level ready/degraded status와 redacted recent calls는 UI에서 계속 보입니다.',
+    h_collab: '협업 코딩',
+    collab_intro: '실시간 tab, sub-session, 전체 source server를 범위 있는 협업 공간으로 공유합니다.',
+    collab_1: 'viewer는 review용이고 participant는 대상 session에 prompt를 보낼 수 있습니다.',
+    collab_2: 'pair programming이나 소규모 agent supervision에 적합하며 actor 표시와 취소 가능한 접근을 제공합니다.',
+    h_autodeliver: 'OpenSpec Auto Deliver',
+    autodeliver_intro: 'OpenSpec change folder를 supervised delivery run으로 바꿉니다: proposal/spec audit, 구현, 검증 힌트, Team audit/rework, 자동 채점, 보이는 final handoff.',
+    autodeliver_1: '원클릭 launch는 owning session을 해석하고, <code>tasks.md</code>를 읽고, Team lane을 잠그며, UI에 live progress를 유지합니다.',
+    autodeliver_2: '구현 전 spec audit은 일반 Team flow로 실행할 수 있고, chat summary가 아니라 authoritative JSON을 사용합니다.',
+    autodeliver_3: 'Implementation prompts는 선택한 OpenSpec change에 집중하고 project manifests에서 안전한 validation command 후보를 보여줍니다.',
+    autodeliver_4: '자동 모듈 채점은 <code>spec</code>, <code>tasks</code>, <code>implementation</code>, <code>tests</code>, <code>risk</code>를 평가하며 evidence는 run details에 표시됩니다.',
+    autodeliver_5: 'Fail-closed gates는 잘못된 audit output, exhausted limits, manual interference, unreadable tasks에서 human input을 요청합니다. Auto Deliver는 code를 stage, commit, push하지 않습니다.',
+    h_auto: '감독된 실행',
+    auto_intro: 'IM.codes는 blind auto-continue에 의존하지 않고 지원되는 transport session을 턴 단위로 감독할 수 있습니다. Auto는 최근 턴이 끝났는지, 더 진행해야 하는지, 아니면 제어를 사용자에게 돌려줘야 하는지 판단합니다.',
+    auto_1: '세션별 Auto 모드: Off, Supervised, Supervised + audit.',
+    auto_2: 'idle 경계에서 턴을 complete, continue, ask_human으로 분류하고 다음 continue prompt를 같은 session에 보낼 수 있습니다.',
+    auto_3: 'Supervised + audit는 제어를 돌려주기 전에 audit→rework 루프를 실행해, 겉보기 완료 결과를 그대로 믿지 않게 합니다.',
+    auto_4: '전역 기본값이 새 session을 미리 채웁니다. 기본 supervisor 백엔드·모델·타임아웃을 한 번만 설정하면, 각 session은 Auto를 켤 때 이를 스냅샷하고 이후에도 백엔드/모델/타임아웃과 audit 모드를 개별적으로 재정의할 수 있습니다.',
+    auto_5: '2단 사용자 지정 감독 지침. 전역 감독 페르소나와 세션별 추가 지침을 함께 쓸 수 있습니다. 기본값은 global + 빈 줄 + session 형태로 합쳐져 감독자에게 전송됩니다. 세션의 「Override global」을 체크하면 그 세션은 전역 값을 무시하고 자체 지침만 사용합니다. 전역 값을 수정해도 이미 Auto가 켜진 세션은 다음 턴부터 반영되며 재활성화가 필요하지 않습니다.',
+    f_memory_name: '공유 에이전트 컨텍스트',
+    f_memory_desc: '문제→해결 메모리, 다국어 리콜, 메시지/시작 시 자동 주입을 타임라인에서 가시화',
+    f_mcp_name: 'managed MCP tools',
+    f_mcp_desc: '10 runtime-scoped tools for memory search/sources, preferences, scoped Send, and Cron scheduling',
+    f_collab_name: '협업 코딩',
+    f_collab_desc: 'tab/sub-session/source server를 범위 있게 공유해 pair 또는 소규모 agent programming 지원',
+    f_autodeliver_name: 'OpenSpec Auto Deliver',
+    f_autodeliver_desc: 'proposal/spec audit → implementation → Team audit/rework, spec/tasks/implementation/tests/risk 자동 채점',
+    f_auto_name: '감독된 실행',
+    f_auto_desc: 'transport 에이전트를 위한 턴 단위 완료 판정, 자동 계속, 선택적 audit→rework 루프',
+    why_text: '책상을 떠나면 대부분의 coding agent 워크플로우는 끊깁니다. 에이전트는 여전히 터미널에서 돌아가지만, 작업을 이어가려면 보통 SSH, tmux attach, 원격 데스크톱을 쓰거나 노트북 앞으로 돌아갈 때까지 기다려야 합니다. 그것은 문제의 절반일 뿐입니다. 어려운 agent 작업에는 더 안정적인 판단도 필요합니다. 단일 모델은 익숙한 패턴에 갇히거나 문제를 놓치고, provider를 바꿀 때 컨텍스트가 끊길 수 있습니다. IM.codes는 언제든 닿을 수 있는 session, 완료된 작업의 공유 메모리 요약, 구조화된 Team 크로스 모델 리뷰를 함께 제공해 코드가 반영되기 전 여러 agent가 계획을 검토하게 합니다. 출력을 완벽하게 만들지는 않지만 단일 모델의 맹점을 줄이고 작업의 연속성을 지킵니다.',
+    not_1: '또 다른 AI IDE가 아닙니다', not_2: '단순한 채팅 래퍼가 아닙니다', not_3: '단순한 원격 터미널 클라이언트가 아닙니다', not_4: 'Claude Code, Codex, Gemini CLI, OpenClaw, Qwen의 대체품이 아닙니다', not_5: '그들을 둘러싼 메시징/컨트롤 레이어입니다',
+    f_remote_name: '원격 터미널', f_remote_desc: '브라우저 & 모바일, SSH/VPN 불필요, 실시간 PTY 스트리밍',
+    f_chat_name: '터미널 + 채팅', f_chat_desc: '네이티브 CLI 또는 구조화된 뷰',
+    f_discuss_name: '크로스 모델 감사', f_discuss_desc: '커스터마이징 가능한 페이즈(audit, review, brainstorm…)의 멀티 에이전트 Team 토론 — 서로 다른 모델이 코드 작성 전 교차 검토해 단일 모델이 자주 놓치는 문제와 재작업을 줄입니다',
+    f_multi_name: '멀티 서버', f_multi_desc: '하나의 대시보드에서 모든 머신의 에이전트 관리',
+    f_sub_name: '서브 세션', f_sub_desc: '병렬 에이전트 즉시 생성',
+    f_file_name: '파일 브라우저', f_file_desc: '탐색, 업로드/다운로드, Git 차이, 안전한 HTML 빠른 미리보기, 로컬 이미지 인라인 미리보기와 확대',
+    f_mobile_name: '모바일 & 알림', f_mobile_desc: '생체 인증, 에이전트가 주의를 필요로 할 때 푸시 알림',
+    f_ota_name: 'OTA 업데이트', f_ota_desc: '웹 UI에서 데몬 업그레이드',
+    f_stream_name: '실시간 스트림', f_stream_desc: '폴링 없음, 메시지 제한 없음',
+    f_self_name: '셀프 호스팅', f_self_desc: '내 인프라, 내 데이터, 원커맨드 배포',
+    f_streaming_name: 'CLI + SDK 연결',
+    f_streaming_desc: '여러 에이전트가 CLI와 SDK 두 방식 모두를 지원합니다. OpenClaw와 Qwen은 계속해서 네이티브 스트리밍, 도구 추적, 세션 복원을 제공합니다.',
+    f_sidebar_name: 'Discord 스타일 사이드바',
+    f_sidebar_desc: '서버 아이콘, 세션 트리, 읽지 않은 배지',
+    f_picker_name: '@ 피커',
+    f_picker_desc: '@파일, @@에이전트, @@all(config) 그룹 디스패치',
+    f_pin_name: '고정 패널',
+    f_pin_desc: '창을 사이드바로 드래그, 크로스 디바이스 동기화',
+    f_repo_name: '리포지토리 대시보드',
+    f_repo_desc: 'Issues, PR, 브랜치, 커밋, CI/CD',
+    f_cron_name: '예약 작업',
+    f_cron_desc: 'Cron 자동화, 시간대 인식, 실행 기록에서 세션으로 이동',
+    f_preview_name: '로컬 웹 미리보기',
+    f_preview_desc: '보안 터널로 localhost 미리보기, HMR 지원',
+    f_sync_name: '크로스 디바이스 동기화',
+    f_sync_desc: '탭 순서, 고정 탭 및 패널 서버 동기화',
+    f_i18n_name: '7개 언어',
+    f_i18n_desc: 'EN, 中文, 繁體, ES, RU, JA, KO',
+    arch_desc: '데몬은 개발 머신에서 실행되며 tmux로 process-backed session을, SDK와 네트워크 프로토콜로 transport-backed session을 관리합니다. 또한 지원되는 SDK provider를 위한 runtime-scoped memory, Send, Cron tools를 제공하는 managed MCP server를 소유합니다. 서버는 디바이스와 데몬 간의 연결을 중계합니다. 모든 데이터는 자체 인프라에 유지됩니다.',
+    copy_hint: '클릭하여 복사',
+    qs_1: '<a href="https://app.im.codes">app.im.codes</a> 사용 또는 서버 셀프 호스팅',
+    qs_2: '<code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code> 실행',
+    qs_3: '대시보드 열기 — 에이전트가 실행 중',
+    h_openclaw: 'openclaw connect',
+    oc_intro: 'If OpenClaw is running on the same machine as the daemon, connect IM.codes to the local OpenClaw gateway with:',
+    oc_1: 'Default gateway URL: <code>ws://127.0.0.1:18789</code>',
+    oc_2: 'Token auto-detected from <code>~/.openclaw/openclaw.json</code>, or pass <code>--token</code> / <code>OPENCLAW_GATEWAY_TOKEN</code>',
+    oc_3: 'OpenClaw sessions and child sessions sync into IM.codes automatically',
+    oc_4: 'Saved to <code>~/.imcodes/openclaw.json</code> so the daemon can reconnect automatically',
+    oc_5: 'Use <code>imcodes disconnect openclaw</code> to remove the saved config',
+    oc_note: 'Only tested on macOS so far. Remote plain-text <code>ws://</code> URLs require <code>--insecure</code>.',
+    sh_intro: '단일 머신에 서버와 데몬을 배포합니다. Docker와 서버를 가리키는 도메인이 필요합니다.',
+    sh_desc: '모든 설정 자동 생성, PostgreSQL + 서버 + Caddy(자동 HTTPS) 시작, 관리자 계정 생성 및 로컬 데몬 바인딩. 자격 증명은 마지막에 출력됩니다.',
+    sh_connect: '추가 머신 연결:', sh_manual: '수동 설정:', sh_manual_pgvector: '생성되는 docker-compose.yml 은 PostgreSQL 이미지로 pgvector/pgvector:pg18 을 사용합니다.',
+    req_os: 'macOS, Linux 또는 Windows (네이티브 실험적; <a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> 완전 지원)',
+    req_mux: 'tmux (Linux/macOS/WSL). Windows 네이티브는 ConPTY (기본 내장) 사용.',
+    about_text: '개인 프로젝트. 거의 전적으로 <a href="https://github.com/anthropics/claude-code">Claude Code</a>가 구축, <a href="https://github.com/openai/codex">Codex</a>와 <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>도 중요한 기여.',
+    disclaimer: 'IM.codes는 독립적인 오픈소스 프로젝트로, Anthropic, OpenAI, Google, Alibaba, OpenClaw 또는 언급된 다른 회사와 제휴, 보증 또는 후원 관계가 없습니다. 모든 제품 이름과 상표는 각 소유자의 자산입니다.',
+  },
+  es: {
+    tagline: 'El IM para agentes. Memoria compartida, OpenSpec Auto Deliver, programación colaborativa, herramientas MCP gestionadas y auditoría cruzada.',
+    hero_intro: 'IM.codes ofrece a los coding agents una capa de memoria compartida entre providers y una superficie MCP gestionada. Convierte el trabajo completado en contexto reutilizable y vuelve a inyectar o recuperar el historial adecuado en sesiones futuras para Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw y más. OpenSpec Auto Deliver puede llevar un cambio desde auditoría de propuesta/spec hasta implementación, sugerencias de validación, auditoría/retrabajo Team, scoring automático por módulo y quality gates finales. El uso compartido de sesión también permite programación colaborativa pair o multi-persona alrededor de sesiones agent en vivo. Auto supervision integrado puede juzgar los turnos completados, seguir trabajando de forma autónoma y, si quieres, ejecutar un bucle de auditoría y retrabajo antes de devolverte el control. La discusión Team integrada permite que varios modelos revisen y auditen los planes y las implementaciones de los demás, reduciendo de forma eficaz las omisiones, puntos ciegos y sesgos de un solo modelo.',
+    hero_output: 'vinculado a app.im.codes · daemon iniciado · registrado como servicio del sistema',
+    self_host_warning: '<strong>Se recomienda encarecidamente el autoalojamiento.</strong> <code>app.im.codes</code> es una instancia de prueba compartida sin garantías de disponibilidad — puede tener límites, ser objetivo de ataques o no estar disponible. Este es un proyecto personal sin soporte comercial. Para uso más allá de la evaluación, despliega en tu propia infraestructura.',
+    h_screenshots: 'capturas', h_why: 'por qué', h_memory: 'contexto compartido para agentes', h_mcp: 'herramientas MCP gestionadas', h_not: 'qué no es', h_features: 'características', h_arch: 'arquitectura', h_download: 'descargar', h_install: 'instalar', h_quick: 'inicio rápido', h_selfhost: 'autoalojamiento', h_agents: 'agentes compatibles', h_reqs: 'requisitos', h_about: 'acerca de',
+    also_web: 'También disponible como <a href="https://app.im.codes">app web</a>', watch_intro: 'La compatibilidad con Watch cubre monitoreo rápido de sesiones, contadores de no leídos, visibilidad de actualizaciones OTA, notificaciones push y respuestas rápidas desde la muñeca.', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'La app de Watch incluye lista de sesiones, contadores de no leídos y respuestas rápidas.',
+    agents_intro: 'Varios agentes admiten integración tanto por CLI como por SDK.',
+    memory_intro: 'IM.codes convierte el trabajo ya resuelto en memoria reutilizable y buscable. Guarda resúmenes estructurados de problema→solución en lugar de logs crudos de prompts. El historial relevante se recupera automáticamente para nuevos mensajes y al iniciar sesiones, y cada inyección queda visible en la línea de tiempo.',
+    memory_1: 'La memoria personal permanece local por defecto, con sincronización opcional a la nube solo para resúmenes procesados entre tus dispositivos.',
+    memory_2: 'El contexto compartido empresarial permite reutilizar soluciones entre workspaces y proyectos con memoria consultable, estadísticas y UI de inspección. Esta parte sigue en desarrollo activo y todavía no ha pasado pruebas completas de producción.',
+    memory_3: 'La recuperación multilingüe combina embeddings locales con búsqueda del lado del servidor basada en pgvector para encontrar soluciones relacionadas entre distintos idiomas.',
+    memory_4: 'Las tarjetas de la línea de tiempo muestran exactamente qué se inyectó, junto con puntuación de relevancia, número de recuperaciones y último uso.',
+    mcp_intro: 'Los agentes compatibles basados en SDK reciben un servidor stdio MCP gestionado por el daemon, con una superficie de runtime para memoria, mensajería de agentes y seguimientos programados, sin tokens crudos ni comandos shell improvisados.',
+    mcp_1: '<code>search_memory</code> recupera trabajo previo, decisiones, preferencias, bugs, commits, despliegues y contexto discutido, devolviendo resúmenes compactos y valores <code>projectionId</code>.',
+    mcp_2: '<code>get_memory_sources</code> expande un hit de memoria relevante en fragmentos de procedencia cuando importan instrucciones previas exactas, detalles de bugs o evidencia fuente.',
+    mcp_3: '<code>save_observation</code> y <code>save_preference</code> persisten hechos útiles y preferencias estables del usuario.',
+    mcp_4: '<code>send_list_targets</code> y <code>send_message</code> permiten descubrir sesiones hermanas y enviar texto con alcance, referencias de archivos, respuestas o broadcasts.',
+    mcp_5: '<code>cron_create</code>, <code>cron_list</code>, <code>cron_update</code> y <code>cron_delete</code> gestionan envíos estructurados futuros para recordatorios, comprobaciones recurrentes, reviews delegadas y follow-ups.',
+    mcp_6: 'La identidad de runtime impide falsificar namespace, user, server, token o routing fields; el estado ready/degraded por provider y las llamadas recientes redactadas quedan visibles en la UI.',
+    h_collab: 'programación colaborativa',
+    collab_intro: 'Comparte un tab, sub-sesión o source server como workspace colaborativo con alcance.',
+    collab_1: 'Viewer sirve para review; participant puede enviar prompts a las sesiones cubiertas.',
+    collab_2: 'Funciona para pair programming o supervisión agent en grupos pequeños, con actor labels y acceso revocable.',
+    h_autodeliver: 'OpenSpec Auto Deliver',
+    autodeliver_intro: 'Convierte un OpenSpec change folder en una entrega supervisada: auditoría proposal/spec, implementación, sugerencias de validación, auditoría/retrabajo Team, scoring automático y handoff final visible.',
+    autodeliver_1: 'El lanzamiento con un clic resuelve la sesión propietaria, lee <code>tasks.md</code>, bloquea el carril Team y mantiene progreso vivo en la UI.',
+    autodeliver_2: 'La auditoría spec puede ejecutarse antes de implementar mediante el flujo Team normal, usando JSON autoritativo en vez de confiar en resúmenes de chat.',
+    autodeliver_3: 'Los prompts de implementación se enfocan en el cambio OpenSpec seleccionado y muestran candidatos seguros de validación desde manifests del proyecto.',
+    autodeliver_4: 'El scoring automático evalúa <code>spec</code>, <code>tasks</code>, <code>implementation</code>, <code>tests</code> y <code>risk</code>, con evidencia visible en los detalles.',
+    autodeliver_5: 'Los gates fail-closed piden intervención humana ante audit output inválido, límites agotados, interferencia manual o tareas ilegibles. Auto Deliver nunca hace stage, commit ni push.',
+    h_auto: 'ejecución supervisada',
+    auto_intro: 'IM.codes puede supervisar sesión por sesión los transport sessions compatibles en lugar de depender de un auto-continue ciego. Auto comprueba si el último turno ya terminó, debe continuar o debe devolverte el control.',
+    auto_1: 'Modos Auto por sesión: Off, Supervised y Supervised + audit.',
+    auto_2: 'En el límite idle, Auto puede clasificar un turno como complete, continue o ask_human y enviar el siguiente continue prompt dentro de la misma session.',
+    auto_3: 'Supervised + audit puede ejecutar un bucle audit→rework antes de devolverte el control, así que el trabajo terminado se revisa en lugar de confiarse a ciegas.',
+    auto_4: 'Los valores globales predeterminados se aplican a las nuevas sesiones. Define una sola vez el backend, modelo y timeout del supervisor: cada sesión los captura al activar Auto y puede seguir sobrescribiendo backend/modelo/timeout y modo de auditoría individualmente.',
+    auto_5: 'Instrucciones de supervisión personalizadas en dos capas. Mantén una persona global de supervisión y añade lo específico por sesión — por defecto ambas se concatenan (global + línea en blanco + sesión) al enviarse al supervisor. Marca la casilla «Override global» de una sesión para que ignore el valor global. Al editar la persona global, el cambio se aplica a las sesiones ya activadas en el siguiente turno sin reactivar Auto.',
+    f_memory_name: 'contexto compartido para agentes',
+    f_memory_desc: 'memoria problema→solución, recuperación multilingüe e inyección automática por mensaje y al iniciar, visible en la línea de tiempo',
+    f_mcp_name: 'herramientas MCP gestionadas',
+    f_mcp_desc: 'diez herramientas con alcance de runtime para búsqueda/fuentes de memoria, preferencias, Send con alcance y programación Cron',
+    f_collab_name: 'programación colaborativa',
+    f_collab_desc: 'sharing con alcance de tabs/sub-sesiones/source servers para pair o small-group agent programming',
+    f_autodeliver_name: 'OpenSpec Auto Deliver',
+    f_autodeliver_desc: 'auditoría proposal/spec → implementación → auditoría/retrabajo Team, con scoring automático spec/tasks/implementation/tests/risk',
+    f_auto_name: 'ejecución supervisada',
+    f_auto_desc: 'comprobaciones de finalización por turno, auto-continue y bucles opcionales audit→rework para agentes transport',
+    why_text: 'Cuando te alejas del escritorio, la mayoría de los flujos con coding agents se rompen. El agente sigue ejecutándose en una terminal, pero continuar suele significar usar SSH, tmux attach, escritorio remoto o esperar a volver al portátil. Esa es solo la mitad del problema. El trabajo difícil con agents también necesita mejor criterio: un solo modelo puede caer en patrones, pasar por alto problemas o perder contexto al cambiar de provider. IM.codes combina sesiones siempre accesibles, memoria compartida de trabajo completado resumido y revisión Team estructurada entre modelos para que varios agentes cuestionen los planes antes de que el código aterrice. No vuelve perfecto el resultado, pero reduce puntos ciegos de un solo modelo y mantiene la continuidad.',
+    not_1: 'No es otro AI IDE', not_2: 'No es solo un wrapper de chat', not_3: 'No es solo un cliente de terminal remota', not_4: 'No reemplaza a Claude Code, Codex, Gemini CLI, OpenClaw ni Qwen', not_5: 'Es la capa de mensajería/control alrededor de ellos',
+    f_remote_name: 'terminal remota', f_remote_desc: 'navegador y móvil, sin SSH/VPN, streaming PTY en tiempo real',
+    f_chat_name: 'terminal + chat', f_chat_desc: 'CLI nativo o vista estructurada con llamadas de herramientas',
+    f_discuss_name: 'auditoría cross-modelo', f_discuss_desc: 'discusiones Team multi-agente con fases personalizables (audit, review, brainstorm…) — distintos modelos detectan distintos problemas antes de escribir código, reduciendo retrabajo',
+    f_multi_name: 'multi-servidor', f_multi_desc: 'gestiona agentes en todas las máquinas desde un panel',
+    f_sub_name: 'sub-sesiones', f_sub_desc: 'lanza agentes paralelos al instante',
+    f_file_name: 'explorador de archivos', f_file_desc: 'explorar, subir/descargar, diffs de Git, vista previa HTML segura, imágenes locales en línea con zoom flotante',
+    f_mobile_name: 'móvil, watch y notificaciones', f_mobile_desc: 'auth biométrica, push y respuestas rápidas desde el watch',
+    f_ota_name: 'actualizaciones OTA', f_ota_desc: 'actualiza daemons desde la interfaz web',
+    f_stream_name: 'stream en tiempo real', f_stream_desc: 'sin polling, sin límite de mensajes',
+    f_self_name: 'autoalojado', f_self_desc: 'tu infraestructura, tus datos, despliegue con un comando',
+    f_streaming_name: 'acceso CLI + SDK',
+    f_streaming_desc: 'Varios agentes admiten integración tanto por CLI como por SDK. OpenClaw y Qwen siguen ofreciendo streaming nativo, seguimiento de herramientas y restauración de sesión.',
+    f_sidebar_name: 'barra lateral estilo Discord',
+    f_sidebar_desc: 'iconos de servidor, árbol de sesiones, insignias no leídas',
+    f_picker_name: 'selector @',
+    f_picker_desc: '@archivos, @@agentes, @@all(config)',
+    f_pin_name: 'paneles fijables',
+    f_pin_desc: 'arrastra ventanas a la barra lateral, sincronización multi-dispositivo',
+    f_repo_name: 'panel de repositorio',
+    f_repo_desc: 'issues, PRs, ramas, commits, CI/CD',
+    f_cron_name: 'tareas programadas',
+    f_cron_desc: 'automatización cron, zona horaria, historial de ejecución con salto a sesión',
+    f_preview_name: 'vista previa local',
+    f_preview_desc: 'vista previa de localhost por túnel seguro, soporta HMR',
+    f_sync_name: 'sincronización multi-dispositivo',
+    f_sync_desc: 'orden de pestañas, pestañas y paneles fijados sincronizados',
+    f_i18n_name: '7 idiomas',
+    f_i18n_desc: 'EN, 中文, 繁體, ES, RU, JA, KO',
+    arch_desc: 'El daemon se ejecuta en tu máquina de desarrollo y gestiona sesiones process-backed con tmux, además de sesiones transport-backed mediante SDKs y protocolos de red. También aloja el servidor MCP gestionado que ofrece herramientas de memoria, Send y Cron con alcance runtime para providers SDK compatibles. El servidor retransmite conexiones entre tus dispositivos y el daemon. Todo permanece en tu infraestructura.',
+    copy_hint: 'clic para copiar',
+    qs_1: 'Usa <a href="https://app.im.codes">app.im.codes</a> o autoaloja el servidor',
+    qs_2: 'Ejecuta <code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code>',
+    qs_3: 'Abre el panel — tus agentes están activos',
+    h_openclaw: 'openclaw connect',
+    oc_intro: 'If OpenClaw is running on the same machine as the daemon, connect IM.codes to the local OpenClaw gateway with:',
+    oc_1: 'Default gateway URL: <code>ws://127.0.0.1:18789</code>',
+    oc_2: 'Token auto-detected from <code>~/.openclaw/openclaw.json</code>, or pass <code>--token</code> / <code>OPENCLAW_GATEWAY_TOKEN</code>',
+    oc_3: 'OpenClaw sessions and child sessions sync into IM.codes automatically',
+    oc_4: 'Saved to <code>~/.imcodes/openclaw.json</code> so the daemon can reconnect automatically',
+    oc_5: 'Use <code>imcodes disconnect openclaw</code> to remove the saved config',
+    oc_note: 'Only tested on macOS so far. Remote plain-text <code>ws://</code> URLs require <code>--insecure</code>.',
+    sh_intro: 'Despliega servidor + daemon en una sola máquina. Requiere Docker y un dominio con DNS apuntando al servidor.',
+    sh_desc: 'Genera toda la configuración, inicia PostgreSQL + servidor + Caddy con HTTPS automático, crea la cuenta admin y vincula el daemon local. Las credenciales se imprimen al final.',
+    sh_connect: 'Para conectar máquinas adicionales:', sh_manual: 'Configuración manual:', sh_manual_pgvector: 'El docker-compose.yml generado ya usa pgvector/pgvector:pg18 para PostgreSQL.',
+    req_os: 'macOS, Linux o Windows (nativo experimental; <a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> totalmente soportado)',
+    req_mux: 'tmux (Linux/macOS/WSL). Windows nativo usa ConPTY (integrado).',
+    about_text: 'Proyecto personal. Construido casi en su totalidad por <a href="https://github.com/anthropics/claude-code">Claude Code</a>, con contribuciones de <a href="https://github.com/openai/codex">Codex</a> y <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>.',
+    disclaimer: 'IM.codes es un proyecto de código abierto independiente y no está afiliado, respaldado ni patrocinado por Anthropic, OpenAI, Google, Alibaba, OpenClaw ni ninguna otra empresa mencionada. Todos los nombres de productos y marcas son propiedad de sus respectivos dueños.',
+  },
+  ru: {
+    tagline: 'IM для агентов. Общая память, OpenSpec Auto Deliver, совместное программирование, управляемые MCP tools и кросс-модельный аудит.',
+    hero_intro: 'IM.codes даёт coding agents единый слой памяти и управляемую поверхность MCP tools поверх разных провайдеров. Он превращает завершённую работу в переиспользуемый контекст и подмешивает или recall нужную историю в будущие session для Claude Code, Codex, Gemini, GitHub Copilot, Cursor, OpenCode, Qwen, OpenClaw и других. OpenSpec Auto Deliver может провести change от proposal/spec audit через implementation, validation hints, Team audit/rework, автоматическую оценку модулей и финальные quality gates. Session sharing также поддерживает pair или multi-person collaborative coding вокруг live agent sessions. Встроенный Auto supervision умеет оценивать завершённые ходы, продолжать работу автономно и при необходимости запускать цикл audit/rework перед возвратом контроля. Team-обсуждение — несколько моделей взаимно проверяют и аудируют планы и реализации друг друга, эффективно уменьшая пропуски, «слепые зоны» и смещения одной модели.',
+    hero_output: 'привязан к app.im.codes · демон запущен · зарегистрирован как системная служба',
+    self_host_warning: '<strong>Настоятельно рекомендуется самостоятельный хостинг.</strong> <code>app.im.codes</code> — общий тестовый экземпляр без гарантий доступности. Может быть ограничен, атакован или недоступен. Это личный проект без коммерческой поддержки. Для использования помимо тестирования разверните на собственной инфраструктуре.',
+    h_screenshots: 'скриншоты', h_why: 'зачем', h_memory: 'общий контекст агентов', h_mcp: 'управляемые MCP tools', h_not: 'чем это не является', h_features: 'возможности', h_arch: 'архитектура', h_download: 'скачать', h_install: 'установка', h_quick: 'быстрый старт', h_selfhost: 'свой сервер', h_agents: 'поддерживаемые агенты', h_reqs: 'требования', h_about: 'о проекте',
+    also_web: 'Также доступно как <a href="https://app.im.codes">веб-приложение</a>', watch_intro: 'Поддержка Watch даёт быстрый просмотр сессий, счётчики непрочитанного, статус OTA-обновлений, push-уведомления и быстрые ответы прямо с запястья.', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Приложение для Watch показывает список сессий, счётчики непрочитанного и быстрые ответы.',
+    agents_intro: 'Несколько агентов поддерживают интеграции как через CLI, так и через SDK.',
+    memory_intro: 'IM.codes превращает уже решённую работу в переиспользуемую и доступную для поиска память. Сохраняются не сырые логи промптов, а структурированные сводки проблема→решение. Релевантная история автоматически подмешивается в новые сообщения и при старте сессии, а каждая инъекция видна в таймлайне.',
+    memory_1: 'Личная память по умолчанию остаётся локальной; при желании в облако синхронизируются только обработанные сводки между вашими устройствами.',
+    memory_2: 'Enterprise Shared Context позволяет командам переиспользовать решения между workspace / project с поиском по памяти, статистикой и интерфейсом просмотра. Эта часть всё ещё активно разрабатывается и ещё не прошла полноценное продакшен-тестирование.',
+    memory_3: 'Многоязычный recall сочетает локальные embedding и серверный поиск на pgvector, поэтому связанные решения находятся даже между разными языками.',
+    memory_4: 'Карточки таймлайна показывают, что именно было подмешано, а также score релевантности, число recall и время последнего использования.',
+    mcp_intro: 'Поддерживаемые SDK-backed агенты получают stdio MCP server под управлением daemon: одну runtime-scoped поверхность для memory, agent messaging и scheduled follow-ups без raw auth tokens и ad hoc shell-команд.',
+    mcp_1: '<code>search_memory</code> вспоминает прошлую работу, decisions, preferences, bugs, commits, deployments и обсуждённый context, возвращая compact summaries и <code>projectionId</code>.',
+    mcp_2: '<code>get_memory_sources</code> разворачивает релевантный memory hit в provenance snippets, когда важны точные прошлые инструкции, bug details или source evidence.',
+    mcp_3: '<code>save_observation</code> и <code>save_preference</code> сохраняют полезные facts и стабильные user preferences.',
+    mcp_4: '<code>send_list_targets</code> и <code>send_message</code> помогают найти sibling sessions и отправить scoped text, file references, replies или broadcasts.',
+    mcp_5: '<code>cron_create</code>, <code>cron_list</code>, <code>cron_update</code> и <code>cron_delete</code> управляют future structured sends для reminders, recurring checks, delegated reviews и follow-ups.',
+    mcp_6: 'Runtime-bound identity не даёт подделывать namespace, user, server, token или routing fields; provider-level ready/degraded status и redacted recent calls видны в UI.',
+    h_collab: 'совместное программирование',
+    collab_intro: 'Делитесь live tab, sub-session или всем source server как scoped workspace для совместной работы.',
+    collab_1: 'viewer — для review; participant может отправлять prompts в покрытые sessions.',
+    collab_2: 'Подходит для pair programming или небольшого group agent supervision, с actor labels и отзывом доступа.',
+    h_autodeliver: 'OpenSpec Auto Deliver',
+    autodeliver_intro: 'Превратите OpenSpec change folder в supervised delivery run: proposal/spec audit, implementation, validation hints, Team audit/rework, automatic scoring и видимый final handoff.',
+    autodeliver_1: 'One-click launch определяет owning session, читает <code>tasks.md</code>, блокирует Team lane и показывает live progress в UI.',
+    autodeliver_2: 'Spec audit можно запустить до implementation через обычный Team flow, используя authoritative JSON вместо chat summaries.',
+    autodeliver_3: 'Implementation prompts фокусируются на выбранном OpenSpec change и показывают безопасные validation command candidates из project manifests.',
+    autodeliver_4: 'Automatic module scoring оценивает <code>spec</code>, <code>tasks</code>, <code>implementation</code>, <code>tests</code> и <code>risk</code>, evidence виден в run details.',
+    autodeliver_5: 'Fail-closed gates требуют human input при bad audit output, exhausted limits, manual interference или unreadable tasks. Auto Deliver никогда не делает stage, commit или push code.',
+    h_auto: 'контролируемое выполнение',
+    auto_intro: 'IM.codes может контролировать поддерживаемые transport session ход за ходом вместо слепого auto-continue. Auto определяет, завершён ли последний ход, нужно ли продолжать, или пора вернуть управление вам.',
+    auto_1: 'Режимы Auto на уровне session: Off, Supervised и Supervised + audit.',
+    auto_2: 'На границе idle Auto может классифицировать ход как complete, continue или ask_human и отправить следующий continue prompt в ту же session.',
+    auto_3: 'Supervised + audit может прогнать цикл audit→rework до возврата управления, так что «похоже завершённую» работу не приходится принимать на веру.',
+    auto_4: 'Глобальные значения по умолчанию заполняют новые session. Задайте backend, модель и timeout supervisor один раз — каждая session фиксирует их при включении Auto и по-прежнему может переопределить backend/model/timeout и режим audit индивидуально.',
+    auto_5: 'Двухслойные пользовательские инструкции supervisor. Сохраняйте глобальную supervisor-персону вместе с дополнением на уровне session — по умолчанию они объединяются в «global + пустая строка + session» и отправляются supervisor. Установите флажок «Override global» в сессии, чтобы она игнорировала глобальное значение. Правка глобальной персоны применяется к уже активным session со следующего хода, повторная активация Auto не нужна.',
+    f_memory_name: 'общий контекст агентов',
+    f_memory_desc: 'память проблема→решение, многоязычный recall и автоматическая инъекция при сообщении и старте сессии с видимостью в таймлайне',
+    f_mcp_name: 'управляемые MCP tools',
+    f_mcp_desc: 'десять runtime-scoped tools для memory search/sources, preferences, scoped Send и Cron scheduling',
+    f_collab_name: 'совместное программирование',
+    f_collab_desc: 'scoped sharing tabs/sub-sessions/source servers для pair или small-group agent programming',
+    f_autodeliver_name: 'OpenSpec Auto Deliver',
+    f_autodeliver_desc: 'proposal/spec audit → implementation → Team audit/rework, automatic scoring spec/tasks/implementation/tests/risk',
+    f_auto_name: 'контролируемое выполнение',
+    f_auto_desc: 'проверка завершения по ходам, auto-continue и необязательные циклы audit→rework для transport-агентов',
+    why_text: 'Когда вы отходите от рабочего стола, большинство workflows с coding agents ломается. Агент всё ещё работает в терминале, но продолжение обычно означает SSH, tmux attach, удалённый рабочий стол или ожидание, пока вы вернётесь к ноутбуку. Это только половина проблемы. Сложная работа с agents требует более устойчивого суждения: одна модель может застрять в шаблонах, пропустить проблемы или потерять контекст при смене provider. IM.codes объединяет всегда доступные session, общую память с резюме завершённой работы и структурированный Team кросс-модельный review, чтобы несколько agents проверяли планы до попадания кода. Это не делает вывод идеальным, но уменьшает слепые зоны одной модели и сохраняет непрерывность работы.',
+    not_1: 'Это не ещё один AI IDE', not_2: 'Это не просто чат-обёртка', not_3: 'Это не просто клиент удалённого терминала', not_4: 'Это не замена Claude Code, Codex, Gemini CLI, OpenClaw или Qwen', not_5: 'Это слой сообщений/управления вокруг них',
+    f_remote_name: 'удалённый терминал', f_remote_desc: 'браузер и мобильный, без SSH/VPN, PTY-стриминг в реальном времени',
+    f_chat_name: 'терминал + чат', f_chat_desc: 'нативный CLI или структурированный вид',
+    f_discuss_name: 'кросс-модельный аудит', f_discuss_desc: 'мульти-агентные Team обсуждения с настраиваемыми фазами (audit, review, brainstorm…) — разные модели перекрёстно проверяют до написания кода, сокращая переделки',
+    f_multi_name: 'мульти-сервер', f_multi_desc: 'управление агентами на всех машинах с одной панели',
+    f_sub_name: 'под-сессии', f_sub_desc: 'мгновенный запуск параллельных агентов',
+    f_file_name: 'файловый браузер', f_file_desc: 'просмотр, загрузка/скачивание, Git-диффы, безопасный HTML-превью, локальные изображения inline с увеличением',
+    f_mobile_name: 'мобильная версия, Watch и уведомления', f_mobile_desc: 'биометрия, push-уведомления и быстрые ответы с Watch',
+    f_ota_name: 'OTA-обновления', f_ota_desc: 'обновление демонов через веб-интерфейс',
+    f_stream_name: 'стриминг в реальном времени', f_stream_desc: 'без опроса, без лимитов сообщений',
+    f_self_name: 'свой сервер', f_self_desc: 'ваша инфраструктура, ваши данные, развёртывание одной командой',
+    f_streaming_name: 'доступ через CLI + SDK',
+    f_streaming_desc: 'Несколько агентов поддерживают интеграции как через CLI, так и через SDK. OpenClaw и Qwen продолжают давать нативный стриминг, отслеживание инструментов и восстановление сессий.',
+    f_sidebar_name: 'боковая панель в стиле Discord',
+    f_sidebar_desc: 'иконки серверов, дерево сессий, бейджи непрочитанных',
+    f_picker_name: 'выбор @',
+    f_picker_desc: '@файлы, @@агенты, @@all(config)',
+    f_pin_name: 'закрепляемые панели',
+    f_pin_desc: 'перетащите окно на боковую панель, кросс-девайс синхронизация',
+    f_repo_name: 'панель репозитория',
+    f_repo_desc: 'issues, PRs, ветки, коммиты, CI/CD',
+    f_cron_name: 'запланированные задачи',
+    f_cron_desc: 'cron-автоматизация, часовые пояса, история выполнения с переходом к сессии',
+    f_preview_name: 'локальный предпросмотр',
+    f_preview_desc: 'предпросмотр localhost через безопасный туннель, поддержка HMR',
+    f_sync_name: 'кросс-девайс синхронизация',
+    f_sync_desc: 'порядок вкладок, закреплённые вкладки и панели синхронизированы',
+    f_i18n_name: '7 языков',
+    f_i18n_desc: 'EN, 中文, 繁體, ES, RU, JA, KO',
+    arch_desc: 'Демон работает на вашей машине разработки и управляет process-backed session через tmux, а transport-backed session — через SDK и сетевые протоколы. Он также владеет managed MCP server, который даёт runtime-scoped memory, Send и Cron tools поддерживаемым SDK providers. Сервер передаёт соединения между вашими устройствами и демоном. Все данные остаются на вашей инфраструктуре.',
+    copy_hint: 'нажмите для копирования',
+    qs_1: 'Используйте <a href="https://app.im.codes">app.im.codes</a> или разверните свой сервер',
+    qs_2: 'Выполните <code>imcodes bind https://app.im.codes/bind/&lt;key&gt;</code>',
+    qs_3: 'Откройте панель — ваши агенты работают',
+    h_openclaw: 'openclaw connect',
+    oc_intro: 'If OpenClaw is running on the same machine as the daemon, connect IM.codes to the local OpenClaw gateway with:',
+    oc_1: 'Default gateway URL: <code>ws://127.0.0.1:18789</code>',
+    oc_2: 'Token auto-detected from <code>~/.openclaw/openclaw.json</code>, or pass <code>--token</code> / <code>OPENCLAW_GATEWAY_TOKEN</code>',
+    oc_3: 'OpenClaw sessions and child sessions sync into IM.codes automatically',
+    oc_4: 'Saved to <code>~/.imcodes/openclaw.json</code> so the daemon can reconnect automatically',
+    oc_5: 'Use <code>imcodes disconnect openclaw</code> to remove the saved config',
+    oc_note: 'Only tested on macOS so far. Remote plain-text <code>ws://</code> URLs require <code>--insecure</code>.',
+    sh_intro: 'Разверните сервер + демон на одной машине. Требуется Docker и домен с DNS, указывающим на сервер.',
+    sh_desc: 'Автоматически генерирует конфигурацию, запускает PostgreSQL + сервер + Caddy с автоматическим HTTPS, создаёт учётную запись администратора и привязывает локальный демон. Данные для входа выводятся в конце.',
+    sh_connect: 'Подключение дополнительных машин:', sh_manual: 'Ручная настройка:', sh_manual_pgvector: 'Сгенерированный docker-compose.yml уже использует pgvector/pgvector:pg18 для PostgreSQL.',
+    req_os: 'macOS, Linux или Windows (нативная поддержка экспериментальная; <a href="https://learn.microsoft.com/en-us/windows/wsl/">WSL</a> полностью поддерживается)',
+    req_mux: 'tmux (Linux/macOS/WSL). Нативный Windows использует ConPTY (встроенный).',
+    about_text: 'Личный проект. Почти полностью создан <a href="https://github.com/anthropics/claude-code">Claude Code</a>, со значительным вкладом <a href="https://github.com/openai/codex">Codex</a> и <a href="https://github.com/google-gemini/gemini-cli">Gemini CLI</a>.',
+    disclaimer: 'IM.codes — независимый проект с открытым исходным кодом, не связанный с Anthropic, OpenAI, Google, Alibaba, OpenClaw или любой другой упомянутой компанией. Все названия продуктов и товарные знаки являются собственностью их владельцев.',
+  },};
+
+const LANG_MAP = { 'zh': 'zh-CN', 'zh-Hans': 'zh-CN', 'zh-Hant': 'zh-TW' };
+const SUPPORTED = ['en', 'zh-CN', 'zh-TW', 'ja', 'ko', 'es', 'ru'];
+
+function detectLang() {
+  const saved = localStorage.getItem('im_lang');
+  if (saved && SUPPORTED.includes(saved)) return saved;
+  const nav = navigator.language || '';
+  const mapped = LANG_MAP[nav] || LANG_MAP[nav.split('-')[0]];
+  if (mapped) return mapped;
+  const base = nav.split('-')[0];
+  return SUPPORTED.find(s => s === nav || s.startsWith(base)) || 'en';
+}
+
+let currentLang = detectLang();
+
+function setLang(lang) {
+  currentLang = lang;
+  localStorage.setItem('im_lang', lang);
+  applyLang();
+}
+
+// Snapshot original English HTML so switching back to EN works after another language
+const _enSnap = {};
+document.querySelectorAll('[data-i18n]').forEach(el => {
+  _enSnap[el.getAttribute('data-i18n')] = el.innerHTML;
+});
+
+function applyLang() {
+  const dict = currentLang === 'en' ? _enSnap : (I18N[currentLang] || {});
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const key = el.getAttribute('data-i18n');
+    // Fall back to the English snapshot when a non-EN dict lacks the key, so a
+    // missing translation shows English instead of leaving the previous
+    // language's text in place (e.g. es/ru intentionally omit the couplet keys).
+    let val = dict[key];
+    if (val == null && currentLang !== 'en') val = _enSnap[key];
+    if (val != null) el.innerHTML = val;
+  });
+  document.querySelectorAll('.lang-switch button').forEach(btn => {
+    btn.classList.toggle('active', btn.getAttribute('data-lang') === currentLang);
+  });
+  document.documentElement.lang = currentLang === 'en' ? 'en' : currentLang;
+}
+
+function copy(el) {
+  const code = el.querySelector('code');
+  const text = code ? code.textContent.replace(/\u00a0/g, ' ').trim() : '';
+  navigator.clipboard.writeText(text);
+  const hint = el.querySelector('.copy-hint');
+  const orig = hint.textContent;
+  hint.textContent = { 'zh-CN': '已复制！', 'zh-TW': '已複製！', ja: 'コピーしました！', ko: '복사됨!', es: '¡copiado!', ru: 'скопировано!' }[currentLang] || 'copied!';
+  setTimeout(() => hint.textContent = orig, 1500);
+}
+
+applyLang();
+
+// Lightbox
+const LB_IMAGES = ['imcodes-sidebar.png','imcodes0.png','imcodes1.png','imcodes2.png','imcodes-ipad2.png','imcodes-ipad3.png','imcodes-m6.png','imcodes-m7.png','imcodes-m8.png','imcodes-m5.png','imcodes-m1.png','imcodes-m2.png','imcodes-m3.png','imcodes-m4.png','imcodes-m0.png','imcodes-watch1.png','imcodes-watch0.png','imcodes-watch2.png'];
+let lbIdx = 0;
+function openLightbox(i) {
+  lbIdx = i;
+  document.getElementById('lb-img').src = LB_IMAGES[i];
+  document.getElementById('lb-counter').textContent = (i + 1) + ' / ' + LB_IMAGES.length;
+  document.getElementById('lightbox').classList.add('open');
+  document.body.style.overflow = 'hidden';
+}
+function closeLightbox() {
+  document.getElementById('lightbox').classList.remove('open');
+  document.body.style.overflow = '';
+}
+function navLightbox(dir) {
+  lbIdx = (lbIdx + dir + LB_IMAGES.length) % LB_IMAGES.length;
+  openLightbox(lbIdx);
+}
+document.addEventListener('keydown', function(e) {
+  if (!document.getElementById('lightbox').classList.contains('open')) return;
+  if (e.key === 'Escape') closeLightbox();
+  else if (e.key === 'ArrowLeft') navLightbox(-1);
+  else if (e.key === 'ArrowRight') navLightbox(1);
+});
+</script>
+</body>
+</html>
