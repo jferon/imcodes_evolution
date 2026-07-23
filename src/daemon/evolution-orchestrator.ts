@@ -4422,6 +4422,43 @@ export async function handleEvolutionPipelineCommand(cmd: Record<string, unknown
       });
       return;
     }
+    case EVOLUTION_PIPELINE_MSG.SET_INBOX_DIRECTORY: {
+      const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+      const sessionName = typeof cmd.sessionName === 'string' ? cmd.sessionName : '';
+      const projectRoot = resolveProjectRootFromCommand(cmd);
+      const directoryPath = typeof cmd.directoryPath === 'string' ? cmd.directoryPath : '';
+      if (!sessionName || !projectRoot || !directoryPath) {
+        send(serverLink, {
+          type: EVOLUTION_PIPELINE_MSG.LAUNCH_ERROR,
+          requestId,
+          issues: [issue('invalid_inbox_directory_request', 'sessionName, projectRoot, and directoryPath are required.')],
+        });
+        return;
+      }
+      try {
+        const { configureEvolutionInboxWatcherDirectory } = await import('./evolution-inbox-watch-manager.js');
+        const result = await configureEvolutionInboxWatcherDirectory({
+          sessionName,
+          projectRoot,
+          directoryPath,
+          ...(typeof cmd.projectName === 'string' ? { projectName: cmd.projectName } : {}),
+          serverLink,
+        });
+        send(serverLink, {
+          type: EVOLUTION_PIPELINE_MSG.SET_INBOX_DIRECTORY_ACK,
+          requestId,
+          directoryPath,
+          watchers: result.watchers,
+        });
+      } catch (error) {
+        send(serverLink, {
+          type: EVOLUTION_PIPELINE_MSG.LAUNCH_ERROR,
+          requestId,
+          issues: [issue('evolution_inbox_directory_failed', describeUnknownError(error), 'directoryPath')],
+        });
+      }
+      return;
+    }
     case EVOLUTION_PIPELINE_MSG.IMPORT_REFERENCES: {
       const requestId = typeof cmd.requestId === 'string' && cmd.requestId.length > 0
         ? cmd.requestId

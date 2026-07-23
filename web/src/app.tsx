@@ -4989,6 +4989,7 @@ export function App() {
 
             {selectedServerId && appEvolutionConsoleOpen && (
               <EvolutionControlConsole
+                ws={wsRef.current}
                 projection={appEvolutionPipeline.projection}
                 watchers={appEvolutionPipeline.watchers}
                 sessionName={appEvolutionTargetSession?.name ?? appOpenSpecAutoSessionName}
@@ -5008,6 +5009,9 @@ export function App() {
                   });
                 }}
                 onScanInbox={() => { appEvolutionPipeline.scanInbox(); }}
+                onSetInboxDirectory={(directoryPath) => (
+                  appEvolutionPipeline.setInboxDirectory(directoryPath, appEvolutionTargetSession?.project)
+                )}
                 onSendUserMessage={(text, roleId) => appEvolutionPipeline.sendUserMessage(text, roleId)}
                 onRefresh={() => { appEvolutionPipeline.requestStatus(); }}
                 onNewSubSession={() => setShowSubDialog(true)}

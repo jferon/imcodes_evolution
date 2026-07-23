@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { EVOLUTION_PIPELINE_MSG, EVOLUTION_REQUIREMENT_INBOX_DIR } from '../../shared/evolution-pipeline-constants.js';
 import { parseOpenSpecTasksMarkdown } from '../../shared/openspec-auto-deliver-validators.js';
 import { validateEvolutionProjection } from '../../shared/evolution-pipeline-validators.js';
+import { stopAllEvolutionInboxWatchers } from '../../src/daemon/evolution-inbox-watch-manager.js';
 import {
   advanceEvolutionRunStage,
   approveEvolutionRoleSkillCandidate,
@@ -36,6 +37,7 @@ async function makeRoot(): Promise<string> {
 }
 
 afterEach(async () => {
+  stopAllEvolutionInboxWatchers();
   setEvolutionAutoDeliverLauncher(null);
   setEvolutionRoundtableLauncher(null);
   setEvolutionRoundtableUserMessageSink(null);
@@ -304,6 +306,36 @@ describe('evolution orchestrator', () => {
       candidates: 0,
     }));
     expect(Array.isArray(scanAck?.watchers)).toBe(true);
+  });
+
+  it('handles websocket-style requirement directory changes', async () => {
+    const root = await makeRoot();
+    const selectedDirectory = join(root, 'incoming-requirements');
+    await mkdir(selectedDirectory, { recursive: true });
+    const sent: Record<string, unknown>[] = [];
+    const serverLink = { send(message: Record<string, unknown>) { sent.push(message); } };
+
+    await handleEvolutionPipelineCommand({
+      type: EVOLUTION_PIPELINE_MSG.SET_INBOX_DIRECTORY,
+      requestId: 'req-orch-set-inbox',
+      sessionName: 'deck_demo_brain',
+      projectName: 'demo',
+      projectRoot: root,
+      directoryPath: selectedDirectory,
+    }, serverLink as never);
+
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: EVOLUTION_PIPELINE_MSG.SET_INBOX_DIRECTORY_ACK,
+      requestId: 'req-orch-set-inbox',
+      directoryPath: selectedDirectory,
+      watchers: [
+        expect.objectContaining({
+          sessionName: 'deck_demo_brain',
+          inboxAbsolutePath: selectedDirectory,
+          active: true,
+        }),
+      ],
+    }));
   });
 
   it('handles websocket-style demo launch by seeding a demo requirement', async () => {

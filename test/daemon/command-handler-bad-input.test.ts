@@ -216,4 +216,11 @@ describe('handleWebCommand: malformed inputs do not crash', () => {
     expect(src).toContain('case EVOLUTION_PIPELINE_MSG.IMPORT_REFERENCES:');
     expect(src).toContain('handleEvolutionPipelineCommand(evolutionCmd, serverLink)');
   });
+
+  it('routes evolution inbox directory changes through the web command dispatcher', async () => {
+    const { readFileSync } = await import('node:fs');
+    const src = readFileSync('src/daemon/command-handler.ts', 'utf8');
+    expect(src).toContain('case EVOLUTION_PIPELINE_MSG.SET_INBOX_DIRECTORY:');
+    expect(src).toContain('handleEvolutionPipelineCommand(evolutionCmd, serverLink)');
+  });
 });

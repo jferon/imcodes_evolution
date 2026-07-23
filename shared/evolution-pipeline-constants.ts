@@ -10,6 +10,8 @@ export const EVOLUTION_PIPELINE_MSG = {
   STATUS_PROJECTION: 'evolution_pipeline.status_projection',
   SCAN_INBOX: 'evolution_pipeline.scan_inbox',
   SCAN_INBOX_ACK: 'evolution_pipeline.scan_inbox_ack',
+  SET_INBOX_DIRECTORY: 'evolution_pipeline.set_inbox_directory',
+  SET_INBOX_DIRECTORY_ACK: 'evolution_pipeline.set_inbox_directory_ack',
   IMPORT_REFERENCES: 'evolution_pipeline.import_references',
   IMPORT_REFERENCES_ACK: 'evolution_pipeline.import_references_ack',
   CHECK_STAGING: 'evolution_pipeline.check_staging',
