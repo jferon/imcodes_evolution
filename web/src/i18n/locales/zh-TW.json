@@ -744,6 +744,20 @@
     "upgrade_blocked_toolchain_unavailable": "daemon 主機上的 Node 已遺失（工具鏈被移除）。請重新安裝 Node——在此之前自動升級已停用。"
   },
   "discussion": {
+    "field_domain_role": "領域角色",
+    "field_runtime": "Agent 執行環境",
+    "domain_role_loop_supervisor": "Loop 總控",
+    "domain_role_product_manager": "產品經理",
+    "domain_role_product_critic": "產品審查",
+    "domain_role_ux_designer": "UX 設計師",
+    "domain_role_visual_designer": "視覺設計師",
+    "domain_role_visual_fidelity_checker": "視覺保真審查",
+    "domain_role_tech_director": "技術總監",
+    "domain_role_backend_developer": "後端開發",
+    "domain_role_frontend_developer": "前端開發",
+    "domain_role_qa_engineer": "測試工程師",
+    "domain_role_security_reviewer": "安全審查",
+    "domain_role_ops_release_manager": "維運 / 發布經理",
     "role_critic": "評論者",
     "role_pragmatist": "務實者",
     "role_innovator": "創新者",
@@ -2525,5 +2539,24 @@
     "error_request_failed": "請求失敗。",
     "error_app_server_timeout": "Codex 逾時。",
     "error_invalid_params": "請求無效。"
+  },
+  "evolution": {
+    "development_mode": "開發模式",
+    "mode_brownfield_refactor": "在現有系統上重構 / 擴充",
+    "mode_greenfield_new_system": "全部重新開發新系統",
+    "greenfield_target": "新系統目標目錄",
+    "greenfield_topology": "新系統拓撲",
+    "topology_monolith": "單體（基礎設施最少）",
+    "topology_modular_monolith": "模組化單體（建議）",
+    "topology_services": "服務化（需要額外基礎設施門禁）",
+    "greenfield_help": "在專案內獨立目錄建立架構、基礎設施與 walking skeleton 任務；外部儲存庫與正式環境仍需另行授權。",
+    "brownfield_help": "沿用現有架構、模組、資料契約、元件與部署慣例，並補齊遷移及回滾方案。",
+    "hifi_review_title": "高保真人工預覽",
+    "hifi_review_help": "進入架構前先查看全部圖片。滿意即可核准，不滿意可填寫意見後要求重新設計。",
+    "images": "張圖片",
+    "approve_hifi": "核准並繼續",
+    "redesign_hifi": "重新設計",
+    "hifi_approved_message": "使用者已核准本輪高保真評審集。",
+    "redesign_default_feedback": "請重新設計高保真評審集，並保留需求與參考圖約束。"
   }
 }

@@ -2153,7 +2153,7 @@ export function App() {
   const handleStartDiscussion = useCallback((payload: {
     topic: string;
     cwd: string;
-    participants: Array<{ agentType: string; model?: string; roleId: string; roleLabel?: string; rolePrompt?: string; sessionName?: string }>;
+    participants: Array<{ agentType: string; model?: string; roleId: string; domainRoleId?: string; roleLabel?: string; rolePrompt?: string; sessionName?: string }>;
     maxRounds?: number;
     verdictIdx?: number;
   }) => {
@@ -5004,8 +5004,10 @@ export function App() {
                     projectName: appEvolutionTargetSession?.project,
                     autoStartImplementation: true,
                     autoDeliverPresetId: 'standard',
-                    roundtableGateMode: 'planning',
+                    roundtableGateMode: 'strict',
                     designTargetSurface: 'auto',
+                    developmentMode: 'brownfield_refactor',
+                    requireHifiHumanApproval: true,
                   });
                 }}
                 onScanInbox={() => { appEvolutionPipeline.scanInbox(); }}
@@ -5641,6 +5643,10 @@ export function App() {
               autoDeliverPresetId: 'standard',
               roundtableGateMode: options.roundtableGateMode,
               designTargetSurface: options.designTargetSurface,
+              developmentMode: options.developmentMode,
+              developmentTargetRelativeDir: options.developmentTargetRelativeDir,
+              greenfieldTopology: options.greenfieldTopology,
+              requireHifiHumanApproval: options.requireHifiHumanApproval,
             });
           }}
           onLaunchDemo={(options) => {
@@ -5650,6 +5656,10 @@ export function App() {
               autoDeliverPresetId: 'standard',
               roundtableGateMode: options.roundtableGateMode,
               designTargetSurface: options.designTargetSurface,
+              developmentMode: options.developmentMode,
+              developmentTargetRelativeDir: options.developmentTargetRelativeDir,
+              greenfieldTopology: options.greenfieldTopology,
+              requireHifiHumanApproval: options.requireHifiHumanApproval,
             });
           }}
           onCreateReferenceBrief={(options) => appEvolutionPipeline.createReferenceBrief({
@@ -5659,7 +5669,8 @@ export function App() {
           onScanInbox={() => { appEvolutionPipeline.scanInbox(); }}
           onCheckStaging={() => { appEvolutionPipeline.checkStaging(); }}
           onStop={() => { appEvolutionPipeline.stop(); }}
-          onContinue={(message) => { appEvolutionPipeline.continueRun(undefined, message); }}
+          onContinue={(message, targetStage) => { appEvolutionPipeline.continueRun(targetStage, message); }}
+          onGateAction={(gateId, action, feedback) => { appEvolutionPipeline.applyGateAction(gateId, action, feedback); }}
           onStartAutoDeliver={(changeName) => {
             appOpenSpecAutoDeliver.launch({ changeName, presetId: 'standard' });
             appEvolutionPipeline.sendUserMessage(`OpenSpec Auto Deliver launch requested for ${changeName}.`, 'loop_supervisor');

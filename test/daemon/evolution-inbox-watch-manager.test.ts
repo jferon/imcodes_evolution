@@ -106,7 +106,7 @@ describe('evolution inbox watch manager', () => {
 
     const projection = await waitForProjection(
       sent,
-      (candidate) => candidate.stage === 'tasks_ready' && candidate.source.relativePath === sourceRelativePath,
+      (candidate) => candidate.stage === 'needs_human' && candidate.source.relativePath === sourceRelativePath,
       10_000,
     );
 
@@ -114,14 +114,14 @@ describe('evolution inbox watch manager', () => {
     expect(projection.requestId).toMatch(/^watcher-/);
     expect(projection.source.requestedBy).toBe('watcher');
     expect(projection.autoDelivery?.enabled).toBe(true);
-    expect(projection.artifacts.map((artifact) => artifact.kind)).toEqual(expect.arrayContaining([
-      'prd',
-      'taste_hifi_output',
-      'implementation_task_matrix',
-      'test_cases',
-    ]));
-    await expect(readFile(join(root, '.imc/evolution', projection.runId, 'design/taste-hifi-output.md'), 'utf8'))
-      .resolves.toContain('Built-in taste-skill High-Fidelity Output');
+    expect(projection.roundtableGateMode).toBe('strict');
+    expect(projection.requireHifiHumanApproval).toBe(true);
+    expect(projection.roundtables).toContainEqual(expect.objectContaining({
+      id: 'product-review',
+      status: 'failed',
+      error: 'roundtable_launcher_unavailable',
+    }));
+    expect(projection.evidence.some((entry) => entry.source === 'local_roundtable_review')).toBe(false);
   });
 
   it('manually scans active inbox watchers without waiting for the poll interval', async () => {
@@ -156,10 +156,11 @@ describe('evolution inbox watch manager', () => {
     }));
     const projection = await waitForProjection(
       sent,
-      (candidate) => candidate.stage === 'tasks_ready' && candidate.source.relativePath === sourceRelativePath,
+      (candidate) => candidate.stage === 'needs_human' && candidate.source.relativePath === sourceRelativePath,
       10_000,
     );
     expect(projection.source.requestedBy).toBe('watcher');
+    expect(projection.roundtableGateMode).toBe('strict');
   });
 
   it('switches to a browsed directory, imports its requirements safely, and restores it after restart', async () => {
@@ -208,10 +209,11 @@ describe('evolution inbox watch manager', () => {
     expect(scan.candidates).toBe(1);
     const projection = await waitForProjection(
       sent,
-      (candidate) => candidate.stage === 'tasks_ready' && candidate.source.fileName === 'feature.md',
+      (candidate) => candidate.stage === 'needs_human' && candidate.source.fileName === 'feature.md',
       10_000,
     );
     expect(projection.source.relativePath).toMatch(/^\.imcodes\/inbox\/requirements\/imported\//);
+    expect(projection.requireHifiHumanApproval).toBe(true);
     await expect(readFile(join(root, '.imc/evolution', projection.runId, 'input/feature.md'), 'utf8'))
       .resolves.toContain('selected-directory flow');
 

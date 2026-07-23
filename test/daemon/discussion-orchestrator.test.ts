@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // The orchestrator drives real sub-sessions / tmux / file IO, so importing it
 // (and exercising the failure path) requires stubbing those boundaries. We only
@@ -20,7 +23,12 @@ vi.mock('../../src/daemon/subsession-manager.js', () => ({
   subSessionName: (id: string) => `deck_sub_${id}`,
 }));
 
-import { startDiscussion, buildRunningTransitionRelay } from '../../src/daemon/discussion-orchestrator.js';
+import {
+  startDiscussion,
+  buildRunningTransitionRelay,
+  resolveGovernedDiscussionDomainRole,
+  resolveGovernedDiscussionDomainRoleAtProject,
+} from '../../src/daemon/discussion-orchestrator.js';
 
 describe('discussion-orchestrator — requestId propagation', () => {
   beforeEach(() => {
@@ -29,6 +37,45 @@ describe('discussion-orchestrator — requestId propagation', () => {
   });
 
   describe('setup→running transition relay (2.2 / D3)', () => {
+    it('resolves governed domain-role skill content on the daemon', () => {
+      const role = resolveGovernedDiscussionDomainRole('security_reviewer');
+      expect(role?.label).toContain('安全审查');
+      expect(role?.prompt).toContain('Mission:');
+      expect(role?.prompt).toContain('Responsibilities:');
+      expect(role?.prompt).toContain('Quality checklist:');
+      expect(resolveGovernedDiscussionDomainRole('browser-invented-role')).toBeNull();
+    });
+
+    it('uses the exact approved project skill bytes instead of a browser-owned prompt', async () => {
+      const root = await mkdtemp(join(tmpdir(), 'imcodes-discussion-role-'));
+      try {
+        const approvedDir = join(root, 'config/evolution/role-skills/approved');
+        await mkdir(approvedDir, { recursive: true });
+        await writeFile(join(approvedDir, 'security-risk-review.md'), [
+          '---',
+          'name: security-risk-review',
+          'category: evolution',
+          'description: "Project security review"',
+          'enforcement: additive',
+          '---',
+          '',
+          '# Project Security Review',
+          '',
+          'PROJECT_APPROVED_SECURITY_SENTINEL',
+          '',
+        ].join('\n'), 'utf8');
+
+        const role = await resolveGovernedDiscussionDomainRoleAtProject(root, 'security_reviewer');
+        expect(role?.prompt).toContain('Governed skill source: project');
+        expect(role?.prompt).toContain('config/evolution/role-skills/approved/security-risk-review.md');
+        expect(role?.prompt).toContain('PROJECT_APPROVED_SECURITY_SENTINEL');
+        expect(role?.prompt).toMatch(/Governed skill sha256: [a-f0-9]{64}/);
+        expect(role?.prompt).toContain('<governed-skill>');
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+
     it('relays a discussion.update carrying requestId so a pending optimistic card can match', () => {
       const relay = buildRunningTransitionRelay({
         id: 'disc-1', requestId: 'req-abc', maxRounds: 3, filePath: '/p/.imc/discussions/x-title.md',

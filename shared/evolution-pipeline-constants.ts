@@ -25,6 +25,10 @@ export const EVOLUTION_PIPELINE_MSG = {
   STOP_ACK: 'evolution_pipeline.stop_ack',
   CONTINUE: 'evolution_pipeline.continue',
   CONTINUE_ACK: 'evolution_pipeline.continue_ack',
+  GATE_ACTION: 'evolution_pipeline.gate_action',
+  GATE_ACTION_ACK: 'evolution_pipeline.gate_action_ack',
+  ROLE_CATALOG_REQUEST: 'evolution_pipeline.role_catalog_request',
+  ROLE_CATALOG: 'evolution_pipeline.role_catalog',
   USER_MESSAGE: 'evolution_pipeline.user_message',
   ARTIFACT_WRITTEN: 'evolution_pipeline.artifact_written',
   TERMINAL: 'evolution_pipeline.terminal',
@@ -127,6 +131,70 @@ export type EvolutionRoundtableGateMode = (typeof EVOLUTION_ROUNDTABLE_GATE_MODE
 
 export const EVOLUTION_DESIGN_TARGET_SURFACES = ['auto', 'mobile', 'pc', 'both'] as const;
 export type EvolutionDesignTargetSurface = (typeof EVOLUTION_DESIGN_TARGET_SURFACES)[number];
+
+export const EVOLUTION_DEVELOPMENT_MODES = ['brownfield_refactor', 'greenfield_new_system'] as const;
+export type EvolutionDevelopmentMode = (typeof EVOLUTION_DEVELOPMENT_MODES)[number];
+
+export const EVOLUTION_EXECUTION_POLICIES = ['draft_preview', 'governed'] as const;
+export type EvolutionExecutionPolicy = (typeof EVOLUTION_EXECUTION_POLICIES)[number];
+
+export const EVOLUTION_ASSURANCE_LEVELS = [
+  'pipeline_draft',
+  'legacy_unverified',
+  'observed',
+  'agent_attested',
+  'checker_verified',
+  'human_approved',
+  'waived',
+] as const;
+export type EvolutionAssuranceLevel = (typeof EVOLUTION_ASSURANCE_LEVELS)[number];
+
+export const EVOLUTION_ARTIFACT_STATUSES = ['draft', 'candidate', 'rejected', 'approved', 'superseded'] as const;
+export type EvolutionArtifactStatus = (typeof EVOLUTION_ARTIFACT_STATUSES)[number];
+
+export const EVOLUTION_SCORE_SOURCES = ['heuristic', 'agent', 'checker', 'human'] as const;
+export type EvolutionScoreSource = (typeof EVOLUTION_SCORE_SOURCES)[number];
+
+export const EVOLUTION_ROLE_SOURCES = ['builtin', 'project', 'custom_user'] as const;
+export type EvolutionRoleSource = (typeof EVOLUTION_ROLE_SOURCES)[number];
+
+export const EVOLUTION_ATTEMPT_KINDS = ['maker', 'checker', 'foundation', 'implementation', 'verification'] as const;
+export type EvolutionAttemptKind = (typeof EVOLUTION_ATTEMPT_KINDS)[number];
+
+export const EVOLUTION_ATTEMPT_STATUSES = ['planned', 'running', 'passed', 'rework', 'blocked', 'failed', 'cancelled'] as const;
+export type EvolutionAttemptStatus = (typeof EVOLUTION_ATTEMPT_STATUSES)[number];
+
+export const EVOLUTION_GATE_KINDS = [
+  'product_review',
+  'design_review',
+  'architecture_review',
+  'planning_review',
+  'development_mode',
+  'external_infrastructure',
+  'production_release',
+] as const;
+export type EvolutionGateKind = (typeof EVOLUTION_GATE_KINDS)[number];
+
+export const EVOLUTION_GATE_STATUSES = ['open', 'approved', 'rejected', 'waived', 'superseded'] as const;
+export type EvolutionGateStatus = (typeof EVOLUTION_GATE_STATUSES)[number];
+
+export const EVOLUTION_GATE_ACTIONS = ['approve', 'request_changes', 'waive'] as const;
+export type EvolutionGateAction = (typeof EVOLUTION_GATE_ACTIONS)[number];
+
+export const EVOLUTION_GREENFIELD_TOPOLOGIES = ['monolith', 'modular_monolith', 'services'] as const;
+export type EvolutionGreenfieldTopology = (typeof EVOLUTION_GREENFIELD_TOPOLOGIES)[number];
+
+export const EVOLUTION_EXTERNAL_ACTION_CLASSES = [
+  'local_only',
+  'sandbox_write',
+  'external_preview',
+  'shared_environment',
+  'production',
+] as const;
+export type EvolutionExternalActionClass = (typeof EVOLUTION_EXTERNAL_ACTION_CLASSES)[number];
+
+/** Protocol marker used by the War Room to request a fresh high-fidelity maker pass. */
+export const EVOLUTION_HIFI_REDESIGN_MESSAGE_PREFIX = '[EVOLUTION_HIFI_REDESIGN]' as const;
 
 export const EVOLUTION_ARTIFACT_KINDS = [
   'input',

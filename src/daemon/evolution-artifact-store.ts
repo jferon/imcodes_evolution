@@ -22,6 +22,11 @@ import {
 } from '../../shared/evolution-pipeline-validators.js';
 import { getProjectSkillEscapeHatchPath } from '../../shared/skill-store.js';
 import { parseSkillMarkdown } from '../../shared/skill-store.js';
+import {
+  captureEvolutionSkillSnapshot,
+  initializeEvolutionControlState,
+  registerEvolutionArtifactRevision,
+} from './evolution-control-plane.js';
 
 export interface CreateEvolutionRunOptions {
   projectRoot: string;
@@ -37,6 +42,12 @@ export interface EvolutionRunPaths {
   discussionsDir: string;
   designDir: string;
   deliveryDir: string;
+  attemptsDir: string;
+  revisionsDir: string;
+  verdictsDir: string;
+  gatesDir: string;
+  reviewSetsDir: string;
+  skillSnapshotsDir: string;
   runJsonPath: string;
 }
 
@@ -268,10 +279,27 @@ function renderEvolutionRoleSkill(definition: EvolutionRoleSkillDefinition): str
     '## Handoff Rule',
     definition.handoff,
     '',
+    '## Execution Contract',
+    '- 接收任务后先输出 `INPUTS_READ`（路径 + sha256）、`ASSUMPTIONS`、`RISKS`，再开始角色工作。',
+    '- 产物必须以候选 revision 形式交付，并写明 `OUTPUTS_WRITTEN`；不得把聊天总结、模板存在或文件名存在视为完成。',
+    '- Checker 结论必须绑定 attempt id、skill snapshot id、全部 input revision ids 和可复核证据；缺少任一字段时结论为 BLOCKED。',
+    '- 最终结论使用受治理机器标记 `<!-- EVOLUTION_VERDICT: PASS|REWORK|BLOCKED -->`；自然语言中的 PASS 不授权下游。',
+    '',
+    '## Evaluation Rubric',
+    '- 0–2：未读取输入、泛化建议或无产物。',
+    '- 3–5：有产物但假设/风险/失败路径不完整，或无法复现。',
+    '- 6–8：输入、产物、证据、边界、失败路径与 handoff 完整。',
+    '- 9–10：除上述要求外，还能给出反例、独立 checker 复核与使结论失效的条件。',
+    '- 出现伪造工具执行、伪造测试、越过人工门禁或 maker 自验收时直接判 0，并进入 human gate。',
+    '',
     '## Operating Rules',
-    '- 只基于当前 run 的需求、产物和用户补充指令行动。',
-    '- 结论必须能落到 artifact、discussion 或 evidence；不要只停留在聊天。',
-    '- 发现不可逆、生产、密钥、支付、隐私、迁移风险时，要求进入 human gate。',
+    '- 开始前读取当前阶段声明的全部输入产物；列出实际读取的路径，并区分用户需求、已批准上游产物、生成草稿和外部参考。',
+    '- 先写出关键假设、反例、约束和不确定性，再做结论；缺少决定性输入时进入 blocker，不得用常识静默补齐。',
+    '- 每个结论都要关联可复核的 artifact、discussion、test 或 evidence；不要只停留在聊天，也不要把模板生成冒充为角色执行。',
+    '- 作为 maker 时产出候选并交给独立 checker；作为 checker 时不得审查自己同一会话生成的内容，REWORK 必须给出可执行修改项。',
+    '- PASS/REWORK/BLOCKED 必须绑定本次实际审查的产物路径和哈希；人工 waiver 与 checker PASS 是不同事实。',
+    '- 发现不可逆、生产、密钥、支付、隐私、迁移、外部仓库或云资源风险时，要求进入 human gate。',
+    '- 输出 handoff 时明确下一角色、所需输入、验收标准、风险 owner 和会使结论失效的条件。',
   ].join('\n');
 }
 
@@ -301,6 +329,33 @@ async function readApprovedEvolutionRoleSkillTemplate(
     relativePath,
     sha256: sha256(Buffer.from(content)),
     bytes,
+  };
+}
+
+export async function resolveApprovedEvolutionRoleSkill(
+  projectRoot: string,
+  roleId: EvolutionRoleId,
+): Promise<{
+  roleId: EvolutionRoleId;
+  label: string;
+  skillName: string;
+  source: 'project' | 'built_in';
+  sourcePath: string;
+  content: string;
+  sha256: string;
+}> {
+  const definition = EVOLUTION_ROLE_SKILL_DEFINITIONS.find((entry) => entry.roleId === roleId);
+  if (!definition) throw new Error(`unknown_evolution_role:${roleId}`);
+  const approved = await readApprovedEvolutionRoleSkillTemplate(projectRoot, definition);
+  const content = approved?.content ?? renderEvolutionRoleSkill(definition);
+  return {
+    roleId,
+    label: definition.label,
+    skillName: definition.skillName,
+    source: approved ? 'project' : 'built_in',
+    sourcePath: approved?.relativePath ?? `builtin:evolution/${definition.skillName}`,
+    content,
+    sha256: sha256(Buffer.from(content)),
   };
 }
 
@@ -443,6 +498,12 @@ export function getEvolutionRunPaths(projectRoot: string, runId: string): Evolut
     discussionsDir: join(runDir, 'discussions'),
     designDir: join(runDir, 'design'),
     deliveryDir: join(runDir, 'delivery'),
+    attemptsDir: join(runDir, 'attempts'),
+    revisionsDir: join(runDir, 'revisions'),
+    verdictsDir: join(runDir, 'verdicts'),
+    gatesDir: join(runDir, 'gates'),
+    reviewSetsDir: join(runDir, 'review-sets'),
+    skillSnapshotsDir: join(runDir, 'skill-snapshots'),
     runJsonPath: join(runDir, 'run.json'),
   };
 }
@@ -454,6 +515,12 @@ async function ensureEvolutionRunDirectories(paths: EvolutionRunPaths): Promise<
     mkdir(paths.discussionsDir, { recursive: true }),
     mkdir(paths.designDir, { recursive: true }),
     mkdir(paths.deliveryDir, { recursive: true }),
+    mkdir(paths.attemptsDir, { recursive: true }),
+    mkdir(paths.revisionsDir, { recursive: true }),
+    mkdir(paths.verdictsDir, { recursive: true }),
+    mkdir(paths.gatesDir, { recursive: true }),
+    mkdir(paths.reviewSetsDir, { recursive: true }),
+    mkdir(paths.skillSnapshotsDir, { recursive: true }),
   ]);
 }
 
@@ -511,8 +578,24 @@ export async function createEvolutionRunFromRequirement(options: CreateEvolution
     createdAt: nowMs,
   };
   const roleSkillArtifacts = await ensureDefaultEvolutionRoleSkillFiles(options.projectRoot, nowMs);
+  const roleSkillSourceByRole = new Map<EvolutionRoleId, 'builtin' | 'project' | 'custom_user'>();
+  for (const definition of EVOLUTION_ROLE_SKILL_DEFINITIONS) {
+    const active = roleSkillArtifacts.find((artifact) => artifact.kind === 'role_skill' && artifact.roleId === definition.roleId);
+    const approved = roleSkillArtifacts.find((artifact) => artifact.kind === 'role_skill_library' && artifact.roleId === definition.roleId);
+    const builtInSha256 = sha256(Buffer.from(renderEvolutionRoleSkill(definition)));
+    roleSkillSourceByRole.set(
+      definition.roleId,
+      active?.sha256 && approved?.sha256 === active.sha256
+        ? 'project'
+        : active?.sha256 === builtInSha256
+          ? 'builtin'
+          : 'custom_user',
+    );
+  }
 
   const run: EvolutionRun = {
+    controlVersion: 2,
+    runRevision: 0,
     runId,
     requestId: request.requestId,
     stage: 'detected',
@@ -545,6 +628,43 @@ export async function createEvolutionRunFromRequirement(options: CreateEvolution
     roundtables: [],
     roundtableGateMode: request.roundtableGateMode ?? 'planning',
     designTargetSurface: request.designTargetSurface ?? 'auto',
+    developmentMode: request.developmentMode ?? 'brownfield_refactor',
+    ...(request.developmentTargetRelativeDir ? { developmentTargetRelativeDir: request.developmentTargetRelativeDir } : {}),
+    executionPolicy: request.executionPolicy ?? 'draft_preview',
+    ...(request.greenfieldTopology ? { greenfieldTopology: request.greenfieldTopology } : {}),
+    writePolicy: request.developmentMode === 'greenfield_new_system'
+      ? {
+          allowedRoots: [request.developmentTargetRelativeDir ?? ''],
+          deniedRoots: ['.git', '.imc', '.imcodes', 'docs', 'openspec'],
+          protectedRoots: ['.', 'web', 'server', 'src', 'shared'],
+          requireIsolatedWorktree: true,
+        }
+      : {
+          allowedRoots: ['.'],
+          deniedRoots: ['.git', '.imc/evolution'],
+          protectedRoots: ['.git', '.imc'],
+          requireIsolatedWorktree: true,
+        },
+    requireHifiHumanApproval: request.requireHifiHumanApproval === true,
+    roleProfiles: EVOLUTION_ROLE_SKILL_DEFINITIONS.map((definition) => ({
+      id: `role-profile:${definition.roleId}:1`,
+      roleId: definition.roleId,
+      label: definition.label,
+      summary: definition.skillSummary,
+      responsibilities: [...definition.responsibilities],
+      skillName: definition.skillName,
+      roleSource: roleSkillSourceByRole.get(definition.roleId) ?? 'builtin',
+      version: 1,
+    })),
+    skillSnapshots: [],
+    artifactRevisions: [],
+    attempts: [],
+    verdictRecords: [],
+    gates: [],
+    designReviewSets: [],
+    authorizedRevisions: {},
+    foundationEvidence: [],
+    processedMutationIds: [],
     evidence: [{
       source: 'daemon',
       summary: `Requirement file ingested from ${request.sourceRelativePath}.`,
@@ -563,6 +683,40 @@ export async function createEvolutionRunFromRequirement(options: CreateEvolution
     updatedAt: nowMs,
   };
 
+  initializeEvolutionControlState(run);
+  await registerEvolutionArtifactRevision({
+    projectRoot: options.projectRoot,
+    run,
+    artifact: inputArtifact,
+    content: sourceBytes,
+    status: 'approved',
+    assurance: 'observed',
+  });
+  for (const artifact of roleSkillArtifacts) {
+    if (artifact.kind !== 'role_skill') continue;
+    const roleId = artifact.roleId;
+    const skillName = artifact.title;
+    if (!roleId || !skillName) continue;
+    const content = await readFile(safeJoin(options.projectRoot, artifact.path), 'utf8');
+    await registerEvolutionArtifactRevision({
+      projectRoot: options.projectRoot,
+      run,
+      artifact,
+      content,
+      status: 'approved',
+      assurance: 'observed',
+    });
+    await captureEvolutionSkillSnapshot({
+      projectRoot: options.projectRoot,
+      run,
+      roleId,
+      skillName,
+      sourcePath: artifact.path,
+      source: roleSkillSourceByRole.get(roleId) ?? 'builtin',
+      content,
+      nowMs,
+    });
+  }
   await writeEvolutionRun(options.projectRoot, run);
   return run;
 }

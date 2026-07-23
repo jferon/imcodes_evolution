@@ -744,6 +744,20 @@
     "upgrade_blocked_toolchain_unavailable": "daemon 主机上的 Node 已丢失（工具链被删除）。请重新安装 Node——在此之前自动升级已禁用。"
   },
   "discussion": {
+    "field_domain_role": "领域角色",
+    "field_runtime": "Agent 运行时",
+    "domain_role_loop_supervisor": "Loop 总控",
+    "domain_role_product_manager": "产品经理",
+    "domain_role_product_critic": "产品审查",
+    "domain_role_ux_designer": "UX 设计师",
+    "domain_role_visual_designer": "视觉设计师",
+    "domain_role_visual_fidelity_checker": "视觉保真审查",
+    "domain_role_tech_director": "技术总监",
+    "domain_role_backend_developer": "后端开发",
+    "domain_role_frontend_developer": "前端开发",
+    "domain_role_qa_engineer": "测试工程师",
+    "domain_role_security_reviewer": "安全审查",
+    "domain_role_ops_release_manager": "运维 / 发布经理",
     "role_critic": "批判者",
     "role_pragmatist": "实用主义者",
     "role_innovator": "创新者",
@@ -2525,5 +2539,24 @@
     "error_request_failed": "请求失败。",
     "error_app_server_timeout": "Codex 超时。",
     "error_invalid_params": "请求无效。"
+  },
+  "evolution": {
+    "development_mode": "开发模式",
+    "mode_brownfield_refactor": "在现有系统上重构 / 扩展",
+    "mode_greenfield_new_system": "全部重新开发新系统",
+    "greenfield_target": "新系统目标目录",
+    "greenfield_topology": "新系统拓扑",
+    "topology_monolith": "单体（基础设施最少）",
+    "topology_modular_monolith": "模块化单体（推荐）",
+    "topology_services": "服务化（需要额外基础设施门禁）",
+    "greenfield_help": "在项目内独立目录创建架构、基础设施和 walking skeleton 任务；外部仓库与生产基础设施仍需单独授权。",
+    "brownfield_help": "复用现有架构、模块、数据契约、组件和部署约定，并补齐迁移与回滚方案。",
+    "hifi_review_title": "高保真人工预览",
+    "hifi_review_help": "进入架构前先查看全部图片。满意就批准，不满意可填写意见后要求重新设计。",
+    "images": "张图片",
+    "approve_hifi": "批准并继续",
+    "redesign_hifi": "重新设计",
+    "hifi_approved_message": "用户已批准本轮高保真评审集。",
+    "redesign_default_feedback": "请重新设计高保真评审集，并保持需求与参考图约束。"
   }
 }

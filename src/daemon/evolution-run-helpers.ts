@@ -53,6 +53,7 @@ export function upsertArtifact(run: EvolutionRun, artifact: EvolutionArtifactRef
 }
 
 export function upsertScore(run: EvolutionRun, score: EvolutionScore): void {
+  score.source ??= 'heuristic';
   const index = run.scores.findIndex((entry) => entry.module === score.module);
   if (index >= 0) run.scores[index] = score;
   else run.scores.push(score);

@@ -11,6 +11,11 @@ import logger from '../util/logger.js';
 import { ensureImcDir } from '../util/imc-dir.js';
 import type { AgentType } from '../agent/detect.js';
 import { DISCUSSION_RECONCILE_HIDDEN_MS } from '../../shared/discussion-ui.js';
+import {
+  EVOLUTION_ROLE_SKILL_DEFINITIONS,
+  resolveApprovedEvolutionRoleSkill,
+} from './evolution-artifact-store.js';
+import type { EvolutionRoleId } from '../../shared/evolution-pipeline-constants.js';
 
 const IDLE_TIMEOUT = 300_000;      // max total wall time per response
 const ACTIVE_TIMEOUT = 120_000;    // timeout only when agent is idle with no file growth
@@ -56,9 +61,54 @@ interface DiscussionParticipant {
   agentType: AgentType;
   model?: string;
   roleId: string;
+  domainRoleId?: string;
   roleLabel: string;
   rolePrompt: string;
   reused: boolean;
+}
+
+export function resolveGovernedDiscussionDomainRole(roleId: string | undefined): { label: string; prompt: string } | null {
+  if (!roleId) return null;
+  const definition = EVOLUTION_ROLE_SKILL_DEFINITIONS.find((entry) => entry.roleId === roleId);
+  if (!definition) return null;
+  return {
+    label: definition.label,
+    prompt: [
+      `Domain role: ${definition.label}`,
+      `Mission: ${definition.skillSummary}`,
+      `Responsibilities: ${definition.responsibilities.join('; ')}`,
+      `Required outputs: ${definition.outputs.join('; ')}`,
+      `Quality checklist: ${definition.checklist.join('; ')}`,
+      `Handoff: ${definition.handoff}`,
+      'Base claims on the discussion context and referenced project evidence. State assumptions, risks, and confidence. Produce actionable artifacts or decisions rather than generic agreement.',
+      'List the exact inputs you inspected. Distinguish user requirements, approved upstream work, generated drafts, and external references.',
+      'Do not silently fill decisive missing information. Raise a blocker or explicit assumption.',
+      'A maker produces a candidate; an independent checker challenges it. Never turn REWORK into PASS through summary wording.',
+      'Bind PASS/REWORK/BLOCKED to the reviewed artifact or evidence set and give executable corrections for REWORK.',
+    ].join('\n'),
+  };
+}
+
+export async function resolveGovernedDiscussionDomainRoleAtProject(
+  projectRoot: string,
+  roleId: string | undefined,
+): Promise<{ label: string; prompt: string } | null> {
+  const base = resolveGovernedDiscussionDomainRole(roleId);
+  if (!base || !roleId) return base;
+  const skill = await resolveApprovedEvolutionRoleSkill(projectRoot, roleId as EvolutionRoleId);
+  return {
+    label: base.label,
+    prompt: [
+      base.prompt,
+      '',
+      `Governed skill source: ${skill.source} · ${skill.sourcePath}`,
+      `Governed skill sha256: ${skill.sha256}`,
+      'The following skill bytes are daemon-resolved. Browser payloads cannot replace them:',
+      '<governed-skill>',
+      skill.content,
+      '</governed-skill>',
+    ].join('\n'),
+  };
 }
 
 interface Discussion {
@@ -572,6 +622,7 @@ export async function startDiscussion(
       agentType: string;
       model?: string;
       roleId: string;
+      domainRoleId?: string;
       roleLabel?: string;
       rolePrompt?: string;
       sessionName?: string;
@@ -583,23 +634,31 @@ export async function startDiscussion(
 ): Promise<Discussion> {
   // filePath is set later in runDiscussion after LLM generates the title
   const filePath = '';
-  const participants: DiscussionParticipant[] = opts.participants.map((p, i) => {
+  const participants: DiscussionParticipant[] = await Promise.all(opts.participants.map(async (p, i) => {
     const reused = !!p.sessionName;
     const subId = reused
       ? p.sessionName!.replace('deck_sub_', '')
       : `discuss_${opts.id.slice(0, 6)}_${i}`;
     const builtin = BUILTIN_ROLES[p.roleId];
+    const domain = await resolveGovernedDiscussionDomainRoleAtProject(opts.cwd, p.domainRoleId);
+    if (p.domainRoleId && !domain) throw new Error(`invalid_discussion_domain_role:${p.domainRoleId}`);
+    const customStance = p.roleId === 'custom';
+    const stanceLabel = customStance ? (p.roleLabel?.trim() || 'Custom') : (builtin?.label ?? p.roleId);
+    const stancePrompt = customStance
+      ? (p.rolePrompt?.trim() || 'Use the custom perspective supplied by the user.')
+      : (builtin?.prompt ?? `Use the ${p.roleId} discussion stance.`);
     return {
       subSessionId: subId,
       sessionName: reused ? p.sessionName! : `deck_sub_${subId}`,
       agentType: p.agentType as AgentType,
       model: p.model,
       roleId: p.roleId,
-      roleLabel: p.roleLabel ?? builtin?.label ?? p.roleId,
-      rolePrompt: p.rolePrompt ?? builtin?.prompt ?? `You are: ${p.roleId}`,
+      ...(p.domainRoleId ? { domainRoleId: p.domainRoleId } : {}),
+      roleLabel: domain ? `${domain.label} · ${stanceLabel}` : stanceLabel,
+      rolePrompt: [domain?.prompt, `Discussion stance: ${stancePrompt}`].filter(Boolean).join('\n\n'),
       reused,
     };
-  });
+  }));
 
   // Auto-select verdict participant: user-specified > strongest model
   let verdictIdx = opts.verdictIdx ?? -1;

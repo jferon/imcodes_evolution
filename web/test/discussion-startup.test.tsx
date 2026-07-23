@@ -56,4 +56,23 @@ describe('StartDiscussionDialog — App-owned start (9.2)', () => {
     fireEvent.click(startButton(container)); // empty topic → guarded no-op
     expect(onStartRequested).not.toHaveBeenCalled();
   });
+
+  it('sends governed domain roles and hides the model-centric selector', () => {
+    const onStartRequested = vi.fn();
+    const { container } = render(
+      <StartDiscussionDialog onStartRequested={onStartRequested} onClose={vi.fn()} existingSessions={[]} />,
+    );
+    expect(container.querySelectorAll('[aria-label="discussion.field_domain_role"]')).toHaveLength(2);
+    expect(container.textContent).not.toContain('Opus [1M]');
+    expect(container.textContent).not.toContain('Sonnet');
+
+    fireEvent.input(container.querySelector('textarea')!, { target: { value: 'Review the delivery plan' } });
+    fireEvent.click(startButton(container));
+    expect(onStartRequested).toHaveBeenCalledWith(expect.objectContaining({
+      participants: expect.arrayContaining([
+        expect.objectContaining({ domainRoleId: 'product_critic' }),
+        expect.objectContaining({ domainRoleId: 'tech_director' }),
+      ]),
+    }));
+  });
 });

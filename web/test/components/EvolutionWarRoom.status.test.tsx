@@ -1,6 +1,13 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { EvolutionWarRoomPanel } from '../../src/components/EvolutionWarRoom.js';
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string) => key,
+  }),
+}));
+
+import { artifactPreviewUrl, EvolutionWarRoomPanel } from '../../src/components/EvolutionWarRoom.js';
 import { EVOLUTION_REQUIREMENT_INBOX_DIR } from '@shared/evolution-pipeline-constants.js';
 import type { EvolutionProjection } from '@shared/evolution-pipeline-types.js';
 
@@ -84,7 +91,7 @@ function makeProjection(overrides: Partial<EvolutionProjection> = {}): Evolution
       topic: id,
       roles: ['loop_supervisor'],
       status: 'complete',
-      summary: '结论：PASS。允许进入开发 Loop。',
+      summary: '<!-- EVOLUTION_VERDICT: PASS --> 结论：允许进入开发 Loop。',
       createdAt: now,
       updatedAt: now,
     })),
@@ -132,6 +139,18 @@ function makeProjection(overrides: Partial<EvolutionProjection> = {}): Evolution
 }
 
 describe('EvolutionWarRoomPanel status feedback', () => {
+  it('sanitizes executable and external content from visual previews', () => {
+    const svgUrl = artifactPreviewUrl({
+      previewType: 'svg',
+      content: '<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"><script>alert(1)</script><foreignObject/><image href="https://evil.example/x.png"/><rect style="fill:url(https://evil.example/a)"/></svg>',
+    });
+    const decoded = decodeURIComponent(svgUrl.slice(svgUrl.indexOf(',') + 1));
+    expect(decoded).not.toMatch(/script|foreignObject|onload|evil\.example/i);
+    expect(decoded).toContain('<rect');
+    expect(artifactPreviewUrl({ previewType: 'image', content: 'https://evil.example/x.png' }))
+      .toBe('data:image/gif;base64,R0lGODlhAQABAAAAACw=');
+  });
+
   it('shows an explicit idle status before a run starts', () => {
     render(<EvolutionWarRoomPanel {...props()} />);
 
@@ -161,8 +180,10 @@ describe('EvolutionWarRoomPanel status feedback', () => {
     const fullPath = `/Users/mac/tjs/${expectedPath}`;
     expect(onLaunch).toHaveBeenCalledWith(expectedPath, {
       autoStartImplementation: true,
-      roundtableGateMode: 'planning',
+      roundtableGateMode: 'strict',
       designTargetSurface: 'auto',
+      developmentMode: 'brownfield_refactor',
+      requireHifiHumanApproval: true,
     });
     const status = screen.getByTestId('evolution-run-status');
     expect(status.textContent).toContain('从需求文档启动已发出');
@@ -182,8 +203,10 @@ describe('EvolutionWarRoomPanel status feedback', () => {
 
     expect(onLaunch).toHaveBeenCalledWith('.imcodes/inbox/requirements/specs/payment.md', {
       autoStartImplementation: true,
-      roundtableGateMode: 'planning',
+      roundtableGateMode: 'strict',
       designTargetSurface: 'auto',
+      developmentMode: 'brownfield_refactor',
+      requireHifiHumanApproval: true,
     });
     expect(screen.getByTestId('evolution-run-status').textContent).toContain(`目标: ${absolutePath}`);
   });
@@ -198,9 +221,120 @@ describe('EvolutionWarRoomPanel status feedback', () => {
 
     expect(onLaunch).toHaveBeenCalledWith(`${EVOLUTION_REQUIREMENT_INBOX_DIR}/brief.md`, {
       autoStartImplementation: true,
-      roundtableGateMode: 'planning',
+      roundtableGateMode: 'strict',
       designTargetSurface: 'both',
+      developmentMode: 'brownfield_refactor',
+      requireHifiHumanApproval: true,
     });
+  });
+
+  it('passes an explicit greenfield target when launching a new system', () => {
+    const onLaunch = vi.fn();
+    render(<EvolutionWarRoomPanel {...props({ onLaunch })} />);
+
+    const modeSelect = screen.getByLabelText('evolution.development_mode') as HTMLSelectElement;
+    modeSelect.value = 'greenfield_new_system';
+    for (const option of Array.from(modeSelect.options)) {
+      option.selected = option.value === 'greenfield_new_system';
+    }
+    fireEvent.input(modeSelect);
+    fireEvent.change(modeSelect);
+    fireEvent.input(screen.getByLabelText('evolution.greenfield_target'), {
+      target: { value: 'apps/platform-v2' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '从需求文档启动' }));
+
+    expect(onLaunch).toHaveBeenCalledWith(`${EVOLUTION_REQUIREMENT_INBOX_DIR}/brief.md`, {
+      autoStartImplementation: true,
+      roundtableGateMode: 'strict',
+      designTargetSurface: 'auto',
+      developmentMode: 'greenfield_new_system',
+      developmentTargetRelativeDir: 'apps/platform-v2',
+      greenfieldTopology: 'modular_monolith',
+      requireHifiHumanApproval: true,
+    });
+  });
+
+  it('previews the high-fidelity review set and exposes explicit approve/redesign actions', () => {
+    const onContinue = vi.fn();
+    const onGateAction = vi.fn();
+    const revisionId = 'revision-hifi-screen';
+    const projection = makeProjection({
+      controlVersion: 2,
+      runRevision: 7,
+      stage: 'needs_human',
+      blockingQuestions: [{
+        id: 'design-hifi-approval-evo-test',
+        stage: 'design_hifi',
+        roleId: 'visual_designer',
+        question: 'Review the high-fidelity set.',
+        createdAt: Date.now(),
+      }],
+      artifacts: [
+        ...makeProjection().artifacts,
+        {
+          id: 'hifi-screen',
+          kind: 'hifi_mockup',
+          path: 'design/hifi-screen.svg',
+          title: 'Checkout',
+          stage: 'design_hifi',
+          roleId: 'visual_designer',
+          revisionId,
+          status: 'candidate',
+          assurance: 'pipeline_draft',
+          preview: {
+            previewType: 'svg',
+            content: '<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>',
+          },
+          createdAt: Date.now(),
+        },
+      ],
+      artifactRevisions: [{
+        id: revisionId,
+        artifactId: 'hifi-screen',
+        kind: 'hifi_mockup',
+        logicalPath: 'design/hifi-screen.svg',
+        immutablePath: `revisions/blobs/${revisionId}.svg`,
+        sha256: 'a'.repeat(64),
+        bytes: 100,
+        stage: 'design_hifi',
+        roleId: 'visual_designer',
+        status: 'candidate',
+        assurance: 'pipeline_draft',
+        createdAt: Date.now(),
+      }],
+      designReviewSets: [{
+        id: 'review-set-hifi',
+        revisionIds: [revisionId],
+        immutableManifestPath: 'review-sets/review-set-hifi.pending.json',
+        status: 'pending',
+        createdAt: Date.now(),
+      }],
+      gates: [{
+        id: 'gate-hifi',
+        kind: 'design_review',
+        stage: 'design_hifi',
+        status: 'open',
+        candidateRevisionIds: [revisionId],
+        reviewSetId: 'review-set-hifi',
+        requiredAssurance: 'human_approved',
+        openedAt: Date.now(),
+      }],
+    });
+    render(<EvolutionWarRoomPanel {...props({ projection, onContinue, onGateAction })} />);
+
+    const review = screen.getByTestId('evolution-hifi-human-review');
+    expect(review.querySelector('img')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'evolution.approve_hifi' }));
+    expect(onGateAction).toHaveBeenCalledWith('gate-hifi', 'approve');
+
+    fireEvent.click(screen.getByRole('button', { name: 'evolution.redesign_hifi' }));
+    expect(onGateAction).toHaveBeenCalledWith(
+      'gate-hifi',
+      'request_changes',
+      'evolution.redesign_default_feedback',
+    );
+    expect(onContinue).not.toHaveBeenCalled();
   });
 
   it('uses a stronger pending message while the launch request is in flight', () => {
@@ -296,8 +430,10 @@ describe('EvolutionWarRoomPanel status feedback', () => {
     fireEvent.click(restart);
     expect(onLaunch).toHaveBeenCalledWith('.imcodes/inbox/requirements/brief.md', {
       autoStartImplementation: true,
-      roundtableGateMode: 'planning',
+      roundtableGateMode: 'strict',
       designTargetSurface: 'auto',
+      developmentMode: 'brownfield_refactor',
+      requireHifiHumanApproval: true,
     });
   });
 

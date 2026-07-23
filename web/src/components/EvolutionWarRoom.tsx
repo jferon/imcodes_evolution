@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { useTranslation } from 'react-i18next';
 import { uploadFile } from '../api.js';
-import type { EvolutionDesignTargetSurface, EvolutionInboxWatcherStatus, EvolutionProjection, EvolutionReferenceAttachmentInput, EvolutionReferenceBriefImportResult, EvolutionRoleId, EvolutionRoundtableGateMode } from '../evolution-pipeline.js';
+import type { EvolutionDesignTargetSurface, EvolutionDevelopmentMode, EvolutionGateAction, EvolutionGreenfieldTopology, EvolutionInboxWatcherStatus, EvolutionProjection, EvolutionReferenceAttachmentInput, EvolutionReferenceBriefImportResult, EvolutionRoleId, EvolutionRoundtableGateMode, EvolutionStage } from '../evolution-pipeline.js';
 import {
+  EVOLUTION_HIFI_REDESIGN_MESSAGE_PREFIX,
   EVOLUTION_REQUIREMENT_INBOX_DIR,
   type EvolutionArtifactKind,
 } from '@shared/evolution-pipeline-constants.js';
@@ -24,13 +26,14 @@ interface Props {
   autoDeliverPending?: boolean;
   lastError?: string | null;
   onClose: () => void;
-  onLaunch: (sourceRelativePath: string, options: { autoStartImplementation: boolean; roundtableGateMode: EvolutionRoundtableGateMode; designTargetSurface: EvolutionDesignTargetSurface }) => void;
-  onLaunchDemo: (options: { autoStartImplementation: boolean; roundtableGateMode: EvolutionRoundtableGateMode; designTargetSurface: EvolutionDesignTargetSurface }) => void;
+  onLaunch: (sourceRelativePath: string, options: { autoStartImplementation: boolean; roundtableGateMode: EvolutionRoundtableGateMode; designTargetSurface: EvolutionDesignTargetSurface; developmentMode: EvolutionDevelopmentMode; developmentTargetRelativeDir?: string; greenfieldTopology?: EvolutionGreenfieldTopology; requireHifiHumanApproval: boolean }) => void;
+  onLaunchDemo: (options: { autoStartImplementation: boolean; roundtableGateMode: EvolutionRoundtableGateMode; designTargetSurface: EvolutionDesignTargetSurface; developmentMode: EvolutionDevelopmentMode; developmentTargetRelativeDir?: string; greenfieldTopology?: EvolutionGreenfieldTopology; requireHifiHumanApproval: boolean }) => void;
   onCreateReferenceBrief: (options: { attachments: EvolutionReferenceAttachmentInput[]; note?: string; taskName?: string }) => string | null;
   onScanInbox: () => void;
   onCheckStaging: () => void;
   onStop: () => void;
-  onContinue: (message?: string) => void;
+  onContinue: (message?: string, targetStage?: EvolutionStage) => void;
+  onGateAction?: (gateId: string, action: EvolutionGateAction, feedback?: string) => void;
   onStartAutoDeliver?: (changeName: string) => void;
   onSendUserMessage: (text: string, roleId?: EvolutionRoleId) => void;
   onUpdateRoleSkill: (roleId: EvolutionRoleId, markdown: string) => void;
@@ -175,10 +178,7 @@ const REQUIRED_OPENSPEC_LOOP_ROUNDTABLES: Array<{ id: string; label: string }> =
 const EVOLUTION_PROGRESS_STAGES = EVOLUTION_STAGES.filter((stage) => !['needs_human', 'failed', 'stopped'].includes(stage));
 
 function isRoundtablePass(summary: string | undefined): boolean {
-  const text = (summary ?? '').trim();
-  if (!text) return false;
-  if (/(REWORK|BLOCKED|FAIL|FAILED|不允许|不能进入|不能\s*PASS|阻塞|失败|返工|重做)/i.test(text)) return false;
-  return /(^|[^\w])PASS([^\w]|$)|结论\s*[：:]\s*PASS|通过|可进入|允许进入/i.test(text);
+  return /<!--\s*EVOLUTION_VERDICT:\s*PASS\s*-->/i.test(summary ?? '');
 }
 
 function evaluateOpenSpecLoopGate(
@@ -227,9 +227,19 @@ function isVisualArtifact(path: string): boolean {
   return /\.(svg|png|jpg|jpeg|webp)$/i.test(path);
 }
 
-function artifactPreviewUrl(preview: { previewType: string; content: string }): string {
-  if (preview.previewType === 'image') return preview.content;
-  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(preview.content)}`;
+export function artifactPreviewUrl(preview: { previewType: string; content: string }): string {
+  if (preview.previewType === 'image') {
+    return /^data:image\/(?:png|jpeg|webp|gif);base64,[a-z0-9+/=\s]+$/i.test(preview.content)
+      ? preview.content
+      : 'data:image/gif;base64,R0lGODlhAQABAAAAACw=';
+  }
+  const sanitized = preview.content
+    .replace(/<(script|foreignObject|iframe|object|embed|link|style)\b[\s\S]*?<\/\1\s*>/gi, '')
+    .replace(/<(script|foreignObject|iframe|object|embed|link|style)\b[^>]*\/?>/gi, '')
+    .replace(/\s+on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+    .replace(/\s+(?:href|xlink:href)\s*=\s*(?:"(?!#)[^"]*"|'(?!#)[^']*')/gi, '')
+    .replace(/url\s*\(\s*['"]?(?!#)[^)]+\)/gi, 'none');
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(sanitized)}`;
 }
 
 function artifactPreviewText(content: string): string {
@@ -542,16 +552,21 @@ export function EvolutionWarRoomPanel({
   onCheckStaging,
   onStop,
   onContinue,
+  onGateAction,
   onStartAutoDeliver,
   onSendUserMessage,
   onUpdateRoleSkill,
   onApproveRoleSkillCandidate,
   onRefresh,
 }: Props) {
+  const { t } = useTranslation();
   const [sourcePath, setSourcePath] = useState(() => defaultLaunchSourcePath(projectRoot));
   const [autoStartImplementation, setAutoStartImplementation] = useState(true);
-  const [roundtableGateMode, setRoundtableGateMode] = useState<EvolutionRoundtableGateMode>('planning');
+  const [roundtableGateMode, setRoundtableGateMode] = useState<EvolutionRoundtableGateMode>('strict');
   const [designTargetSurface, setDesignTargetSurface] = useState<EvolutionDesignTargetSurface>('auto');
+  const [developmentMode, setDevelopmentMode] = useState<EvolutionDevelopmentMode>('brownfield_refactor');
+  const [developmentTargetRelativeDir, setDevelopmentTargetRelativeDir] = useState('apps/new-system');
+  const [greenfieldTopology, setGreenfieldTopology] = useState<EvolutionGreenfieldTopology>('modular_monolith');
   const [message, setMessage] = useState('');
   const [selectedTarget, setSelectedTarget] = useState<EvolutionMessageTarget>('all');
   const [focusRole, setFocusRole] = useState<EvolutionRoleFocus>('all');
@@ -616,6 +631,18 @@ export function EvolutionWarRoomPanel({
   const filteredArtifacts = useMemo(() => (
     focusRole === 'all' ? projection?.artifacts ?? [] : (projection?.artifacts ?? []).filter((artifact) => artifact.roleId === focusRole)
   ), [focusRole, projection?.artifacts]);
+  const hifiApprovalQuestion = projection?.blockingQuestions.find((question) => question.id === `design-hifi-approval-${projection.runId}`) ?? null;
+  const hifiReviewGate = projection?.gates?.find((gate) => gate.kind === 'design_review' && gate.status === 'open') ?? null;
+  const hifiReviewSet = hifiReviewGate?.reviewSetId
+    ? projection?.designReviewSets?.find((reviewSet) => reviewSet.id === hifiReviewGate.reviewSetId)
+    : null;
+  const hifiReviewArtifacts = useMemo(() => (
+    hifiReviewSet
+      ? hifiReviewSet.revisionIds
+          .map((revisionId) => (projection?.artifacts ?? []).find((artifact) => artifact.revisionId === revisionId))
+          .filter((artifact): artifact is EvolutionProjection['artifacts'][number] => !!artifact && isVisualArtifact(artifact.path))
+      : (projection?.artifacts ?? []).filter((artifact) => artifact.stage === 'design_hifi' && isVisualArtifact(artifact.path))
+  ), [hifiReviewSet, projection?.artifacts]);
   const filteredRoleSkillArtifacts = useMemo(() => (
     focusRole === 'all'
       ? (projection?.artifacts ?? []).filter((artifact) => artifact.kind === 'role_skill')
@@ -667,6 +694,7 @@ export function EvolutionWarRoomPanel({
     projection?.runId ? `Run: ${projection.runId}` : null,
     projection?.stage ? `阶段: ${stageLabel(projection.stage)}（${projection.stage}）` : null,
     projection?.designTargetSurface ? `高保真目标端: ${designTargetLabel(projection.designTargetSurface)}` : null,
+    projection?.developmentMode ? `${t('evolution.development_mode')}: ${t(`evolution.mode_${projection.developmentMode}`)}` : null,
     projection?.source.relativePath ? `需求: ${projection.source.relativePath}` : lastManualAction?.sourceRelativePath ? `目标: ${lastManualAction.sourceRelativePath}` : null,
     lastManualAction ? `操作时间: ${formatTime(lastManualAction.createdAt)}` : null,
     activeWatcher ? 'Watcher: active' : projectRoot ? 'Watcher: inactive' : 'Watcher: unavailable',
@@ -702,9 +730,9 @@ export function EvolutionWarRoomPanel({
       sourceRelativePath: lastReferenceBrief.sourceRelativePath,
       createdAt: Date.now(),
     });
-    onLaunch(lastReferenceBrief.sourceRelativePath, { autoStartImplementation, roundtableGateMode, designTargetSurface });
+    onLaunch(lastReferenceBrief.sourceRelativePath, { autoStartImplementation, roundtableGateMode, designTargetSurface, developmentMode, ...(developmentMode === 'greenfield_new_system' ? { developmentTargetRelativeDir, greenfieldTopology } : {}), requireHifiHumanApproval: true });
     setPendingReferenceLaunchRequestId(null);
-  }, [autoStartImplementation, designTargetSurface, lastReferenceBrief, onLaunch, pendingReferenceLaunchRequestId, roundtableGateMode]);
+  }, [autoStartImplementation, designTargetSurface, developmentMode, developmentTargetRelativeDir, greenfieldTopology, lastReferenceBrief, onLaunch, pendingReferenceLaunchRequestId, roundtableGateMode]);
 
   const handleReferenceFilesChange = (event: Event) => {
     const files = Array.from((event.currentTarget as HTMLInputElement).files ?? [])
@@ -776,7 +804,7 @@ export function EvolutionWarRoomPanel({
       sourceRelativePath: trimmed,
       createdAt: Date.now(),
     });
-    onLaunch(sourceRelativePath, { autoStartImplementation, roundtableGateMode, designTargetSurface });
+    onLaunch(sourceRelativePath, { autoStartImplementation, roundtableGateMode, designTargetSurface, developmentMode, ...(developmentMode === 'greenfield_new_system' ? { developmentTargetRelativeDir, greenfieldTopology } : {}), requireHifiHumanApproval: true });
   };
 
   const handleRestartFromCurrentRequirement = () => {
@@ -788,12 +816,12 @@ export function EvolutionWarRoomPanel({
       sourceRelativePath: projection.source.relativePath,
       createdAt: Date.now(),
     });
-    onLaunch(projection.source.relativePath, { autoStartImplementation, roundtableGateMode, designTargetSurface });
+    onLaunch(projection.source.relativePath, { autoStartImplementation, roundtableGateMode, designTargetSurface, developmentMode, ...(developmentMode === 'greenfield_new_system' ? { developmentTargetRelativeDir, greenfieldTopology } : {}), requireHifiHumanApproval: true });
   };
 
   const handleLaunchDemo = () => {
     setLastManualAction({ kind: 'demo', label: '运行内置 Demo', createdAt: Date.now() });
-    onLaunchDemo({ autoStartImplementation, roundtableGateMode, designTargetSurface });
+    onLaunchDemo({ autoStartImplementation, roundtableGateMode, designTargetSurface, developmentMode, ...(developmentMode === 'greenfield_new_system' ? { developmentTargetRelativeDir, greenfieldTopology } : {}), requireHifiHumanApproval: true });
   };
 
   const handleScanInbox = () => {
@@ -952,6 +980,39 @@ export function EvolutionWarRoomPanel({
           </select>
           <small>会影响 PRD、低保真、高保真 screen pack 和 taste-skill 提示词；参考图会逐张映射到对应端/页面状态。</small>
         </label>
+        <label class="evolution-war-room-field evolution-design-target-field">
+          <span>{t('evolution.development_mode')}</span>
+          <select
+            aria-label={t('evolution.development_mode')}
+            value={developmentMode}
+            onInput={(event) => setDevelopmentMode((event.currentTarget as HTMLSelectElement).value as EvolutionDevelopmentMode)}
+            onChange={(event) => setDevelopmentMode((event.currentTarget as HTMLSelectElement).value as EvolutionDevelopmentMode)}
+          >
+            <option value="brownfield_refactor">{t('evolution.mode_brownfield_refactor')}</option>
+            <option value="greenfield_new_system">{t('evolution.mode_greenfield_new_system')}</option>
+          </select>
+          {developmentMode === 'greenfield_new_system' && (
+            <>
+              <input
+                value={developmentTargetRelativeDir}
+                onInput={(event) => setDevelopmentTargetRelativeDir((event.currentTarget as HTMLInputElement).value)}
+                placeholder="apps/new-system"
+                aria-label={t('evolution.greenfield_target')}
+              />
+              <select
+                aria-label={t('evolution.greenfield_topology')}
+                value={greenfieldTopology}
+                onInput={(event) => setGreenfieldTopology((event.currentTarget as HTMLSelectElement).value as EvolutionGreenfieldTopology)}
+                onChange={(event) => setGreenfieldTopology((event.currentTarget as HTMLSelectElement).value as EvolutionGreenfieldTopology)}
+              >
+                <option value="monolith">{t('evolution.topology_monolith')}</option>
+                <option value="modular_monolith">{t('evolution.topology_modular_monolith')}</option>
+                <option value="services">{t('evolution.topology_services')}</option>
+              </select>
+            </>
+          )}
+          <small>{developmentMode === 'greenfield_new_system' ? t('evolution.greenfield_help') : t('evolution.brownfield_help')}</small>
+        </label>
 
         <div class="evolution-war-room-inbox">
           <div>
@@ -1030,9 +1091,61 @@ export function EvolutionWarRoomPanel({
               ))}
             </div>
 
+            {(hifiApprovalQuestion || hifiReviewGate) && (
+              <section class="evolution-war-room-roundtables" data-testid="evolution-hifi-human-review">
+                <div class="evolution-section-heading">
+                  <div>
+                    <h3>{t('evolution.hifi_review_title')}</h3>
+                    <span>{t('evolution.hifi_review_help')}</span>
+                  </div>
+                  <span>{hifiReviewArtifacts.length} {t('evolution.images')}</span>
+                </div>
+                <div class="evolution-war-room-grid">
+                  {hifiReviewArtifacts.map((artifact) => (
+                    <div key={artifact.id} class="evolution-artifact-card visual-artifact">
+                      <div class="evolution-list-row">
+                        <strong>{artifact.title ?? artifact.kind}</strong>
+                        <span>{artifact.path} · {artifact.assurance ?? 'legacy_unverified'}</span>
+                      </div>
+                      {(artifact.preview?.previewType === 'svg' || artifact.preview?.previewType === 'image') && (
+                        <div class="evolution-artifact-preview evolution-artifact-preview-svg">
+                          <img src={artifactPreviewUrl(artifact.preview)} alt={artifact.title ?? artifact.path} />
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+                <div class="evolution-war-room-actions">
+                  <button
+                    type="button"
+                    class="btn btn-primary"
+                    disabled={continuePending}
+                    onClick={() => {
+                      if (hifiReviewGate && onGateAction) onGateAction(hifiReviewGate.id, 'approve');
+                      else onContinue(t('evolution.hifi_approved_message'), 'design_hifi');
+                    }}
+                  >
+                    {t('evolution.approve_hifi')}
+                  </button>
+                  <button
+                    type="button"
+                    class="btn btn-secondary"
+                    disabled={continuePending}
+                    onClick={() => {
+                      const feedback = message.trim() || t('evolution.redesign_default_feedback');
+                      if (hifiReviewGate && onGateAction) onGateAction(hifiReviewGate.id, 'request_changes', feedback);
+                      else onContinue(`${EVOLUTION_HIFI_REDESIGN_MESSAGE_PREFIX} ${feedback}`, 'design_lofi');
+                    }}
+                  >
+                    {t('evolution.redesign_hifi')}
+                  </button>
+                </div>
+              </section>
+            )}
+
             <div class="evolution-war-room-actions">
               <button class="btn btn-secondary" disabled={!canPause || stopPending} onClick={onStop}>{stopPending ? '暂停中…' : '暂停'}</button>
-              <button class="btn btn-secondary" disabled={terminal || continuePending} onClick={() => onContinue(message)}>
+              <button class="btn btn-secondary" disabled={terminal || continuePending || !!hifiApprovalQuestion || !!hifiReviewGate} onClick={() => onContinue(message)}>
                 {continuePending ? '继续中…' : isProductionGate ? '确认生产门禁' : paused ? '继续执行' : '继续/解除阻塞'}
               </button>
               {projection.stage === 'stopped' && projection.source.relativePath && (

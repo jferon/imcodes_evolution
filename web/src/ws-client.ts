@@ -1037,6 +1037,7 @@ export class WsClient {
       agentType: string;
       model?: string;
       roleId: string;
+      domainRoleId?: string;
       roleLabel?: string;
       rolePrompt?: string;
       sessionName?: string;

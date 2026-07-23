@@ -118,9 +118,16 @@ function formatRoleInstruction(role: EvolutionRoundtableRoleInstruction): string
     `- Mission: ${role.skillSummary ?? '按该角色职责参与圆桌讨论。'}`,
   ];
   if (role.currentAction) lines.push(`- Current action: ${role.currentAction}`);
+  if (role.skillSnapshotId) lines.push(`- Bound skill snapshot: ${role.skillSnapshotId} (${role.skillSha256 ?? 'sha256 unavailable'})`);
   if (role.responsibilities.length > 0) {
     lines.push('- Responsibilities:');
     for (const item of role.responsibilities.slice(0, 8)) lines.push(`  - ${item}`);
+  }
+  if (role.skillContent) {
+    lines.push('- Exact governed skill content:');
+    lines.push('```markdown');
+    lines.push(role.skillContent);
+    lines.push('```');
   }
   return lines.join('\n');
 }
@@ -160,7 +167,8 @@ function composeRoundtablePrompt(request: EvolutionRoundtableLaunchRequest, targ
     '',
     '## 最终输出',
     '',
-    '必须以 PASS 或 REWORK 开头；如果是 REWORK，列出阻塞项、归属角色、建议修改到哪个 artifact；如果是 PASS，说明为什么足以进入下一阶段。',
+    '先写结论与证据；如果是 REWORK，列出阻塞项、归属角色、建议修改到哪个 artifact；如果是 PASS，说明为什么足以进入下一阶段。',
+    '最后一行必须且只能使用以下机器可读标记之一：`<!-- EVOLUTION_VERDICT: PASS -->`、`<!-- EVOLUTION_VERDICT: REWORK -->`、`<!-- EVOLUTION_VERDICT: BLOCKED -->`。缺失或格式错误会按阻塞处理。',
   ].join('\n');
 }
 
@@ -277,7 +285,8 @@ setEvolutionRoundtableLauncher(async (
         'Evolution roundtable mode is discussion-and-review.',
         'Use the injected role skill playbooks: Round 1 expands and improves the artifact set; Round 2 cross-reviews and converges to PASS/REWORK.',
         'Do not execute the original requirement, do not edit project files, do not run delivery/development tasks, and do not write P2P execution proof markers.',
-        'End with a clear PASS or REWORK verdict, role-owned required changes, artifact paths that should be updated, and any human decisions needed before the Evolution pipeline continues.',
+        'End with role-owned required changes, artifact paths that should be updated, and any human decisions needed before the Evolution pipeline continues.',
+        'The final line must be exactly one machine marker: <!-- EVOLUTION_VERDICT: PASS -->, <!-- EVOLUTION_VERDICT: REWORK -->, or <!-- EVOLUTION_VERDICT: BLOCKED -->.',
       ].join('\n'),
       launchOrigin: {
         kind: 'manual',

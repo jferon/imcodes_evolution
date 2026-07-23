@@ -744,6 +744,20 @@
     "upgrade_blocked_toolchain_unavailable": "Node is missing on the daemon host (toolchain removed). Reinstall Node — auto-upgrade is disabled until then."
   },
   "discussion": {
+    "field_domain_role": "Domain role",
+    "field_runtime": "Agent runtime",
+    "domain_role_loop_supervisor": "Loop Supervisor",
+    "domain_role_product_manager": "Product Manager",
+    "domain_role_product_critic": "Product Critic",
+    "domain_role_ux_designer": "UX Designer",
+    "domain_role_visual_designer": "Visual Designer",
+    "domain_role_visual_fidelity_checker": "Visual Fidelity Checker",
+    "domain_role_tech_director": "Technical Director",
+    "domain_role_backend_developer": "Backend Developer",
+    "domain_role_frontend_developer": "Frontend Developer",
+    "domain_role_qa_engineer": "QA Engineer",
+    "domain_role_security_reviewer": "Security Reviewer",
+    "domain_role_ops_release_manager": "Operations / Release Manager",
     "role_critic": "Critic",
     "role_pragmatist": "Pragmatist",
     "role_innovator": "Innovator",
@@ -2525,5 +2539,24 @@
     "error_request_failed": "Request failed.",
     "error_app_server_timeout": "Codex timed out.",
     "error_invalid_params": "Invalid request."
+  },
+  "evolution": {
+    "development_mode": "Development mode",
+    "mode_brownfield_refactor": "Refactor / extend the current system",
+    "mode_greenfield_new_system": "Build a new system",
+    "greenfield_target": "New system target directory",
+    "greenfield_topology": "New system topology",
+    "topology_monolith": "Monolith (least infrastructure)",
+    "topology_modular_monolith": "Modular monolith (recommended)",
+    "topology_services": "Services (additional infrastructure gates required)",
+    "greenfield_help": "Creates architecture and foundation tasks inside a dedicated, project-relative target. External repositories and production infrastructure remain separately authorized.",
+    "brownfield_help": "Reuses the current architecture, modules, data contracts, components and deployment conventions, with migration and rollback planning.",
+    "hifi_review_title": "Review high-fidelity design",
+    "hifi_review_help": "Preview every image before architecture work starts. Approve this set or request another design pass with feedback.",
+    "images": "images",
+    "approve_hifi": "Approve and continue",
+    "redesign_hifi": "Request redesign",
+    "hifi_approved_message": "High-fidelity review set approved by the user.",
+    "redesign_default_feedback": "Please redesign the high-fidelity set and preserve the requirement and reference-image constraints."
   }
 }

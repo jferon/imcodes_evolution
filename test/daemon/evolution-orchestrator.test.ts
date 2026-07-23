@@ -1,14 +1,15 @@
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { afterEach, describe, expect, it } from 'vitest';
-import { EVOLUTION_PIPELINE_MSG, EVOLUTION_REQUIREMENT_INBOX_DIR } from '../../shared/evolution-pipeline-constants.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { EVOLUTION_HIFI_REDESIGN_MESSAGE_PREFIX, EVOLUTION_PIPELINE_MSG, EVOLUTION_REQUIREMENT_INBOX_DIR } from '../../shared/evolution-pipeline-constants.js';
 import { parseOpenSpecTasksMarkdown } from '../../shared/openspec-auto-deliver-validators.js';
 import { validateEvolutionProjection } from '../../shared/evolution-pipeline-validators.js';
 import { stopAllEvolutionInboxWatchers } from '../../src/daemon/evolution-inbox-watch-manager.js';
 import {
   advanceEvolutionRunStage,
+  applyEvolutionGateAction,
   approveEvolutionRoleSkillCandidate,
   checkEvolutionStagingConfig,
   continueEvolutionRun,
@@ -595,6 +596,16 @@ describe('evolution orchestrator', () => {
     expect(updated.value.evidence.some((entry) => entry.source === 'role_skill_editor')).toBe(true);
     expect(updated.value.evidence.at(-1)?.source).toBe('role_skill_release_candidate');
     expect(validateEvolutionProjection(updated.value).ok).toBe(true);
+    const updatedSnapshot = [...(updated.value.skillSnapshots ?? [])].reverse()
+      .find((snapshot) => snapshot.roleId === 'visual_designer');
+    expect(updatedSnapshot).toEqual(expect.objectContaining({
+      source: 'custom_user',
+      sha256: expect.any(String),
+    }));
+    await expect(readFile(
+      join(root, '.imc/evolution', launched.value.runId, 'skill-snapshots', `${updatedSnapshot?.id}.md`),
+      'utf8',
+    )).resolves.toBe(await readFile(skillPath, 'utf8'));
     const releaseCandidate = updated.value.artifacts.find((artifact) => artifact.kind === 'role_skill_release_candidate' && artifact.roleId === 'visual_designer');
     await expect(readFile(join(root, '.imc/evolution', launched.value.runId, releaseCandidate!.path), 'utf8')).resolves.toContain('Release Candidate Governance');
     await expect(readFile(join(root, '.imc/evolution', launched.value.runId, releaseCandidate!.path), 'utf8')).resolves.toContain('config/evolution/role-skills/approved/visual-hifi.md');
@@ -879,6 +890,331 @@ describe('evolution orchestrator', () => {
       'staging_setup:delivery/staging-setup.md',
       'staging_config_example:delivery/delivery.example.json',
     ]));
+  });
+
+  it('waits for explicit high-fidelity approval when requested by the launch', async () => {
+    const root = await makeRoot();
+    const sourceRelativePath = await writeRequirement(root, 'hifi-human-review.md');
+    const launched = await launchEvolutionRun({
+      projectRoot: root,
+      nowMs: 8_000,
+      request: {
+        requestId: 'req-hifi-human-review',
+        sessionName: 'deck_demo_brain',
+        sourceRelativePath,
+        requireHifiHumanApproval: true,
+      },
+    });
+    expect(launched.ok).toBe(true);
+    if (!launched.ok) return;
+
+    const waiting = await runEvolutionAutopilot(launched.value.runId, null, { nowMs: 8_100 });
+    expect(waiting.ok).toBe(true);
+    if (!waiting.ok) return;
+    expect(waiting.value.stage).toBe('needs_human');
+    expect(waiting.value.blockingQuestions.map((question) => question.id)).toContain(
+      `design-hifi-approval-${launched.value.runId}`,
+    );
+    expect(waiting.value.artifacts.some((artifact) => artifact.kind === 'hifi_mockup' && !!artifact.preview)).toBe(true);
+    const firstDesignReviewUpdatedAt = waiting.value.roundtables.find((roundtable) => roundtable.id === 'design-review')?.updatedAt;
+
+    const redesignRequested = await continueEvolutionRun({
+      runId: launched.value.runId,
+      targetStage: 'design_lofi',
+      message: `${EVOLUTION_HIFI_REDESIGN_MESSAGE_PREFIX} Increase contrast and clarify the primary action.`,
+      nowMs: 8_150,
+    });
+    expect(redesignRequested.ok).toBe(true);
+    if (!redesignRequested.ok) return;
+    expect(redesignRequested.value.stage).toBe('design_lofi');
+    expect(redesignRequested.value.artifacts.some((artifact) => artifact.kind === 'visual_fidelity_report')).toBe(true);
+    expect(redesignRequested.value.evidence).toContainEqual(expect.objectContaining({
+      source: 'human_design_rework_review_invalidation',
+      summary: expect.stringContaining('design-review'),
+    }));
+
+    const redesigned = await runEvolutionAutopilot(launched.value.runId, null, { nowMs: 8_200 });
+    expect(redesigned.ok).toBe(true);
+    if (!redesigned.ok) return;
+    expect(redesigned.value.stage).toBe('needs_human');
+    expect(redesigned.value.blockingQuestions.map((question) => question.id)).toContain(
+      `design-hifi-approval-${launched.value.runId}`,
+    );
+    expect(redesigned.value.roundtables.find((roundtable) => roundtable.id === 'design-review')?.updatedAt)
+      .toBeGreaterThan(firstDesignReviewUpdatedAt ?? 0);
+
+    const approved = await continueEvolutionRun({
+      runId: launched.value.runId,
+      targetStage: 'design_hifi',
+      message: 'Approved after previewing the redesigned set.',
+      nowMs: 8_250,
+    });
+    expect(approved.ok).toBe(true);
+    const completed = await runEvolutionAutopilot(launched.value.runId, null, { nowMs: 8_300 });
+    expect(completed.ok).toBe(true);
+    if (!completed.ok) return;
+    expect(completed.value.stage).toBe('tasks_ready');
+    expect(completed.value.evidence.some((entry) => entry.source === 'human_design_approval')).toBe(true);
+  });
+
+  it('applies high-fidelity decisions through a CAS and idempotent typed gate', async () => {
+    const root = await makeRoot();
+    const sourceRelativePath = await writeRequirement(root, 'hifi-typed-gate.md');
+    const launched = await launchEvolutionRun({
+      projectRoot: root,
+      nowMs: 8_320,
+      request: {
+        requestId: 'req-hifi-typed-gate',
+        sessionName: 'deck_demo_brain',
+        sourceRelativePath,
+        requireHifiHumanApproval: true,
+      },
+    });
+    expect(launched.ok).toBe(true);
+    if (!launched.ok) return;
+
+    const waiting = await runEvolutionAutopilot(launched.value.runId, null, { nowMs: 8_330 });
+    expect(waiting.ok).toBe(true);
+    if (!waiting.ok) return;
+    const gate = waiting.value.gates?.find((entry) => entry.kind === 'design_review' && entry.status === 'open');
+    expect(gate).toBeDefined();
+    expect(waiting.value.runRevision).toBeTypeOf('number');
+    if (!gate || waiting.value.runRevision === undefined) return;
+
+    const stale = await applyEvolutionGateAction({
+      runId: waiting.value.runId,
+      gateId: gate.id,
+      action: 'approve',
+      mutationId: 'typed-gate-stale',
+      expectedRunRevision: waiting.value.runRevision - 1,
+      nowMs: 8_340,
+    });
+    expect(stale.ok).toBe(false);
+    if (!stale.ok) expect(stale.issues[0]?.code).toBe('stale_evolution_run_revision');
+
+    const approved = await applyEvolutionGateAction({
+      runId: waiting.value.runId,
+      gateId: gate.id,
+      action: 'approve',
+      mutationId: 'typed-gate-approve',
+      expectedRunRevision: waiting.value.runRevision,
+      nowMs: 8_350,
+    });
+    expect(approved.ok).toBe(true);
+    if (!approved.ok) return;
+    expect(approved.value.gates?.find((entry) => entry.id === gate.id)?.status).toBe('approved');
+    for (const revisionId of gate.candidateRevisionIds) {
+      expect(approved.value.artifactRevisions?.find((revision) => revision.id === revisionId)).toEqual(
+        expect.objectContaining({ status: 'approved', assurance: 'human_approved' }),
+      );
+    }
+
+    const duplicate = await applyEvolutionGateAction({
+      runId: waiting.value.runId,
+      gateId: gate.id,
+      action: 'approve',
+      mutationId: 'typed-gate-approve',
+      expectedRunRevision: waiting.value.runRevision,
+      nowMs: 8_360,
+    });
+    expect(duplicate.ok).toBe(true);
+    if (duplicate.ok) expect(duplicate.value.runRevision).toBe(approved.value.runRevision);
+  });
+
+  it('rejects a high-fidelity review set through the typed gate and requires a fresh revision set', async () => {
+    const root = await makeRoot();
+    const sourceRelativePath = await writeRequirement(root, 'hifi-typed-request-changes.md');
+    const launched = await launchEvolutionRun({
+      projectRoot: root,
+      nowMs: 8_365,
+      request: {
+        requestId: 'req-hifi-typed-request-changes',
+        sessionName: 'deck_demo_brain',
+        sourceRelativePath,
+        requireHifiHumanApproval: true,
+      },
+    });
+    expect(launched.ok).toBe(true);
+    if (!launched.ok) return;
+
+    const waiting = await runEvolutionAutopilot(launched.value.runId, null, { nowMs: 8_370 });
+    expect(waiting.ok).toBe(true);
+    if (!waiting.ok) return;
+    const gate = waiting.value.gates?.find((entry) => entry.kind === 'design_review' && entry.status === 'open');
+    const reviewSet = waiting.value.designReviewSets?.find((entry) => entry.id === gate?.reviewSetId);
+    expect(gate).toBeDefined();
+    expect(reviewSet).toBeDefined();
+    expect(waiting.value.runRevision).toBeTypeOf('number');
+    if (!gate || !reviewSet || waiting.value.runRevision === undefined) return;
+
+    const missingFeedback = await applyEvolutionGateAction({
+      runId: waiting.value.runId,
+      gateId: gate.id,
+      action: 'request_changes',
+      mutationId: 'typed-gate-request-changes-empty',
+      expectedRunRevision: waiting.value.runRevision,
+      feedback: '   ',
+      nowMs: 8_375,
+    });
+    expect(missingFeedback.ok).toBe(false);
+    if (!missingFeedback.ok) expect(missingFeedback.issues[0]?.code).toBe('evolution_gate_feedback_required');
+
+    const changed = await applyEvolutionGateAction({
+      runId: waiting.value.runId,
+      gateId: gate.id,
+      action: 'request_changes',
+      mutationId: 'typed-gate-request-changes',
+      expectedRunRevision: waiting.value.runRevision,
+      feedback: 'Increase contrast and include the payment failure state.',
+      nowMs: 8_380,
+    });
+    expect(changed.ok).toBe(true);
+    if (!changed.ok) return;
+    expect(changed.value.gates?.find((entry) => entry.id === gate.id)).toEqual(expect.objectContaining({
+      status: 'rejected',
+      decision: expect.objectContaining({
+        action: 'request_changes',
+        feedback: 'Increase contrast and include the payment failure state.',
+      }),
+    }));
+    expect(changed.value.designReviewSets?.find((entry) => entry.id === reviewSet.id)).toEqual(expect.objectContaining({
+      status: 'rejected',
+      feedback: 'Increase contrast and include the payment failure state.',
+    }));
+    for (const revisionId of gate.candidateRevisionIds) {
+      expect(changed.value.artifactRevisions?.find((revision) => revision.id === revisionId)?.status).toBe('rejected');
+    }
+    expect(changed.value.evidence).toContainEqual(expect.objectContaining({
+      source: 'human_design_rework_review_invalidation',
+    }));
+
+    const regenerated = await runEvolutionAutopilot(changed.value.runId, null, { nowMs: 8_390 });
+    expect(regenerated.ok).toBe(true);
+    if (!regenerated.ok) return;
+    const nextOpenGate = regenerated.value.gates?.find((entry) => (
+      entry.kind === 'design_review'
+      && entry.status === 'open'
+      && entry.id !== gate.id
+    ));
+    expect(nextOpenGate).toBeUndefined();
+    expect(regenerated.value.stage).toBe('needs_human');
+    expect(regenerated.value.blockingQuestions).toContainEqual(expect.objectContaining({
+      id: `design-hifi-regeneration-unchanged-${regenerated.value.runId}`,
+    }));
+    expect(regenerated.value.evidence).toContainEqual(expect.objectContaining({
+      source: 'human_design_rework_unchanged',
+      summary: expect.stringContaining(reviewSet.id),
+    }));
+    expect(regenerated.value.gates?.filter((entry) => entry.id === gate.id)).toHaveLength(1);
+  });
+
+  it('binds greenfield mode to an empty in-root target and plans foundation work', async () => {
+    const root = await makeRoot();
+    const sourceRelativePath = await writeRequirement(root, 'greenfield-platform.md');
+    const launched = await launchEvolutionRun({
+      projectRoot: root,
+      nowMs: 8_400,
+      request: {
+        requestId: 'req-greenfield-platform',
+        sessionName: 'deck_demo_brain',
+        sourceRelativePath,
+        developmentMode: 'greenfield_new_system',
+        developmentTargetRelativeDir: 'apps/new-system',
+      },
+    });
+    expect(launched.ok).toBe(true);
+    if (!launched.ok) return;
+    expect(launched.value.developmentMode).toBe('greenfield_new_system');
+    expect(launched.value.developmentTargetRelativeDir).toBe('apps/new-system');
+
+    const planned = await runEvolutionAutopilot(launched.value.runId, null, { nowMs: 8_500 });
+    expect(planned.ok).toBe(true);
+    if (!planned.ok) return;
+    const baseline = await readFile(join(root, '.imc/evolution', launched.value.runId, 'artifacts/architecture-baseline.md'), 'utf8');
+    expect(baseline).toContain('greenfield_new_system');
+    expect(baseline).toContain('apps/new-system');
+    expect(baseline).toContain('walking-skeleton');
+    const changeRoot = join(root, 'openspec/changes', planned.value.linkedOpenSpecChange!);
+    const design = await readFile(join(changeRoot, 'design.md'), 'utf8');
+    const tasks = await readFile(join(changeRoot, 'tasks.md'), 'utf8');
+    const taskMatrix = await readFile(join(root, '.imc/evolution', launched.value.runId, 'implementation/agent-task-matrix.md'), 'utf8');
+    expect(design).toContain('apps/new-system');
+    expect(design).toContain('walking skeleton');
+    expect(tasks).toContain('health/readiness checks');
+    expect(tasks).toContain('container/staging and rollback');
+    expect(taskMatrix).toContain('greenfield_new_system');
+
+    await mkdir(join(root, 'apps/occupied'), { recursive: true });
+    await writeFile(join(root, 'apps/occupied/existing.txt'), 'do not overwrite', 'utf8');
+    const rejected = await launchEvolutionRun({
+      projectRoot: root,
+      request: {
+        requestId: 'req-greenfield-occupied',
+        sessionName: 'deck_demo_brain',
+        sourceRelativePath,
+        developmentMode: 'greenfield_new_system',
+        developmentTargetRelativeDir: 'apps/occupied',
+      },
+    });
+    expect(rejected.ok).toBe(false);
+    if (!rejected.ok) expect(rejected.issues.map((issue) => issue.code)).toContain('greenfield_target_not_empty');
+  });
+
+  it('rejects a greenfield target whose existing path traverses a symbolic link', async () => {
+    const root = await makeRoot();
+    const sourceRelativePath = await writeRequirement(root, 'greenfield-symlink.md');
+    await mkdir(join(root, 'actual-empty-target'), { recursive: true });
+    await mkdir(join(root, 'apps'), { recursive: true });
+    await symlink(join(root, 'actual-empty-target'), join(root, 'apps', 'linked-target'));
+
+    const launched = await launchEvolutionRun({
+      projectRoot: root,
+      nowMs: 8_550,
+      request: {
+        requestId: 'req-greenfield-symlink',
+        sessionName: 'deck_demo_brain',
+        sourceRelativePath,
+        developmentMode: 'greenfield_new_system',
+        developmentTargetRelativeDir: 'apps/linked-target/new-system',
+      },
+    });
+    expect(launched.ok).toBe(false);
+    if (!launched.ok) expect(launched.issues.map((entry) => entry.code)).toContain('greenfield_target_symlink');
+  });
+
+  it('rechecks the frozen greenfield inventory before auto delivery', async () => {
+    const root = await makeRoot();
+    const sourceRelativePath = await writeRequirement(root, 'greenfield-inventory-change.md');
+    const launched = await launchEvolutionRun({
+      projectRoot: root,
+      nowMs: 8_560,
+      request: {
+        requestId: 'req-greenfield-inventory-change',
+        sessionName: 'deck_demo_brain',
+        sourceRelativePath,
+        developmentMode: 'greenfield_new_system',
+        developmentTargetRelativeDir: 'apps/inventory-target',
+        autoStartImplementation: true,
+      },
+    });
+    expect(launched.ok).toBe(true);
+    if (!launched.ok) return;
+    expect(launched.value.writePolicy?.targetInventorySha256).toMatch(/^[a-f0-9]{64}$/);
+
+    await mkdir(join(root, 'apps/inventory-target'), { recursive: true });
+    await writeFile(join(root, 'apps/inventory-target/unexpected.txt'), 'occupied\n', 'utf8');
+    const autoDeliver = vi.fn().mockResolvedValue({ ok: true });
+    setEvolutionAutoDeliverLauncher(autoDeliver);
+    const result = await runEvolutionAutopilot(
+      launched.value.runId,
+      { send: vi.fn() },
+      { nowMs: 8_570 },
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.stage).toBe('needs_human');
+    expect(result.value.autoDelivery?.lastError).toContain('greenfield_target_not_empty');
+    expect(autoDeliver).not.toHaveBeenCalled();
   });
 
   it('propagates War Room instructions into generated planning and taste-skill artifacts', async () => {
@@ -1852,7 +2188,7 @@ describe('evolution orchestrator', () => {
     const status = sent.find((message) => message.type === EVOLUTION_PIPELINE_MSG.STATUS_PROJECTION) as { projection?: { roundtables?: Array<{ id?: string; status?: string; summary?: string; error?: string }>; blockingQuestions?: Array<{ id?: string; question?: string }> } } | undefined;
     expect(status?.projection?.roundtables?.find((roundtable) => roundtable.id === 'product-review')).toEqual(expect.objectContaining({
       status: 'complete',
-      summary: expect.stringContaining('REWORK'),
+      summary: expect.stringContaining('PASS'),
     }));
     expect(status?.projection?.blockingQuestions?.some((question) =>
       question.id === `planning-roundtable-${launched.value.runId}-blocked` &&
@@ -1910,6 +2246,70 @@ describe('evolution orchestrator', () => {
     expect(failed[0]?.discussion.at(-1)).toEqual(expect.objectContaining({
       kind: 'gate',
     }));
+  });
+
+  it('binds governed roundtables to exact skill bytes and blocks a verdict marker that is not last', async () => {
+    const root = await makeRoot();
+    const sourceRelativePath = await writeRequirement(root, 'governed-receipt.md');
+    const launched = await launchEvolutionRun({
+      projectRoot: root,
+      nowMs: 16_500,
+      request: {
+        requestId: 'req-governed-receipt',
+        sessionName: 'deck_demo_brain',
+        sourceRelativePath,
+        executionPolicy: 'governed',
+        roundtableGateMode: 'strict',
+      },
+    });
+    expect(launched.ok).toBe(true);
+    if (!launched.ok) return;
+
+    let captured: {
+      roleInstructions: Array<{ roleId: string; skillSnapshotId?: string; skillSha256?: string; skillContent?: string }>;
+    } | null = null;
+    setEvolutionRoundtableLauncher(async (request) => {
+      captured = request;
+      return {
+        ok: true,
+        p2pRunId: 'p2p_governed_receipt',
+        discussionId: 'dsc_governed_receipt',
+      };
+    });
+    const pending = await runEvolutionAutopilot(launched.value.runId, null, { nowMs: 16_510 });
+    expect(pending.ok).toBe(true);
+    if (!pending.ok) return;
+    const productInstruction = captured?.roleInstructions.find((entry) => entry.roleId === 'product_manager');
+    expect(productInstruction?.skillSnapshotId).toBeTruthy();
+    expect(productInstruction?.skillSha256).toMatch(/^[a-f0-9]{64}$/);
+    const snapshottedBytes = await readFile(
+      join(root, '.imc/evolution', launched.value.runId, 'skill-snapshots', `${productInstruction?.skillSnapshotId}.md`),
+      'utf8',
+    );
+    expect(productInstruction?.skillContent).toBe(snapshottedBytes);
+
+    const blocked = await recordEvolutionP2pRunProjection({
+      run: {
+        id: 'p2p_governed_receipt',
+        discussion_id: 'dsc_governed_receipt',
+        status: 'completed',
+        mode_key: 'review',
+        current_round: 1,
+        total_rounds: 1,
+        result_summary: [
+          '<!-- EVOLUTION_VERDICT: PASS -->',
+          'This trailing prose makes the structured receipt invalid.',
+        ].join('\n'),
+        completed_at: '2026-07-08T00:02:00.000Z',
+      },
+      nowMs: 16_520,
+    });
+    expect(blocked[0]?.stage).toBe('needs_human');
+    expect(blocked[0]?.roundtables.find((entry) => entry.id === 'product-review')?.summary)
+      .not.toContain('EVOLUTION_VERDICT');
+    expect(blocked[0]?.attempts?.find((entry) => entry.p2pRunId === 'p2p_governed_receipt')?.status)
+      .toBe('blocked');
+    expect(blocked[0]?.verdictRecords).toHaveLength(0);
   });
 
   it('delivers War Room role messages into the matching active P2P roundtable context', async () => {
@@ -2638,6 +3038,34 @@ describe('evolution orchestrator', () => {
     expect(sent.map((message) => message.type)).toContain(EVOLUTION_PIPELINE_MSG.PROJECTION);
   });
 
+  it('strict gate mode fails closed when no live roundtable helper is available', async () => {
+    const root = await makeRoot();
+    const sourceRelativePath = await writeRequirement(root, 'strict-helper-required.md');
+    const launched = await launchEvolutionRun({
+      projectRoot: root,
+      nowMs: 49_000,
+      request: {
+        requestId: 'req-orch-strict-helper-required',
+        sessionName: 'deck_demo_brain',
+        sourceRelativePath,
+        roundtableGateMode: 'strict',
+      },
+    });
+    expect(launched.ok).toBe(true);
+    if (!launched.ok) return;
+
+    const paused = await runEvolutionAutopilot(launched.value.runId, null, { nowMs: 49_100 });
+    expect(paused.ok).toBe(true);
+    if (!paused.ok) return;
+    expect(paused.value.stage).toBe('needs_human');
+    expect(paused.value.roundtables).toContainEqual(expect.objectContaining({
+      id: 'product-review',
+      status: 'failed',
+      error: 'roundtable_launcher_unavailable',
+    }));
+    expect(paused.value.evidence.some((entry) => entry.source === 'local_roundtable_review')).toBe(false);
+  });
+
   it('strict gate mode pauses after product, design, and architecture roundtables until PASS', async () => {
     const root = await makeRoot();
     const sourceRelativePath = await writeRequirement(root, 'strict-roundtables.md');
@@ -2687,7 +3115,10 @@ describe('evolution orchestrator', () => {
     expect(firstPause.value.roundtables).toEqual([
       expect.objectContaining({ id: 'product-review', status: 'running', p2pRunId: 'p2p_strict_product' }),
     ]);
-    expect(firstPause.value.artifacts.some((artifact) => artifact.kind === 'prd')).toBe(false);
+    expect(firstPause.value.artifacts.find((artifact) => artifact.kind === 'prd')).toEqual(expect.objectContaining({
+      status: 'candidate',
+      assurance: 'pipeline_draft',
+    }));
     expect(firstPause.value.latestMessage).toContain('waiting_for_product-review');
 
     const afterProductPass = await recordEvolutionP2pRunProjection({
@@ -2775,11 +3206,15 @@ describe('evolution orchestrator', () => {
     });
     expect(launched.ok).toBe(true);
     if (!launched.ok) return;
-    setEvolutionRoundtableLauncher(async () => ({
-      ok: true,
-      p2pRunId: 'p2p_strict_rework',
-      discussionId: 'dsc_strict_rework',
-    }));
+    let launchCount = 0;
+    setEvolutionRoundtableLauncher(async () => {
+      launchCount += 1;
+      return {
+        ok: true,
+        p2pRunId: `p2p_strict_rework_${launchCount}`,
+        discussionId: `dsc_strict_rework_${launchCount}`,
+      };
+    });
 
     const paused = await runEvolutionAutopilot(launched.value.runId, null, { nowMs: 61_000 });
     expect(paused.ok).toBe(true);
@@ -2788,8 +3223,8 @@ describe('evolution orchestrator', () => {
 
     const blocked = await recordEvolutionP2pRunProjection({
       run: {
-        id: 'p2p_strict_rework',
-        discussion_id: 'dsc_strict_rework',
+        id: 'p2p_strict_rework_1',
+        discussion_id: 'dsc_strict_rework_1',
         status: 'completed',
         mode_key: 'review',
         current_round: 1,
@@ -2807,7 +3242,10 @@ describe('evolution orchestrator', () => {
       summary: 'REWORK: clarify buyer personas and payment assumptions before PRD.',
     }));
     expect(blocked[0]?.blockingQuestions[0]?.question).toContain('strict roundtable gate');
-    expect(blocked[0]?.artifacts.some((artifact) => artifact.kind === 'prd')).toBe(false);
+    expect(blocked[0]?.artifacts.find((artifact) => artifact.kind === 'prd')).toEqual(expect.objectContaining({
+      status: 'candidate',
+      assurance: 'pipeline_draft',
+    }));
 
     const continued = await continueEvolutionRun({
       runId: launched.value.runId,
@@ -2821,17 +3259,43 @@ describe('evolution orchestrator', () => {
     expect(continued.value.verdict).toBeUndefined();
     expect(continued.value.blockingQuestions).toHaveLength(0);
     expect(continued.value.roundtables.find((roundtable) => roundtable.id === 'product-review')).toEqual(expect.objectContaining({
-      status: 'complete',
-      summary: expect.stringContaining('PASS: human override resolved 产品需求圆桌'),
+      status: 'running',
+      p2pRunId: 'p2p_strict_rework_2',
+    }));
+    expect(continued.value.roundtables.find((roundtable) => roundtable.id === 'product-review')?.summary).toBeUndefined();
+    expect(continued.value.evidence).toContainEqual(expect.objectContaining({
+      source: 'human_roundtable_retry',
+      summary: expect.stringContaining('Previous verdict=REWORK'),
     }));
 
-    const resumed = await runEvolutionAutopilot(launched.value.runId, null, { nowMs: 64_000 });
-    expect(resumed.ok).toBe(true);
-    if (!resumed.ok) return;
-    expect(resumed.value.stage).toBe('design_hifi');
-    expect(resumed.value.artifacts.some((artifact) => artifact.kind === 'prd')).toBe(true);
-    expect(resumed.value.roundtables.find((roundtable) => roundtable.id === 'design-review')).toEqual(expect.objectContaining({
+    const retryPending = await runEvolutionAutopilot(launched.value.runId, null, { nowMs: 64_000 });
+    expect(retryPending.ok).toBe(true);
+    if (!retryPending.ok) return;
+    expect(retryPending.value.stage).toBe('product_discussion');
+    expect(retryPending.value.artifacts.find((artifact) => artifact.kind === 'prd')).toEqual(expect.objectContaining({
+      status: 'candidate',
+      assurance: 'pipeline_draft',
+    }));
+
+    const retried = await recordEvolutionP2pRunProjection({
+      run: {
+        id: 'p2p_strict_rework_2',
+        discussion_id: 'dsc_strict_rework_2',
+        status: 'completed',
+        mode_key: 'review',
+        current_round: 1,
+        total_rounds: 1,
+        result_summary: 'PASS: buyer personas and payment assumptions are now reviewable.',
+        completed_at: '2026-07-08T00:07:00.000Z',
+      },
+      nowMs: 65_000,
+    });
+
+    expect(retried[0]?.stage).toBe('design_hifi');
+    expect(retried[0]?.artifacts.some((artifact) => artifact.kind === 'prd')).toBe(true);
+    expect(retried[0]?.roundtables.find((roundtable) => roundtable.id === 'design-review')).toEqual(expect.objectContaining({
       status: 'running',
     }));
+    expect(launchCount).toBe(3);
   });
 });

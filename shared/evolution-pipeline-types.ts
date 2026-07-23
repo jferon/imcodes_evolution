@@ -1,14 +1,27 @@
 import type {
   EvolutionArtifactKind,
   EvolutionArtifactPreviewType,
+  EvolutionArtifactStatus,
+  EvolutionAssuranceLevel,
+  EvolutionAttemptKind,
+  EvolutionAttemptStatus,
   EvolutionAutoDeliverPresetId,
+  EvolutionDevelopmentMode,
   EvolutionDesignTargetSurface,
   EvolutionDiscussionMessageKind,
+  EvolutionExecutionPolicy,
+  EvolutionExternalActionClass,
+  EvolutionGateAction,
+  EvolutionGateKind,
+  EvolutionGateStatus,
+  EvolutionGreenfieldTopology,
   EvolutionRoleId,
+  EvolutionRoleSource,
   EvolutionRoleStatus,
   EvolutionRoundtableGateMode,
   EvolutionRoundtableStatus,
   EvolutionScoreModuleId,
+  EvolutionScoreSource,
   EvolutionStage,
   EvolutionStagingDeliveryStatus,
   EvolutionVerdict,
@@ -52,6 +65,15 @@ export interface EvolutionLaunchRequest {
    * fidelity screen pack and taste-skill prompt.
    */
   designTargetSurface?: EvolutionDesignTargetSurface;
+  /**
+   * Explicitly selects whether implementation extends the current system or
+   * creates a new system inside a dedicated project-relative target.
+   */
+  developmentMode?: EvolutionDevelopmentMode;
+  developmentTargetRelativeDir?: string;
+  executionPolicy?: EvolutionExecutionPolicy;
+  greenfieldTopology?: EvolutionGreenfieldTopology;
+  requireHifiHumanApproval?: boolean;
 }
 
 export interface EvolutionSourceDocument {
@@ -111,7 +133,31 @@ export interface EvolutionRoleState {
   stage?: EvolutionStage;
   currentAction?: string;
   sessionName?: string;
+  roleProfileId?: string;
+  activeAttemptId?: string;
   updatedAt: number;
+}
+
+export interface EvolutionRoleProfile {
+  id: string;
+  roleId: EvolutionRoleId;
+  label: string;
+  summary: string;
+  responsibilities: string[];
+  skillName: string;
+  roleSource: EvolutionRoleSource;
+  version: number;
+}
+
+export interface EvolutionSkillSnapshot {
+  id: string;
+  roleId: EvolutionRoleId;
+  skillName: string;
+  sourcePath: string;
+  source: EvolutionRoleSource;
+  sha256: string;
+  bytes: number;
+  capturedAt: number;
 }
 
 export interface EvolutionArtifactPreview {
@@ -131,6 +177,30 @@ export interface EvolutionArtifactRef {
   stage?: EvolutionStage;
   sha256?: string;
   bytes?: number;
+  revisionId?: string;
+  status?: EvolutionArtifactStatus;
+  assurance?: EvolutionAssuranceLevel;
+  producerAttemptId?: string;
+  authorizedByVerdictId?: string;
+  supersedesRevisionId?: string;
+  createdAt: number;
+}
+
+export interface EvolutionArtifactRevision {
+  id: string;
+  artifactId: string;
+  kind: EvolutionArtifactKind;
+  logicalPath: string;
+  immutablePath: string;
+  sha256: string;
+  bytes: number;
+  stage: EvolutionStage;
+  roleId?: EvolutionRoleId;
+  status: EvolutionArtifactStatus;
+  assurance: EvolutionAssuranceLevel;
+  producerAttemptId?: string;
+  authorizedByVerdictId?: string;
+  supersedesRevisionId?: string;
   createdAt: number;
 }
 
@@ -139,6 +209,93 @@ export interface EvolutionScore {
   score: number;
   maxScore: 10;
   summary: string;
+  source?: EvolutionScoreSource;
+  attemptId?: string;
+}
+
+export interface EvolutionAttemptRecord {
+  id: string;
+  kind: EvolutionAttemptKind;
+  stage: EvolutionStage;
+  roleId: EvolutionRoleId;
+  checkerRoleId?: EvolutionRoleId;
+  status: EvolutionAttemptStatus;
+  dispatchToken: string;
+  p2pRunId?: string;
+  inputRevisionIds: string[];
+  skillSnapshotIds: string[];
+  outputRevisionIds: string[];
+  startedAt: number;
+  completedAt?: number;
+  error?: string;
+}
+
+export interface EvolutionVerdictRecord {
+  id: string;
+  attemptId: string;
+  stage: EvolutionStage;
+  checkerRoleId: EvolutionRoleId;
+  verdict: EvolutionVerdict;
+  machineReadable: boolean;
+  summary: string;
+  inputRevisionIds: string[];
+  approvedRevisionIds: string[];
+  p2pRunId?: string;
+  createdAt: number;
+}
+
+export interface EvolutionGateDecision {
+  id: string;
+  action: EvolutionGateAction;
+  actor: 'human' | 'system';
+  expectedRunRevision: number;
+  feedback?: string;
+  createdAt: number;
+}
+
+export interface EvolutionGateRecord {
+  id: string;
+  kind: EvolutionGateKind;
+  stage: EvolutionStage;
+  status: EvolutionGateStatus;
+  candidateRevisionIds: string[];
+  reviewSetId?: string;
+  requiredAssurance: EvolutionAssuranceLevel;
+  openedAt: number;
+  resolvedAt?: number;
+  decision?: EvolutionGateDecision;
+}
+
+export interface EvolutionDesignReviewSet {
+  id: string;
+  attemptId?: string;
+  revisionIds: string[];
+  immutableManifestPath: string;
+  status: 'pending' | 'approved' | 'rejected' | 'superseded';
+  createdAt: number;
+  decidedAt?: number;
+  feedback?: string;
+}
+
+export interface EvolutionWritePolicy {
+  allowedRoots: string[];
+  deniedRoots: string[];
+  protectedRoots: string[];
+  requireIsolatedWorktree: boolean;
+  targetRelativeDir?: string;
+  targetInventorySha256?: string;
+  inventoryCapturedAt?: number;
+}
+
+export interface EvolutionFoundationEvidence {
+  id: string;
+  capability: 'repository' | 'runtime' | 'database' | 'auth' | 'observability' | 'ci' | 'deployment';
+  status: 'planned' | 'verified' | 'blocked' | 'not_applicable';
+  ownerRoleId: EvolutionRoleId;
+  artifactRevisionIds: string[];
+  externalActionClass: EvolutionExternalActionClass;
+  summary: string;
+  createdAt: number;
 }
 
 export interface EvolutionBlockingQuestion {
@@ -179,6 +336,9 @@ export interface EvolutionRoundtableRef {
   discussionId?: string;
   contextPath?: string;
   currentTargetSession?: string;
+  attemptId?: string;
+  dispatchToken?: string;
+  verdictId?: string;
   summary?: string;
   error?: string;
   completedAt?: string;
@@ -304,6 +464,8 @@ export interface EvolutionLiveEvent {
 }
 
 export interface EvolutionRun {
+  controlVersion?: 2;
+  runRevision?: number;
   runId: string;
   requestId: string;
   stage: EvolutionStage;
@@ -321,6 +483,22 @@ export interface EvolutionRun {
   roundtables: EvolutionRoundtableRef[];
   roundtableGateMode: EvolutionRoundtableGateMode;
   designTargetSurface?: EvolutionDesignTargetSurface;
+  developmentMode?: EvolutionDevelopmentMode;
+  developmentTargetRelativeDir?: string;
+  executionPolicy?: EvolutionExecutionPolicy;
+  greenfieldTopology?: EvolutionGreenfieldTopology;
+  writePolicy?: EvolutionWritePolicy;
+  requireHifiHumanApproval?: boolean;
+  roleProfiles?: EvolutionRoleProfile[];
+  skillSnapshots?: EvolutionSkillSnapshot[];
+  artifactRevisions?: EvolutionArtifactRevision[];
+  attempts?: EvolutionAttemptRecord[];
+  verdictRecords?: EvolutionVerdictRecord[];
+  gates?: EvolutionGateRecord[];
+  designReviewSets?: EvolutionDesignReviewSet[];
+  authorizedRevisions?: Record<string, string>;
+  foundationEvidence?: EvolutionFoundationEvidence[];
+  processedMutationIds?: string[];
   evidence: EvolutionEvidence[];
   executionTimeline?: EvolutionExecutionTimelineItem[];
   liveEvents?: EvolutionLiveEvent[];
@@ -337,6 +515,8 @@ export interface EvolutionRun {
 
 export interface EvolutionProjection {
   projectionVersion: 1;
+  controlVersion?: 2;
+  runRevision?: number;
   runId: string;
   requestId: string;
   stage: EvolutionStage;
@@ -352,6 +532,21 @@ export interface EvolutionProjection {
   roundtables: EvolutionRoundtableRef[];
   roundtableGateMode: EvolutionRoundtableGateMode;
   designTargetSurface?: EvolutionDesignTargetSurface;
+  developmentMode?: EvolutionDevelopmentMode;
+  developmentTargetRelativeDir?: string;
+  executionPolicy?: EvolutionExecutionPolicy;
+  greenfieldTopology?: EvolutionGreenfieldTopology;
+  writePolicy?: EvolutionWritePolicy;
+  requireHifiHumanApproval?: boolean;
+  roleProfiles?: EvolutionRoleProfile[];
+  skillSnapshots?: EvolutionSkillSnapshot[];
+  artifactRevisions?: EvolutionArtifactRevision[];
+  attempts?: EvolutionAttemptRecord[];
+  verdictRecords?: EvolutionVerdictRecord[];
+  gates?: EvolutionGateRecord[];
+  designReviewSets?: EvolutionDesignReviewSet[];
+  authorizedRevisions?: Record<string, string>;
+  foundationEvidence?: EvolutionFoundationEvidence[];
   evidence: EvolutionEvidence[];
   executionTimeline: EvolutionExecutionTimelineItem[];
   liveEvents: EvolutionLiveEvent[];

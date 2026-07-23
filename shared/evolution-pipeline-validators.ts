@@ -1,6 +1,7 @@
 import {
   EVOLUTION_ARTIFACT_PATH_MAX_BYTES,
   EVOLUTION_ARTIFACT_KINDS,
+  EVOLUTION_ARTIFACT_STATUSES,
   EVOLUTION_ARTIFACT_PREVIEW_MAX_CHARS,
   EVOLUTION_ARTIFACT_PREVIEW_TYPES,
   EVOLUTION_BLOCKING_QUESTIONS_MAX,
@@ -9,7 +10,17 @@ import {
   EVOLUTION_EVIDENCE_ITEMS_MAX,
   EVOLUTION_ARTIFACTS_MAX,
   EVOLUTION_AUTO_DELIVER_PRESET_IDS,
+  EVOLUTION_ASSURANCE_LEVELS,
   EVOLUTION_DESIGN_TARGET_SURFACES,
+  EVOLUTION_DEVELOPMENT_MODES,
+  EVOLUTION_EXECUTION_POLICIES,
+  EVOLUTION_GREENFIELD_TOPOLOGIES,
+  EVOLUTION_ATTEMPT_KINDS,
+  EVOLUTION_ATTEMPT_STATUSES,
+  EVOLUTION_GATE_ACTIONS,
+  EVOLUTION_GATE_KINDS,
+  EVOLUTION_GATE_STATUSES,
+  EVOLUTION_ROLE_SOURCES,
   EVOLUTION_REQUIREMENT_FILE_EXTENSIONS,
   EVOLUTION_REQUIREMENT_IMAGE_EXTENSIONS,
   EVOLUTION_REQUIREMENT_FILE_MAX_BYTES,
@@ -21,6 +32,7 @@ import {
   EVOLUTION_ROUNDTABLE_STATUSES,
   EVOLUTION_RUN_ID_MAX_BYTES,
   EVOLUTION_SCORE_MAX,
+  EVOLUTION_SCORE_SOURCES,
   EVOLUTION_SCORE_MODULE_IDS,
   EVOLUTION_SOURCE_PATH_MAX_BYTES,
   EVOLUTION_STAGING_DELIVERY_STATUSES,
@@ -32,6 +44,9 @@ import {
   type EvolutionArtifactPreviewType,
   type EvolutionAutoDeliverPresetId,
   type EvolutionDesignTargetSurface,
+  type EvolutionDevelopmentMode,
+  type EvolutionExecutionPolicy,
+  type EvolutionGreenfieldTopology,
   type EvolutionRoleId,
   type EvolutionRoleStatus,
   type EvolutionRoundtableGateMode,
@@ -89,6 +104,228 @@ function issue(code: string, message: string, path?: string): EvolutionValidatio
 
 function isOneOf<T extends readonly string[]>(value: unknown, values: T): value is T[number] {
   return typeof value === 'string' && (values as readonly string[]).includes(value);
+}
+
+function validateControlRecordId(value: unknown, path: string): EvolutionValidationIssue[] {
+  return typeof value === 'string' && SAFE_SEGMENT_ID_RE.test(value) && byteLength(value) <= 240
+    ? []
+    : [issue('invalid_control_record_id', 'Control record id must be a bounded safe identifier.', path)];
+}
+
+function validateControlIdList(value: unknown, path: string): EvolutionValidationIssue[] {
+  if (!Array.isArray(value)) return [issue('invalid_control_id_list', 'Expected an array of record ids.', path)];
+  if (value.length > 2_000) return [issue('too_many_control_ids', 'Control id list is too large.', path)];
+  return value.flatMap((entry, index) => validateControlRecordId(entry, `${path}[${index}]`));
+}
+
+function validateEvolutionControlProjection(input: Record<string, unknown>): EvolutionValidationIssue[] {
+  const issues: EvolutionValidationIssue[] = [];
+  if (input.controlVersion !== undefined && input.controlVersion !== 2) {
+    issues.push(issue('invalid_control_version', 'controlVersion must be 2 when present.', 'controlVersion'));
+  }
+  if (input.runRevision !== undefined && (
+    typeof input.runRevision !== 'number'
+    || !Number.isInteger(input.runRevision)
+    || input.runRevision < 0
+  )) {
+    issues.push(issue('invalid_run_revision', 'runRevision must be a non-negative integer.', 'runRevision'));
+  }
+  if (input.executionPolicy !== undefined && !isOneOf(input.executionPolicy, EVOLUTION_EXECUTION_POLICIES)) {
+    issues.push(issue('invalid_execution_policy', 'executionPolicy must be draft_preview or governed.', 'executionPolicy'));
+  }
+  if (input.greenfieldTopology !== undefined && !isOneOf(input.greenfieldTopology, EVOLUTION_GREENFIELD_TOPOLOGIES)) {
+    issues.push(issue('invalid_greenfield_topology', 'greenfieldTopology is invalid.', 'greenfieldTopology'));
+  }
+
+  const skillSnapshots = input.skillSnapshots;
+  if (skillSnapshots !== undefined) {
+    if (!Array.isArray(skillSnapshots)) issues.push(issue('invalid_skill_snapshots', 'skillSnapshots must be an array.', 'skillSnapshots'));
+    else skillSnapshots.forEach((entry, index) => {
+      const path = `skillSnapshots[${index}]`;
+      if (!isRecord(entry)) {
+        issues.push(issue('invalid_skill_snapshot', 'Skill snapshot must be an object.', path));
+        return;
+      }
+      issues.push(...validateControlRecordId(entry.id, `${path}.id`));
+      if (!isOneOf(entry.roleId, EVOLUTION_ROLE_IDS)) issues.push(issue('invalid_role_id', 'Invalid snapshot roleId.', `${path}.roleId`));
+      if (!isOneOf(entry.source, EVOLUTION_ROLE_SOURCES)) issues.push(issue('invalid_role_source', 'Invalid snapshot source.', `${path}.source`));
+      if (typeof entry.sha256 !== 'string' || !SHA256_RE.test(entry.sha256)) issues.push(issue('invalid_sha256', 'Snapshot sha256 is invalid.', `${path}.sha256`));
+      if (typeof entry.bytes !== 'number' || !Number.isInteger(entry.bytes) || entry.bytes < 0) issues.push(issue('invalid_bytes', 'Snapshot bytes is invalid.', `${path}.bytes`));
+      if (typeof entry.skillName !== 'string' || !entry.skillName) issues.push(issue('invalid_skill_name', 'Snapshot skillName is required.', `${path}.skillName`));
+      if (typeof entry.sourcePath !== 'string' || !entry.sourcePath) issues.push(issue('invalid_source_path', 'Snapshot sourcePath is required.', `${path}.sourcePath`));
+    });
+  }
+
+  const artifactRevisions = input.artifactRevisions;
+  const revisionIds = new Set<string>();
+  if (artifactRevisions !== undefined) {
+    if (!Array.isArray(artifactRevisions)) issues.push(issue('invalid_artifact_revisions', 'artifactRevisions must be an array.', 'artifactRevisions'));
+    else artifactRevisions.forEach((entry, index) => {
+      const path = `artifactRevisions[${index}]`;
+      if (!isRecord(entry)) {
+        issues.push(issue('invalid_artifact_revision', 'Artifact revision must be an object.', path));
+        return;
+      }
+      issues.push(...validateControlRecordId(entry.id, `${path}.id`));
+      if (typeof entry.id === 'string') revisionIds.add(entry.id);
+      if (!isOneOf(entry.kind, EVOLUTION_ARTIFACT_KINDS)) issues.push(issue('invalid_artifact_kind', 'Invalid revision kind.', `${path}.kind`));
+      if (!isEvolutionStage(entry.stage)) issues.push(issue('invalid_stage', 'Invalid revision stage.', `${path}.stage`));
+      if (!isOneOf(entry.status, EVOLUTION_ARTIFACT_STATUSES)) issues.push(issue('invalid_artifact_status', 'Invalid revision status.', `${path}.status`));
+      if (!isOneOf(entry.assurance, EVOLUTION_ASSURANCE_LEVELS)) issues.push(issue('invalid_assurance', 'Invalid revision assurance.', `${path}.assurance`));
+      if (typeof entry.sha256 !== 'string' || !SHA256_RE.test(entry.sha256)) issues.push(issue('invalid_sha256', 'Revision sha256 is invalid.', `${path}.sha256`));
+      if (typeof entry.bytes !== 'number' || !Number.isInteger(entry.bytes) || entry.bytes < 0) issues.push(issue('invalid_bytes', 'Revision bytes is invalid.', `${path}.bytes`));
+      for (const key of ['artifactId', 'logicalPath', 'immutablePath'] as const) {
+        if (typeof entry[key] !== 'string' || !entry[key]) issues.push(issue(`invalid_${key}`, `${key} is required.`, `${path}.${key}`));
+      }
+    });
+  }
+
+  const skillIds = new Set(
+    Array.isArray(skillSnapshots)
+      ? skillSnapshots.filter(isRecord).map((entry) => entry.id).filter((id): id is string => typeof id === 'string')
+      : [],
+  );
+  const attempts = input.attempts;
+  const attemptIds = new Set<string>();
+  if (attempts !== undefined) {
+    if (!Array.isArray(attempts)) issues.push(issue('invalid_attempts', 'attempts must be an array.', 'attempts'));
+    else attempts.forEach((entry, index) => {
+      const path = `attempts[${index}]`;
+      if (!isRecord(entry)) {
+        issues.push(issue('invalid_attempt', 'Attempt must be an object.', path));
+        return;
+      }
+      issues.push(...validateControlRecordId(entry.id, `${path}.id`));
+      if (typeof entry.id === 'string') attemptIds.add(entry.id);
+      if (!isOneOf(entry.kind, EVOLUTION_ATTEMPT_KINDS)) issues.push(issue('invalid_attempt_kind', 'Invalid attempt kind.', `${path}.kind`));
+      if (!isOneOf(entry.status, EVOLUTION_ATTEMPT_STATUSES)) issues.push(issue('invalid_attempt_status', 'Invalid attempt status.', `${path}.status`));
+      if (!isEvolutionStage(entry.stage)) issues.push(issue('invalid_stage', 'Invalid attempt stage.', `${path}.stage`));
+      if (!isOneOf(entry.roleId, EVOLUTION_ROLE_IDS)) issues.push(issue('invalid_role_id', 'Invalid attempt roleId.', `${path}.roleId`));
+      if (entry.checkerRoleId !== undefined && !isOneOf(entry.checkerRoleId, EVOLUTION_ROLE_IDS)) issues.push(issue('invalid_role_id', 'Invalid checkerRoleId.', `${path}.checkerRoleId`));
+      issues.push(...validateControlIdList(entry.inputRevisionIds, `${path}.inputRevisionIds`));
+      issues.push(...validateControlIdList(entry.outputRevisionIds, `${path}.outputRevisionIds`));
+      issues.push(...validateControlIdList(entry.skillSnapshotIds, `${path}.skillSnapshotIds`));
+      if (Array.isArray(entry.inputRevisionIds)) {
+        for (const id of entry.inputRevisionIds) if (typeof id === 'string' && !revisionIds.has(id)) issues.push(issue('unknown_revision_reference', `Unknown revision ${id}.`, `${path}.inputRevisionIds`));
+      }
+      if (Array.isArray(entry.outputRevisionIds)) {
+        for (const id of entry.outputRevisionIds) if (typeof id === 'string' && !revisionIds.has(id)) issues.push(issue('unknown_revision_reference', `Unknown revision ${id}.`, `${path}.outputRevisionIds`));
+      }
+      if (Array.isArray(entry.skillSnapshotIds)) {
+        for (const id of entry.skillSnapshotIds) if (typeof id === 'string' && !skillIds.has(id)) issues.push(issue('unknown_skill_snapshot_reference', `Unknown skill snapshot ${id}.`, `${path}.skillSnapshotIds`));
+      }
+    });
+  }
+
+  const verdictRecords = input.verdictRecords;
+  const verdictIds = new Set<string>();
+  if (verdictRecords !== undefined) {
+    if (!Array.isArray(verdictRecords)) issues.push(issue('invalid_verdict_records', 'verdictRecords must be an array.', 'verdictRecords'));
+    else verdictRecords.forEach((entry, index) => {
+      const path = `verdictRecords[${index}]`;
+      if (!isRecord(entry)) {
+        issues.push(issue('invalid_verdict_record', 'Verdict record must be an object.', path));
+        return;
+      }
+      issues.push(...validateControlRecordId(entry.id, `${path}.id`));
+      if (typeof entry.id === 'string') verdictIds.add(entry.id);
+      if (typeof entry.attemptId !== 'string' || !attemptIds.has(entry.attemptId)) issues.push(issue('unknown_attempt_reference', 'Verdict attemptId is unknown.', `${path}.attemptId`));
+      if (!isOneOf(entry.verdict, EVOLUTION_VERDICTS)) issues.push(issue('invalid_verdict', 'Verdict is invalid.', `${path}.verdict`));
+      if (typeof entry.machineReadable !== 'boolean') issues.push(issue('invalid_machine_readable', 'machineReadable must be boolean.', `${path}.machineReadable`));
+      issues.push(...validateControlIdList(entry.inputRevisionIds, `${path}.inputRevisionIds`));
+      issues.push(...validateControlIdList(entry.approvedRevisionIds, `${path}.approvedRevisionIds`));
+      if (Array.isArray(entry.inputRevisionIds)) {
+        for (const id of entry.inputRevisionIds) if (typeof id === 'string' && !revisionIds.has(id)) issues.push(issue('unknown_revision_reference', `Unknown revision ${id}.`, `${path}.inputRevisionIds`));
+      }
+      if (Array.isArray(entry.approvedRevisionIds)) {
+        for (const id of entry.approvedRevisionIds) if (typeof id === 'string' && !revisionIds.has(id)) issues.push(issue('unknown_revision_reference', `Unknown revision ${id}.`, `${path}.approvedRevisionIds`));
+      }
+    });
+  }
+
+  const gates = input.gates;
+  if (gates !== undefined) {
+    if (!Array.isArray(gates)) issues.push(issue('invalid_gates', 'gates must be an array.', 'gates'));
+    else gates.forEach((entry, index) => {
+      const path = `gates[${index}]`;
+      if (!isRecord(entry)) {
+        issues.push(issue('invalid_gate', 'Gate must be an object.', path));
+        return;
+      }
+      issues.push(...validateControlRecordId(entry.id, `${path}.id`));
+      if (!isOneOf(entry.kind, EVOLUTION_GATE_KINDS)) issues.push(issue('invalid_gate_kind', 'Gate kind is invalid.', `${path}.kind`));
+      if (!isOneOf(entry.status, EVOLUTION_GATE_STATUSES)) issues.push(issue('invalid_gate_status', 'Gate status is invalid.', `${path}.status`));
+      if (!isOneOf(entry.requiredAssurance, EVOLUTION_ASSURANCE_LEVELS)) issues.push(issue('invalid_assurance', 'Gate assurance is invalid.', `${path}.requiredAssurance`));
+      issues.push(...validateControlIdList(entry.candidateRevisionIds, `${path}.candidateRevisionIds`));
+      if (Array.isArray(entry.candidateRevisionIds)) {
+        for (const id of entry.candidateRevisionIds) if (typeof id === 'string' && !revisionIds.has(id)) issues.push(issue('unknown_revision_reference', `Unknown revision ${id}.`, `${path}.candidateRevisionIds`));
+      }
+      if (isRecord(entry.decision) && !isOneOf(entry.decision.action, EVOLUTION_GATE_ACTIONS)) issues.push(issue('invalid_gate_action', 'Gate decision action is invalid.', `${path}.decision.action`));
+    });
+  }
+
+  const reviewSets = input.designReviewSets;
+  const reviewSetIds = new Set<string>();
+  if (reviewSets !== undefined) {
+    if (!Array.isArray(reviewSets)) issues.push(issue('invalid_review_sets', 'designReviewSets must be an array.', 'designReviewSets'));
+    else reviewSets.forEach((entry, index) => {
+      const path = `designReviewSets[${index}]`;
+      if (!isRecord(entry)) {
+        issues.push(issue('invalid_review_set', 'Review set must be an object.', path));
+        return;
+      }
+      issues.push(...validateControlRecordId(entry.id, `${path}.id`));
+      if (typeof entry.id === 'string') reviewSetIds.add(entry.id);
+      issues.push(...validateControlIdList(entry.revisionIds, `${path}.revisionIds`));
+      if (Array.isArray(entry.revisionIds)) {
+        for (const id of entry.revisionIds) if (typeof id === 'string' && !revisionIds.has(id)) issues.push(issue('unknown_revision_reference', `Unknown revision ${id}.`, `${path}.revisionIds`));
+      }
+      if (entry.attemptId !== undefined && (typeof entry.attemptId !== 'string' || !attemptIds.has(entry.attemptId))) {
+        issues.push(issue('unknown_attempt_reference', 'Review set attemptId is unknown.', `${path}.attemptId`));
+      }
+      if (!['pending', 'approved', 'rejected', 'superseded'].includes(String(entry.status))) issues.push(issue('invalid_review_set_status', 'Review set status is invalid.', `${path}.status`));
+    });
+  }
+
+  if (Array.isArray(artifactRevisions)) artifactRevisions.forEach((entry, index) => {
+    if (!isRecord(entry)) return;
+    const path = `artifactRevisions[${index}]`;
+    if (entry.supersedesRevisionId !== undefined && (
+      typeof entry.supersedesRevisionId !== 'string'
+      || !revisionIds.has(entry.supersedesRevisionId)
+    )) {
+      issues.push(issue('unknown_revision_reference', 'Superseded artifact revision is unknown.', `${path}.supersedesRevisionId`));
+    }
+    if (entry.producerAttemptId !== undefined && (
+      typeof entry.producerAttemptId !== 'string'
+      || !attemptIds.has(entry.producerAttemptId)
+    )) {
+      issues.push(issue('unknown_attempt_reference', 'Artifact producer attempt is unknown.', `${path}.producerAttemptId`));
+    }
+    if (entry.authorizedByVerdictId !== undefined && (
+      typeof entry.authorizedByVerdictId !== 'string'
+      || !verdictIds.has(entry.authorizedByVerdictId)
+    )) {
+      issues.push(issue('unknown_verdict_reference', 'Artifact authorizing verdict is unknown.', `${path}.authorizedByVerdictId`));
+    }
+  });
+
+  if (Array.isArray(gates)) gates.forEach((entry, index) => {
+    if (!isRecord(entry) || entry.reviewSetId === undefined) return;
+    if (typeof entry.reviewSetId !== 'string' || !reviewSetIds.has(entry.reviewSetId)) {
+      issues.push(issue('unknown_review_set_reference', 'Gate reviewSetId is unknown.', `gates[${index}].reviewSetId`));
+    }
+  });
+
+  if (input.authorizedRevisions !== undefined) {
+    if (!isRecord(input.authorizedRevisions)) issues.push(issue('invalid_authorized_revisions', 'authorizedRevisions must be an object.', 'authorizedRevisions'));
+    else for (const [logicalPath, revisionId] of Object.entries(input.authorizedRevisions)) {
+      if (typeof revisionId !== 'string' || !revisionIds.has(revisionId)) {
+        issues.push(issue('unknown_authorized_revision', `Authorized revision for ${logicalPath} is unknown.`, `authorizedRevisions.${logicalPath}`));
+      }
+    }
+  }
+  return issues;
 }
 
 function fileNameFromRelativePath(value: string): string {
@@ -238,6 +475,32 @@ export function validateEvolutionLaunchRequest(input: unknown): EvolutionValidat
   if (input.designTargetSurface !== undefined && !isOneOf(input.designTargetSurface, EVOLUTION_DESIGN_TARGET_SURFACES)) {
     issues.push(issue('invalid_design_target_surface', 'designTargetSurface must be auto, mobile, pc, or both.', 'designTargetSurface'));
   }
+  if (input.developmentMode !== undefined && !isOneOf(input.developmentMode, EVOLUTION_DEVELOPMENT_MODES)) {
+    issues.push(issue('invalid_development_mode', 'developmentMode must be brownfield_refactor or greenfield_new_system.', 'developmentMode'));
+  }
+  if (input.executionPolicy !== undefined && !isOneOf(input.executionPolicy, EVOLUTION_EXECUTION_POLICIES)) {
+    issues.push(issue('invalid_execution_policy', 'executionPolicy must be draft_preview or governed.', 'executionPolicy'));
+  }
+  if (input.greenfieldTopology !== undefined && !isOneOf(input.greenfieldTopology, EVOLUTION_GREENFIELD_TOPOLOGIES)) {
+    issues.push(issue('invalid_greenfield_topology', 'greenfieldTopology must be monolith, modular_monolith, or services.', 'greenfieldTopology'));
+  }
+  let developmentTarget: EvolutionValidationResult<string> | null = null;
+  if (input.developmentTargetRelativeDir !== undefined) {
+    developmentTarget = validateEvolutionArtifactRelativePath(input.developmentTargetRelativeDir, 'developmentTargetRelativeDir');
+    if (!developmentTarget.ok) issues.push(...developmentTarget.issues);
+  }
+  if (input.developmentMode === 'greenfield_new_system' && !developmentTarget?.ok) {
+    issues.push(issue('missing_greenfield_target', 'Greenfield development requires a safe project-relative target directory.', 'developmentTargetRelativeDir'));
+  }
+  if (input.requireHifiHumanApproval !== undefined && typeof input.requireHifiHumanApproval !== 'boolean') {
+    issues.push(issue('invalid_hifi_human_approval', 'requireHifiHumanApproval must be a boolean when provided.', 'requireHifiHumanApproval'));
+  }
+  if (developmentTarget?.ok) {
+    const protectedRoot = developmentTarget.value.replace(/\\/g, '/').split('/')[0]?.toLowerCase();
+    if (!protectedRoot || ['.', '.git', '.imc', 'openspec', 'docs', 'node_modules'].includes(protectedRoot)) {
+      issues.push(issue('protected_greenfield_target', 'Greenfield target must be a dedicated, non-protected project directory.', 'developmentTargetRelativeDir'));
+    }
+  }
   if (issues.length > 0) return { ok: false, issues };
 
   return {
@@ -264,6 +527,17 @@ export function validateEvolutionLaunchRequest(input: unknown): EvolutionValidat
       designTargetSurface: isOneOf(input.designTargetSurface, EVOLUTION_DESIGN_TARGET_SURFACES)
         ? input.designTargetSurface
         : 'auto',
+      ...(isOneOf(input.developmentMode, EVOLUTION_DEVELOPMENT_MODES)
+        ? { developmentMode: input.developmentMode as EvolutionDevelopmentMode }
+        : {}),
+      ...(developmentTarget?.ok ? { developmentTargetRelativeDir: developmentTarget.value.replace(/\/+$/, '') } : {}),
+      ...(isOneOf(input.executionPolicy, EVOLUTION_EXECUTION_POLICIES)
+        ? { executionPolicy: input.executionPolicy as EvolutionExecutionPolicy }
+        : {}),
+      ...(isOneOf(input.greenfieldTopology, EVOLUTION_GREENFIELD_TOPOLOGIES)
+        ? { greenfieldTopology: input.greenfieldTopology as EvolutionGreenfieldTopology }
+        : {}),
+      ...(input.requireHifiHumanApproval === true ? { requireHifiHumanApproval: true } : {}),
     },
     issues: [],
   };
@@ -373,6 +647,8 @@ function normalizeRoleState(input: Record<string, unknown>): EvolutionRoleState 
     ...(isEvolutionStage(input.stage) ? { stage: input.stage } : {}),
     ...(typeof input.currentAction === 'string' ? { currentAction: input.currentAction } : {}),
     ...(typeof input.sessionName === 'string' ? { sessionName: input.sessionName } : {}),
+    ...(typeof input.roleProfileId === 'string' ? { roleProfileId: input.roleProfileId } : {}),
+    ...(typeof input.activeAttemptId === 'string' ? { activeAttemptId: input.activeAttemptId } : {}),
     updatedAt: typeof input.updatedAt === 'number' ? input.updatedAt : Date.now(),
   };
 }
@@ -433,6 +709,12 @@ function normalizeArtifactRef(input: Record<string, unknown>): EvolutionArtifact
     ...(isEvolutionStage(input.stage) ? { stage: input.stage } : {}),
     ...(typeof input.sha256 === 'string' ? { sha256: input.sha256.toLowerCase() } : {}),
     ...(typeof input.bytes === 'number' ? { bytes: input.bytes } : {}),
+    ...(typeof input.revisionId === 'string' ? { revisionId: input.revisionId } : {}),
+    ...(isOneOf(input.status, EVOLUTION_ARTIFACT_STATUSES) ? { status: input.status } : {}),
+    ...(isOneOf(input.assurance, EVOLUTION_ASSURANCE_LEVELS) ? { assurance: input.assurance } : {}),
+    ...(typeof input.producerAttemptId === 'string' ? { producerAttemptId: input.producerAttemptId } : {}),
+    ...(typeof input.authorizedByVerdictId === 'string' ? { authorizedByVerdictId: input.authorizedByVerdictId } : {}),
+    ...(typeof input.supersedesRevisionId === 'string' ? { supersedesRevisionId: input.supersedesRevisionId } : {}),
     createdAt: input.createdAt as number,
   };
 }
@@ -453,6 +735,8 @@ function normalizeScore(input: Record<string, unknown>): EvolutionScore {
     score: input.score as number,
     maxScore: 10,
     summary: input.summary as string,
+    ...(isOneOf(input.source, EVOLUTION_SCORE_SOURCES) ? { source: input.source } : {}),
+    ...(typeof input.attemptId === 'string' ? { attemptId: input.attemptId } : {}),
   };
 }
 
@@ -542,6 +826,9 @@ function normalizeRoundtableRef(input: Record<string, unknown>): EvolutionRoundt
     ...(typeof input.discussionId === 'string' ? { discussionId: input.discussionId } : {}),
     ...(typeof input.contextPath === 'string' ? { contextPath: input.contextPath } : {}),
     ...(typeof input.currentTargetSession === 'string' ? { currentTargetSession: input.currentTargetSession } : {}),
+    ...(typeof input.attemptId === 'string' ? { attemptId: input.attemptId } : {}),
+    ...(typeof input.dispatchToken === 'string' ? { dispatchToken: input.dispatchToken } : {}),
+    ...(typeof input.verdictId === 'string' ? { verdictId: input.verdictId } : {}),
     ...(typeof input.summary === 'string' ? { summary: input.summary } : {}),
     ...(typeof input.error === 'string' ? { error: input.error } : {}),
     ...(typeof input.completedAt === 'string' ? { completedAt: input.completedAt } : {}),
@@ -841,6 +1128,17 @@ export function validateEvolutionProjection(input: unknown): EvolutionValidation
   if (input.designTargetSurface !== undefined && !isOneOf(input.designTargetSurface, EVOLUTION_DESIGN_TARGET_SURFACES)) {
     issues.push(issue('invalid_design_target_surface', 'designTargetSurface must be auto, mobile, pc, or both.', 'designTargetSurface'));
   }
+  if (input.developmentMode !== undefined && !isOneOf(input.developmentMode, EVOLUTION_DEVELOPMENT_MODES)) {
+    issues.push(issue('invalid_development_mode', 'developmentMode must be brownfield_refactor or greenfield_new_system.', 'developmentMode'));
+  }
+  if (input.developmentTargetRelativeDir !== undefined) {
+    const target = validateEvolutionArtifactRelativePath(input.developmentTargetRelativeDir, 'developmentTargetRelativeDir');
+    if (!target.ok) issues.push(...target.issues);
+  }
+  if (input.requireHifiHumanApproval !== undefined && typeof input.requireHifiHumanApproval !== 'boolean') {
+    issues.push(issue('invalid_hifi_human_approval', 'requireHifiHumanApproval must be a boolean when provided.', 'requireHifiHumanApproval'));
+  }
+  issues.push(...validateEvolutionControlProjection(input));
 
   const evidence = Array.isArray(input.evidence) ? input.evidence : [];
   if (!Array.isArray(input.evidence)) issues.push(issue('invalid_evidence_list', 'evidence must be an array.', 'evidence'));
@@ -867,6 +1165,7 @@ export function validateEvolutionProjection(input: unknown): EvolutionValidation
   return {
     ok: true,
     value: {
+      ...(input as Partial<EvolutionProjection>),
       projectionVersion: 1,
       runId: runId.ok ? runId.value : '',
       requestId: requestId.ok ? requestId.value : '',
@@ -890,6 +1189,9 @@ export function validateEvolutionProjection(input: unknown): EvolutionValidation
       roundtables: roundtables.map((entry) => normalizeRoundtableRef(entry as Record<string, unknown>)),
       roundtableGateMode: input.roundtableGateMode as EvolutionRoundtableGateMode,
       ...(isOneOf(input.designTargetSurface, EVOLUTION_DESIGN_TARGET_SURFACES) ? { designTargetSurface: input.designTargetSurface as EvolutionDesignTargetSurface } : {}),
+      ...(isOneOf(input.developmentMode, EVOLUTION_DEVELOPMENT_MODES) ? { developmentMode: input.developmentMode as EvolutionDevelopmentMode } : {}),
+      ...(typeof input.developmentTargetRelativeDir === 'string' ? { developmentTargetRelativeDir: input.developmentTargetRelativeDir } : {}),
+      ...(typeof input.requireHifiHumanApproval === 'boolean' ? { requireHifiHumanApproval: input.requireHifiHumanApproval } : {}),
       evidence: evidence.map((entry) => normalizeEvidence(entry as Record<string, unknown>)),
       executionTimeline: executionTimeline.map((entry) => normalizeExecutionTimelineItem(entry as Record<string, unknown>)),
       liveEvents: liveEvents.map((entry) => normalizeLiveEvent(entry as Record<string, unknown>)),

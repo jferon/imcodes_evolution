@@ -3683,6 +3683,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               autoDeliverPresetId: 'standard',
               roundtableGateMode: options.roundtableGateMode,
               designTargetSurface: options.designTargetSurface,
+              developmentMode: options.developmentMode,
+              developmentTargetRelativeDir: options.developmentTargetRelativeDir,
+              greenfieldTopology: options.greenfieldTopology,
+              requireHifiHumanApproval: options.requireHifiHumanApproval,
             });
           }}
           onLaunchDemo={(options) => {
@@ -3692,6 +3696,10 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
               autoDeliverPresetId: 'standard',
               roundtableGateMode: options.roundtableGateMode,
               designTargetSurface: options.designTargetSurface,
+              developmentMode: options.developmentMode,
+              developmentTargetRelativeDir: options.developmentTargetRelativeDir,
+              greenfieldTopology: options.greenfieldTopology,
+              requireHifiHumanApproval: options.requireHifiHumanApproval,
             });
           }}
           onCreateReferenceBrief={(options) => evolutionPipeline.createReferenceBrief({
@@ -3701,7 +3709,8 @@ export function SessionControls({ ws, activeSession, inputRef, onAfterAction, on
           onScanInbox={() => { evolutionPipeline.scanInbox(); }}
           onCheckStaging={() => { evolutionPipeline.checkStaging(); }}
           onStop={() => { evolutionPipeline.stop(); }}
-          onContinue={(message) => { evolutionPipeline.continueRun(undefined, message); }}
+          onContinue={(message, targetStage) => { evolutionPipeline.continueRun(targetStage, message); }}
+          onGateAction={(gateId, action, feedback) => { evolutionPipeline.applyGateAction(gateId, action, feedback); }}
           onStartAutoDeliver={(changeName) => {
             launchOpenSpecAutoDeliver(changeName, 'standard');
             evolutionPipeline.sendUserMessage(`OpenSpec Auto Deliver launch requested for ${changeName}.`, 'loop_supervisor');

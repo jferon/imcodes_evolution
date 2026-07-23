@@ -743,6 +743,20 @@
     "upgrade_blocked_toolchain_unavailable": "На хосте daemon отсутствует Node (toolchain удалён). Переустановите Node — автообновление отключено до этого."
   },
   "discussion": {
+    "field_domain_role": "Предметная роль",
+    "field_runtime": "Среда Agent",
+    "domain_role_loop_supervisor": "Координатор цикла",
+    "domain_role_product_manager": "Менеджер продукта",
+    "domain_role_product_critic": "Критик продукта",
+    "domain_role_ux_designer": "UX-дизайнер",
+    "domain_role_visual_designer": "Визуальный дизайнер",
+    "domain_role_visual_fidelity_checker": "Ревьюер визуальной точности",
+    "domain_role_tech_director": "Технический директор",
+    "domain_role_backend_developer": "Backend-разработчик",
+    "domain_role_frontend_developer": "Frontend-разработчик",
+    "domain_role_qa_engineer": "QA-инженер",
+    "domain_role_security_reviewer": "Ревьюер безопасности",
+    "domain_role_ops_release_manager": "Операции / Релизы",
     "role_critic": "Критик",
     "role_pragmatist": "Прагматик",
     "role_innovator": "Новатор",
@@ -2523,5 +2537,24 @@
     "error_request_failed": "Ошибка запроса.",
     "error_app_server_timeout": "Codex не ответил.",
     "error_invalid_params": "Неверный запрос."
+  },
+  "evolution": {
+    "development_mode": "Режим разработки",
+    "mode_brownfield_refactor": "Рефакторинг / расширение текущей системы",
+    "mode_greenfield_new_system": "Разработка новой системы",
+    "greenfield_target": "Каталог новой системы",
+    "greenfield_topology": "Топология новой системы",
+    "topology_monolith": "Монолит (минимум инфраструктуры)",
+    "topology_modular_monolith": "Модульный монолит (рекомендуется)",
+    "topology_services": "Сервисы (нужны дополнительные инфраструктурные шлюзы)",
+    "greenfield_help": "Создаёт задачи архитектуры, основы и walking skeleton в отдельном каталоге проекта. Внешний репозиторий и production-инфраструктура требуют отдельного разрешения.",
+    "brownfield_help": "Переиспользует текущую архитектуру, модули, контракты данных, компоненты и развёртывание с планами миграции и отката.",
+    "hifi_review_title": "Проверка детального дизайна",
+    "hifi_review_help": "Просмотрите все изображения до начала архитектурных работ. Одобрите набор или запросите новый вариант с комментариями.",
+    "images": "изображений",
+    "approve_hifi": "Одобрить и продолжить",
+    "redesign_hifi": "Запросить редизайн",
+    "hifi_approved_message": "Пользователь одобрил набор детального дизайна.",
+    "redesign_default_feedback": "Переработайте набор, сохранив требования и ограничения референсов."
   }
 }

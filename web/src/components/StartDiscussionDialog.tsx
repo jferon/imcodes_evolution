@@ -1,15 +1,17 @@
 import { useState, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { saveUserPref } from '../api.js';
+import { EVOLUTION_ROLE_IDS, type EvolutionRoleId } from '@shared/evolution-pipeline-constants.js';
 
 const AGENTS = [
-  { id: 'claude-code', label: 'Claude Code', models: ['opus[1M]', 'sonnet'] },
-  { id: 'codex', label: 'Codex', models: [] },
-  { id: 'gemini', label: 'Gemini', models: [] },
+  { id: 'claude-code', label: 'Claude Code' },
+  { id: 'codex', label: 'Codex' },
+  { id: 'gemini', label: 'Gemini' },
 ];
 
 interface Participant {
   roleId: string;
+  domainRoleId: EvolutionRoleId;
   customRoleLabel?: string;
   customRolePrompt?: string;
   agentType: string;
@@ -35,7 +37,7 @@ interface Props {
   onStartRequested: (payload: {
     topic: string;
     cwd: string;
-    participants: Array<{ agentType: string; model?: string; roleId: string; roleLabel?: string; rolePrompt?: string; sessionName?: string }>;
+    participants: Array<{ agentType: string; model?: string; roleId: string; domainRoleId: EvolutionRoleId; roleLabel?: string; rolePrompt?: string; sessionName?: string }>;
     maxRounds: number;
     verdictIdx: number;
   }) => void;
@@ -54,13 +56,20 @@ export function StartDiscussionDialog({ onStartRequested, defaultCwd, existingSe
     { id: 'innovator', label: t('discussion.role_innovator'), icon: '💡' },
     { id: 'custom', label: t('discussion.role_custom'), icon: '✏️' },
   ];
+  const DOMAIN_ROLES = EVOLUTION_ROLE_IDS.map((roleId) => ({
+    id: roleId,
+    label: t(`discussion.domain_role_${roleId}`),
+  }));
 
   const [topic, setTopic] = useState('');
   const [cwd, setCwd] = useState(defaultCwd ?? '');
   const [participants, setParticipants] = useState<Participant[]>(
-    savedPrefs?.participants ?? [
-      { roleId: 'critic', agentType: 'claude-code', model: 'opus[1M]' },
-      { roleId: 'pragmatist', agentType: 'claude-code', model: 'sonnet' },
+    savedPrefs?.participants?.map((participant, index) => ({
+      ...participant,
+      domainRoleId: participant.domainRoleId ?? (index === 0 ? 'product_critic' : 'tech_director'),
+    })) ?? [
+      { roleId: 'critic', domainRoleId: 'product_critic', agentType: 'claude-code', model: 'opus[1M]' },
+      { roleId: 'pragmatist', domainRoleId: 'tech_director', agentType: 'claude-code', model: 'sonnet' },
     ],
   );
   const [verdictIdx, setVerdictIdx] = useState(savedPrefs?.verdictIdx ?? 0);
@@ -70,7 +79,9 @@ export function StartDiscussionDialog({ onStartRequested, defaultCwd, existingSe
     if (participants.length >= 3) return;
     const usedRoles = new Set(participants.map((p) => p.roleId));
     const nextRole = PRESET_ROLES.find((r) => !usedRoles.has(r.id) && r.id !== 'custom')?.id ?? 'critic';
-    setParticipants([...participants, { roleId: nextRole, agentType: 'claude-code', model: 'sonnet' }]);
+    const usedDomainRoles = new Set(participants.map((p) => p.domainRoleId));
+    const domainRoleId = EVOLUTION_ROLE_IDS.find((roleId) => !usedDomainRoles.has(roleId)) ?? 'product_critic';
+    setParticipants([...participants, { roleId: nextRole, domainRoleId, agentType: 'claude-code', model: 'sonnet' }]);
   };
 
   const removeParticipant = (idx: number) => {
@@ -91,8 +102,10 @@ export function StartDiscussionDialog({ onStartRequested, defaultCwd, existingSe
     if (!topic.trim() || submittingRef.current) return;
     submittingRef.current = true;
     void saveUserPref('discussion_prefs', {
+      prefsSchemaVersion: 2,
       participants: participants.map((p) => ({
         roleId: p.roleId,
+        domainRoleId: p.domainRoleId,
         customRoleLabel: p.customRoleLabel,
         customRolePrompt: p.customRolePrompt,
         agentType: p.agentType,
@@ -108,6 +121,7 @@ export function StartDiscussionDialog({ onStartRequested, defaultCwd, existingSe
         agentType: p.agentType,
         model: p.model,
         roleId: p.roleId,
+        domainRoleId: p.domainRoleId,
         roleLabel: p.roleId === 'custom' ? p.customRoleLabel : undefined,
         rolePrompt: p.roleId === 'custom' ? p.customRolePrompt : undefined,
         sessionName: p.sessionName,
@@ -206,62 +220,61 @@ export function StartDiscussionDialog({ onStartRequested, defaultCwd, existingSe
                   )}
 
                   {/* Session source: new or reuse */}
-                  {p.roleId !== 'custom' && (
+                  <select
+                    class="input input-sm discussion-session-select"
+                    value={p.sessionName ?? '_new'}
+                    onChange={(e) => {
+                      const val = (e.target as HTMLSelectElement).value;
+                      if (val === '_new') {
+                        updateParticipant(idx, { sessionName: undefined });
+                      } else {
+                        const existing = existingSessions.find((s) => s.sessionName === val);
+                        updateParticipant(idx, {
+                          sessionName: val,
+                          agentType: existing?.type ?? p.agentType,
+                        });
+                      }
+                    }}
+                  >
+                    <option value="_new">{t('session.new_btn')}</option>
+                    {existingSessions.map((s) => (
+                      <option key={s.sessionName} value={s.sessionName}>
+                        {s.label || s.sessionName} ({s.type})
+                      </option>
+                    ))}
+                  </select>
+
+                  {/* Governed domain role — the daemon resolves its skill. */}
+                  <select
+                    class="input input-sm discussion-role-select"
+                    value={p.domainRoleId}
+                    aria-label={t('discussion.field_domain_role')}
+                    onChange={(e) => updateParticipant(idx, { domainRoleId: (e.target as HTMLSelectElement).value as EvolutionRoleId })}
+                  >
+                    {DOMAIN_ROLES.map((role) => (
+                      <option key={role.id} value={role.id}>{role.label}</option>
+                    ))}
+                  </select>
+
+                  {/* Runtime (new sessions only). Model selection is hidden:
+                      the governed role/skill defines the participant. */}
+                  {!p.sessionName && (
                     <select
-                      class="input input-sm discussion-session-select"
-                      value={p.sessionName ?? '_new'}
+                      class="input input-sm"
+                      value={p.agentType}
+                      aria-label={t('discussion.field_runtime')}
                       onChange={(e) => {
-                        const val = (e.target as HTMLSelectElement).value;
-                        if (val === '_new') {
-                          updateParticipant(idx, { sessionName: undefined });
-                        } else {
-                          const existing = existingSessions.find((s) => s.sessionName === val);
-                          updateParticipant(idx, {
-                            sessionName: val,
-                            agentType: existing?.type ?? p.agentType,
-                          });
-                        }
+                        const agent = (e.target as HTMLSelectElement).value;
+                        updateParticipant(idx, {
+                          agentType: agent,
+                          model: agent === 'claude-code' ? 'sonnet' : undefined,
+                        });
                       }}
                     >
-                      <option value="_new">{t('session.new_btn')}</option>
-                      {existingSessions.map((s) => (
-                        <option key={s.sessionName} value={s.sessionName}>
-                          {s.label || s.sessionName} ({s.type})
-                        </option>
+                      {AGENTS.map((a) => (
+                        <option key={a.id} value={a.id}>{a.label}</option>
                       ))}
                     </select>
-                  )}
-
-                  {/* Agent + Model (new sessions only) */}
-                  {!p.sessionName && p.roleId !== 'custom' && (
-                    <>
-                      <select
-                        class="input input-sm"
-                        value={p.agentType}
-                        onChange={(e) => {
-                          const agent = (e.target as HTMLSelectElement).value;
-                          updateParticipant(idx, {
-                            agentType: agent,
-                            model: agent === 'claude-code' ? 'sonnet' : undefined,
-                          });
-                        }}
-                      >
-                        {AGENTS.map((a) => (
-                          <option key={a.id} value={a.id}>{a.label}</option>
-                        ))}
-                      </select>
-
-                      {p.agentType === 'claude-code' && (
-                        <select
-                          class="input input-sm"
-                          value={p.model ?? 'sonnet'}
-                          onChange={(e) => updateParticipant(idx, { model: (e.target as HTMLSelectElement).value })}
-                        >
-                          <option value="opus[1M]">Opus [1M]</option>
-                          <option value="sonnet">Sonnet</option>
-                        </select>
-                      )}
-                    </>
                   )}
 
                   {/* Remove button */}

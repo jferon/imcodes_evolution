@@ -1,10 +1,15 @@
 import { createHash } from 'node:crypto';
-import { copyFile, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, readFile, readdir, realpath, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import {
   EVOLUTION_ARTIFACT_PREVIEW_MAX_CHARS,
   EVOLUTION_AUTO_DELIVER_PRESET_IDS,
+  EVOLUTION_DEVELOPMENT_MODES,
   EVOLUTION_DESIGN_TARGET_SURFACES,
+  EVOLUTION_EXECUTION_POLICIES,
+  EVOLUTION_HIFI_REDESIGN_MESSAGE_PREFIX,
+  EVOLUTION_GATE_ACTIONS,
+  EVOLUTION_GREENFIELD_TOPOLOGIES,
   EVOLUTION_PIPELINE_MSG,
   EVOLUTION_VISUAL_FIDELITY_ROUNDTABLE_ID,
   EVOLUTION_REQUIREMENT_INBOX_DIR,
@@ -16,7 +21,11 @@ import {
   isEvolutionStage,
   type EvolutionArtifactKind,
   type EvolutionAutoDeliverPresetId,
+  type EvolutionDevelopmentMode,
   type EvolutionDesignTargetSurface,
+  type EvolutionExecutionPolicy,
+  type EvolutionGateAction,
+  type EvolutionGreenfieldTopology,
   type EvolutionRoundtableGateMode,
   type EvolutionScoreModuleId,
   type EvolutionRoleId,
@@ -67,6 +76,19 @@ import { recordEvolutionInboxSeenFiles } from './evolution-inbox-watcher.js';
 import type { EvolutionInboxCandidate, EvolutionInboxCandidateFile, EvolutionInboxCandidateGroup } from './evolution-inbox-watcher.js';
 import { parseSkillMarkdown } from '../../shared/skill-store.js';
 import { getSession } from '../store/session-store.js';
+import {
+  captureEvolutionSkillSnapshot,
+  completeEvolutionAttempt,
+  createEvolutionAttempt,
+  initializeEvolutionControlState,
+  nextEvolutionRunRevision,
+  persistEvolutionGate,
+  persistEvolutionReviewSet,
+  recordEvolutionVerdict,
+  registerEvolutionArtifactRevision,
+  requireAuthorizedEvolutionRevision,
+} from './evolution-control-plane.js';
+import { withEvolutionMutationCommit } from './evolution-mutation-controller.js';
 
 interface RuntimeEntry {
   projectRoot: string;
@@ -93,6 +115,11 @@ export interface LaunchEvolutionDemoRunOptions {
   autoCommitPush?: boolean;
   roundtableGateMode?: EvolutionRoundtableGateMode;
   designTargetSurface?: EvolutionDesignTargetSurface;
+  developmentMode?: EvolutionDevelopmentMode;
+  executionPolicy?: EvolutionExecutionPolicy;
+  developmentTargetRelativeDir?: string;
+  greenfieldTopology?: EvolutionGreenfieldTopology;
+  requireHifiHumanApproval?: boolean;
   nowMs?: number;
 }
 
@@ -131,6 +158,16 @@ export interface ContinueEvolutionRunOptions {
   runId: string;
   targetStage?: EvolutionStage;
   message?: string;
+  nowMs?: number;
+}
+
+export interface ApplyEvolutionGateActionOptions {
+  runId: string;
+  gateId: string;
+  action: EvolutionGateAction;
+  mutationId: string;
+  expectedRunRevision: number;
+  feedback?: string;
   nowMs?: number;
 }
 
@@ -249,6 +286,9 @@ export interface EvolutionRoundtableRoleInstruction {
   skillSummary?: string;
   responsibilities: string[];
   currentAction?: string;
+  skillSnapshotId?: string;
+  skillSha256?: string;
+  skillContent?: string;
 }
 
 export interface EvolutionRoundtableLaunchResult {
@@ -360,6 +400,9 @@ function launchFingerprint(request: EvolutionLaunchRequest): string {
     autoCommitPush: request.autoCommitPush === true,
     roundtableGateMode: request.roundtableGateMode ?? 'planning',
     designTargetSurface: request.designTargetSurface ?? 'auto',
+    developmentMode: request.developmentMode ?? 'brownfield_refactor',
+    developmentTargetRelativeDir: request.developmentTargetRelativeDir ?? null,
+    requireHifiHumanApproval: request.requireHifiHumanApproval === true,
   });
 }
 
@@ -415,6 +458,88 @@ function safeProjectRelativePath(projectRoot: string, relativePath: string): str
   const rel = relative(resolvedRoot, resolvedPath);
   if (rel.startsWith('..') || isAbsolute(rel)) throw new Error('evolution_path_outside_project');
   return resolvedPath;
+}
+
+type GreenfieldTargetInspection =
+  | { ok: true; inventorySha256: string }
+  | { ok: false; code: string; message: string };
+
+async function inspectGreenfieldTarget(
+  projectRoot: string,
+  targetRelativeDir: string,
+): Promise<GreenfieldTargetInspection> {
+  const resolvedRoot = safeProjectRoot(projectRoot);
+  const targetPath = safeProjectRelativePath(resolvedRoot, targetRelativeDir);
+  try {
+    const canonicalRoot = await realpath(resolvedRoot);
+    const segments = relative(resolvedRoot, targetPath).split(/[\\/]/).filter(Boolean);
+    let cursor = resolvedRoot;
+    let targetExists = true;
+    for (const segment of segments) {
+      cursor = join(cursor, segment);
+      try {
+        const entry = await lstat(cursor);
+        if (entry.isSymbolicLink()) {
+          return {
+            ok: false,
+            code: 'greenfield_target_symlink',
+            message: 'Greenfield target and its existing parent path must not contain symbolic links.',
+          };
+        }
+        if (!entry.isDirectory()) {
+          return {
+            ok: false,
+            code: 'greenfield_target_not_empty',
+            message: 'Greenfield target must be absent or an empty directory; existing content will not be overwritten.',
+          };
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          targetExists = false;
+          break;
+        }
+        return {
+          ok: false,
+          code: 'greenfield_target_unreadable',
+          message: `Greenfield target could not be inspected safely: ${describeUnknownError(error)}`,
+        };
+      }
+    }
+    const canonicalExistingParent = await realpath(cursor).catch(async (error) => {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      return realpath(dirname(cursor));
+    });
+    const canonicalRelative = relative(canonicalRoot, canonicalExistingParent);
+    if (canonicalRelative.startsWith('..') || isAbsolute(canonicalRelative)) {
+      return {
+        ok: false,
+        code: 'greenfield_target_outside_project',
+        message: 'Greenfield target resolves outside the canonical project root.',
+      };
+    }
+    const entries = targetExists ? (await readdir(targetPath)).sort() : [];
+    if (entries.length > 0) {
+      return {
+        ok: false,
+        code: 'greenfield_target_not_empty',
+        message: 'Greenfield target must be absent or an empty directory; existing content will not be overwritten.',
+      };
+    }
+    return {
+      ok: true,
+      inventorySha256: sha256(JSON.stringify({
+        targetRelativeDir: targetRelativeDir.replace(/\\/g, '/').replace(/\/+$/, ''),
+        exists: targetExists,
+        entries,
+      })),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      code: 'greenfield_target_unreadable',
+      message: `Greenfield target could not be inspected safely: ${describeUnknownError(error)}`,
+    };
+  }
 }
 
 function sanitizeDemoPathSegment(value: string): string {
@@ -732,8 +857,9 @@ async function writeRoleInstructionResponseArtifact(
 
 function roundtablePrimaryRole(spec: EvolutionRoundtableSpec): EvolutionRoleId {
   if (spec.gatesAutoDelivery) return 'tech_director';
-  if (spec.id === 'product-review') return 'product_critic';
+  if (spec.id === 'product-review') return 'product_manager';
   if (spec.id === 'design-review') return 'visual_designer';
+  if (spec.id === EVOLUTION_VISUAL_FIDELITY_ROUNDTABLE_ID) return 'visual_designer';
   if (spec.id === 'architecture-review') return 'tech_director';
   return spec.roles[0] ?? 'loop_supervisor';
 }
@@ -977,7 +1103,7 @@ function findUserPauseQuestion(run: EvolutionRun): { id: string; stage: Evolutio
   return null;
 }
 
-function inferHumanContinueTargetStage(run: EvolutionRun): EvolutionStage {
+function inferHumanContinueTargetStage(run: EvolutionRun): EvolutionStage | null {
   const pauseQuestion = findUserPauseQuestion(run);
   if (pauseQuestion) return pauseQuestion.stage;
   for (const question of [...run.blockingQuestions].reverse()) {
@@ -988,10 +1114,16 @@ function inferHumanContinueTargetStage(run: EvolutionRun): EvolutionStage {
     }
     if (question.id === `planning-roundtable-${run.runId}-blocked`) return 'tasks_ready';
     if (question.id === `auto-delivery-${run.runId}-blocked`) return 'tasks_ready';
+    if (question.id === `requirement-classification-${run.runId}`) return 'detected';
+    if (question.id === `design-reference-images-missing-${run.runId}`) return 'design_lofi';
+    if (question.id === `taste-skill-required-${run.runId}`) return 'design_lofi';
+    if (question.id === `design-hifi-approval-${run.runId}`) return 'design_hifi';
+    if (question.id === `design-hifi-regeneration-unchanged-${run.runId}`) return 'design_lofi';
+    if (question.id.startsWith(`staging-config-${run.runId}-`)) return 'delivery_ready';
     if (question.id.startsWith(`staging-delivery-${run.runId}-`)) return 'delivery_ready';
     if (question.id.startsWith('openspec-')) return 'implementation_loop';
   }
-  return 'implementation_loop';
+  return null;
 }
 
 function releaseUserPauseGateForHumanContinue(
@@ -1023,37 +1155,37 @@ function releaseRoundtableGateForHumanContinue(
   targetStage: EvolutionStage,
   message: string | undefined,
   nowMs: number,
-): void {
+): boolean {
   const releaseTargets = (run.roundtables ?? []).filter((roundtable) => {
     if (roundtable.stage !== targetStage) return false;
     if (roundtable.id === PLANNING_ROUNDTABLE_ID) {
       return planningRoundtableGateDecision(run).disposition === 'block';
     }
     if ((run.roundtableGateMode ?? 'planning') !== 'strict') return false;
-    return roundtableGateDecision(roundtable).disposition === 'block';
+    return roundtableGateDecision(roundtable, run).disposition === 'block';
   });
   for (const roundtable of releaseTargets) {
-    const summary = `PASS: human override resolved ${roundtable.topic}${message ? ` — ${message.slice(0, 500)}` : ''}`;
-    const released: EvolutionRoundtableRef = {
-      ...roundtable,
-      status: 'complete',
-      summary,
-      completedAt: new Date(nowMs).toISOString(),
-      updatedAt: nowMs,
-    };
-    delete released.error;
-    upsertRoundtable(run, released);
+    // A human asking the pipeline to continue is not an agent/checker PASS.
+    // Preserve the failed verdict as evidence, then remove only the active
+    // roundtable reference so the same governed stage launches a fresh attempt.
+    run.roundtables = (run.roundtables ?? []).filter((entry) => entry.id !== roundtable.id);
     appendDiscussion(run, {
       kind: 'gate',
       stage: targetStage,
       roleId: 'loop_supervisor',
       author: 'Loop Supervisor / 总控',
-      text: `人工已解除 ${roundtable.topic} 门禁，恢复到 ${targetStage} 继续自我进化。${message ? `说明：${message}` : ''}`,
+      text: `人工要求重新执行 ${roundtable.topic}，恢复到 ${targetStage} 后将启动新的受治理圆桌；原 REWORK/失败结论保持不变。${message ? `说明：${message}` : ''}`,
       createdAt: nowMs,
     });
     appendEvidence(run, {
-      source: 'human_gate_override',
-      summary: `Released ${roundtable.id} gate at ${targetStage}.`,
+      source: 'human_roundtable_retry',
+      summary: [
+        `Human requested a fresh ${roundtable.id} attempt at ${targetStage}.`,
+        `Previous status=${roundtable.status}.`,
+        roundtable.p2pRunId ? `Previous p2pRunId=${roundtable.p2pRunId}.` : '',
+        roundtable.summary ? `Previous verdict=${roundtable.summary.slice(0, 500)}.` : '',
+        roundtable.error ? `Previous error=${roundtable.error.slice(0, 500)}.` : '',
+      ].filter(Boolean).join(' '),
       createdAt: nowMs,
     });
     run.blockingQuestions = run.blockingQuestions.filter((question) => (
@@ -1061,6 +1193,7 @@ function releaseRoundtableGateForHumanContinue(
       question.id !== `planning-roundtable-${run.runId}-blocked`
     ));
   }
+  return releaseTargets.length > 0;
 }
 
 function evolutionScoreModuleForOpenSpec(module: string): EvolutionScoreModuleId | null {
@@ -1073,9 +1206,13 @@ function evolutionScoreModuleForOpenSpec(module: string): EvolutionScoreModuleId
 }
 
 async function persistAndProject(entry: RuntimeEntry, nowMs: number): Promise<EvolutionProjection> {
-  entry.run.updatedAt = nowMs;
-  await writeEvolutionRun(entry.projectRoot, entry.run);
-  return buildEvolutionProjection(entry.run, nowMs);
+  return withEvolutionMutationCommit(entry.run.runId, async () => {
+    initializeEvolutionControlState(entry.run);
+    nextEvolutionRunRevision(entry.run);
+    entry.run.updatedAt = nowMs;
+    await writeEvolutionRun(entry.projectRoot, entry.run);
+    return buildEvolutionProjection(entry.run, nowMs);
+  });
 }
 
 function isManualWarRoomStopReason(reason: string | undefined): boolean {
@@ -1088,6 +1225,15 @@ function isWarRoomPauseReason(reason: string | undefined): boolean {
 
 function normalizeHydratedEvolutionRun(run: EvolutionRun, nowMs: number): boolean {
   let changed = false;
+  if (run.controlVersion !== 2) {
+    initializeEvolutionControlState(run);
+    for (const artifact of run.artifacts) {
+      artifact.status ??= artifact.kind === 'input' || artifact.kind === 'role_skill' ? 'approved' : 'candidate';
+      artifact.assurance ??= artifact.kind === 'input' || artifact.kind === 'role_skill' ? 'observed' : 'legacy_unverified';
+    }
+    for (const score of run.scores) score.source ??= 'heuristic';
+    changed = true;
+  }
   if (run.stage === 'stopped' && isManualWarRoomStopReason(run.terminalReason) && run.latestMessage !== run.terminalReason) {
     run.latestMessage = run.terminalReason;
     changed = true;
@@ -1138,6 +1284,63 @@ async function writeProductionReleaseGateArtifact(
     stage: 'human_release_gate',
     sha256: sha256(content),
     bytes: Buffer.byteLength(content),
+    createdAt: nowMs,
+  };
+}
+
+async function snapshotRejectedHifiReviewSet(
+  entry: RuntimeEntry,
+  feedback: string,
+  nowMs: number,
+): Promise<EvolutionArtifactRef> {
+  const paths = getEvolutionRunPaths(entry.projectRoot, entry.run.runId);
+  const revisionName = `human-${new Date(nowMs).toISOString().replace(/[-:.]/g, '')}`;
+  const revisionRelativeDir = `design/revisions/${revisionName}`;
+  const visualArtifacts = entry.run.artifacts.filter((artifact) => (
+    artifact.stage === 'design_hifi'
+    && /\.(?:svg|png|jpe?g|webp)$/i.test(artifact.path)
+  ));
+  const copied: Array<{ artifactId: string; sourcePath: string; snapshotPath: string; sha256?: string }> = [];
+  for (const artifact of visualArtifacts) {
+    const snapshotRelativePath = `${revisionRelativeDir}/${artifact.path.replace(/^design\//, '')}`;
+    const sourcePath = safeRunArtifactPath(paths.runDir, artifact.path);
+    const snapshotPath = safeRunArtifactPath(paths.runDir, snapshotRelativePath);
+    await mkdir(dirname(snapshotPath), { recursive: true });
+    await copyFile(sourcePath, snapshotPath);
+    copied.push({
+      artifactId: artifact.id,
+      sourcePath: artifact.path,
+      snapshotPath: snapshotRelativePath,
+      ...(artifact.sha256 ? { sha256: artifact.sha256 } : {}),
+    });
+  }
+  const manifestRelativePath = `${revisionRelativeDir}/review.json`;
+  const manifestPath = safeRunArtifactPath(paths.runDir, manifestRelativePath);
+  const manifest = `${JSON.stringify({
+    schemaVersion: 1,
+    runId: entry.run.runId,
+    verdict: 'REWORK',
+    verdictSource: 'human_gate',
+    feedback: feedback.slice(0, 2_000),
+    frozenAt: new Date(nowMs).toISOString(),
+    artifacts: copied,
+  }, null, 2)}\n`;
+  await mkdir(dirname(manifestPath), { recursive: true });
+  await writeFile(manifestPath, manifest, 'utf8');
+  return {
+    id: `visual_fidelity_report:${manifestRelativePath}`,
+    kind: 'visual_fidelity_report',
+    path: manifestRelativePath,
+    title: `Rejected High-Fidelity Review Set · ${revisionName}`,
+    preview: {
+      previewType: 'text',
+      content: manifest,
+      language: 'json',
+    },
+    roleId: 'visual_designer',
+    stage: 'design_hifi',
+    sha256: sha256(manifest),
+    bytes: Buffer.byteLength(manifest),
     createdAt: nowMs,
   };
 }
@@ -1367,11 +1570,17 @@ function roundtableSignal(run: EvolutionRun): EvolutionLoopControlSignal {
     };
   }
   if (roundtables.length > 0) {
+    const verified = roundtables.filter((roundtable) => {
+      const verdict = roundtable.verdictId
+        ? (run.verdictRecords ?? []).find((entry) => entry.id === roundtable.verdictId)
+        : undefined;
+      return roundtable.status === 'complete' && verdict?.machineReadable === true && verdict.verdict === 'PASS';
+    });
     return {
       id: 'p2p_roundtables',
       label: 'P2P roundtables',
-      status: 'complete',
-      detail: `${roundtables.length} roundtable checkpoints recorded (${roundtables.map((entry) => entry.status).join(', ')}).`,
+      status: verified.length === roundtables.length ? 'complete' : 'blocked',
+      detail: `${verified.length}/${roundtables.length} roundtables have a bound machine-readable PASS verdict.`,
     };
   }
   return {
@@ -1393,46 +1602,66 @@ function buildLoopControlSignals(run: EvolutionRun): EvolutionLoopControlSignal[
   const deliveryBlocked = run.stagingDelivery?.status === 'failed';
   const scoreCount = run.scores.length;
   const lowScore = run.scores.find((score) => score.score < 5);
+  const verifiedScoreCount = run.scores.filter((score) => score.source === 'checker' || score.source === 'human').length;
+  const authorizedMakerChecker = ['implementation/agent-task-matrix.md', run.linkedOpenSpecChange ? `openspec/changes/${run.linkedOpenSpecChange}/tasks.md` : '']
+    .filter(Boolean)
+    .every((path) => !!run.authorizedRevisions?.[path]);
+  const hifiApproved = (run.designReviewSets ?? []).some((reviewSet) => reviewSet.status === 'approved');
+  const snapshotRoleCount = new Set((run.skillSnapshots ?? []).map((snapshot) => snapshot.roleId)).size;
   return [
     {
       id: 'state_memory',
       label: 'State + memory',
-      status: 'complete',
-      detail: `run.json keeps stage, artifacts, scores, discussion, evidence, and gates durable for ${run.runId}.`,
+      status: run.controlVersion === 2 && typeof run.runRevision === 'number' ? 'complete' : 'ready',
+      detail: run.controlVersion === 2
+        ? `v2 run ledger revision ${run.runRevision ?? 0} persists attempts, immutable revisions, verdicts, gates, and review sets for ${run.runId}.`
+        : 'Legacy run is viewable but has no verified v2 authorization ledger.',
     },
     {
       id: 'role_skills',
       label: 'Role skills',
-      status: roleSkillArtifacts.length >= run.roles.length ? 'complete' : 'missing',
-      detail: `${roleSkillArtifacts.length}/${run.roles.length} project-level evolution skills are materialized under .imc/skills/evolution/.`,
+      status: snapshotRoleCount >= run.roles.length ? 'complete' : 'missing',
+      detail: `${snapshotRoleCount}/${run.roles.length} exact role-skill byte snapshots are available; a snapshot becomes execution evidence only when an attempt binds it.`,
       artifactIds: roleSkillArtifacts.slice(0, 6).map((artifact) => artifact.id),
     },
     roundtableSignal(run),
     {
       id: 'high_fidelity_design',
       label: 'High-fidelity design',
-      status: hifiArtifactIds.length > 0 ? stageOrderIndex(run.stage) >= stageOrderIndex('design_hifi') ? 'complete' : 'running' : 'missing',
+      status: hifiApproved
+        ? 'complete'
+        : hifiArtifactIds.length > 0
+          ? (run.executionPolicy ?? 'draft_preview') === 'draft_preview' ? 'complete' : 'ready'
+          : 'missing',
       detail: hifiArtifactIds.length > 0
-        ? 'Taste-skill prompt/output, high-fidelity SVG, or design handoff is available for frontend agents.'
+        ? hifiApproved
+          ? 'The frozen high-fidelity review set is human-approved and can be consumed downstream.'
+          : 'High-fidelity candidates exist but are not an approved downstream input yet.'
         : 'Waiting for design_hifi stage to create taste-skill/high-fidelity handoff.',
       ...(hifiArtifactIds.length > 0 ? { artifactIds: hifiArtifactIds.slice(0, 6) } : {}),
     },
     {
       id: 'maker_checker_tasks',
       label: 'Maker/checker tasks',
-      status: makerCheckerArtifactIds.length > 0 ? 'complete' : stageOrderIndex(run.stage) >= stageOrderIndex('architecture_baseline') ? 'ready' : 'missing',
+      status: authorizedMakerChecker
+        ? 'complete'
+        : makerCheckerArtifactIds.length > 0
+          ? (run.executionPolicy ?? 'draft_preview') === 'draft_preview' ? 'complete' : 'ready'
+          : stageOrderIndex(run.stage) >= stageOrderIndex('architecture_baseline') ? 'ready' : 'missing',
       detail: makerCheckerArtifactIds.length > 0
-        ? 'OpenSpec tasks and implementation matrix assign maker/checker ownership across frontend, backend, QA, security, and ops.'
+        ? authorizedMakerChecker
+          ? 'OpenSpec tasks and implementation matrix are authorized by a bound planning verdict.'
+          : 'Task candidates assign ownership but are waiting for a bound planning verdict.'
         : 'Task matrix is generated after architecture baseline.',
       ...(makerCheckerArtifactIds.length > 0 ? { artifactIds: makerCheckerArtifactIds.slice(0, 4) } : {}),
     },
     {
       id: 'quality_scores',
       label: 'Quality scores',
-      status: lowScore ? 'blocked' : scoreCount >= 6 ? 'complete' : scoreCount > 0 ? 'running' : 'missing',
+      status: lowScore ? 'blocked' : verifiedScoreCount >= 6 ? 'complete' : scoreCount > 0 ? 'ready' : 'missing',
       detail: lowScore
         ? `${lowScore.module} score is ${lowScore.score}/10 and requires repair.`
-        : `${scoreCount} quality score modules recorded for product/design/architecture/tasks/tests/delivery/risk.`,
+        : `${scoreCount} score modules recorded; ${verifiedScoreCount} are checker/human scores and the rest are heuristic previews.`,
       ...(qaArtifactIds.length > 0 ? { artifactIds: qaArtifactIds.slice(0, 4) } : {}),
     },
     {
@@ -1507,6 +1736,8 @@ export function buildEvolutionProjection(run: EvolutionRun, nowMs = Date.now()):
   const executionTimeline = run.executionTimeline ?? buildExecutionTimeline(run);
   return {
     projectionVersion: 1,
+    ...(run.controlVersion === 2 ? { controlVersion: 2 as const } : {}),
+    ...(typeof run.runRevision === 'number' ? { runRevision: run.runRevision } : {}),
     runId: run.runId,
     requestId: run.requestId,
     stage: run.stage,
@@ -1528,6 +1759,42 @@ export function buildEvolutionProjection(run: EvolutionRun, nowMs = Date.now()):
     })),
     roundtableGateMode: run.roundtableGateMode ?? 'planning',
     designTargetSurface: run.designTargetSurface ?? 'auto',
+    developmentMode: run.developmentMode ?? 'brownfield_refactor',
+    ...(run.developmentTargetRelativeDir ? { developmentTargetRelativeDir: run.developmentTargetRelativeDir } : {}),
+    executionPolicy: run.executionPolicy ?? 'draft_preview',
+    ...(run.greenfieldTopology ? { greenfieldTopology: run.greenfieldTopology } : {}),
+    ...(run.writePolicy ? { writePolicy: {
+      ...run.writePolicy,
+      allowedRoots: [...run.writePolicy.allowedRoots],
+      deniedRoots: [...run.writePolicy.deniedRoots],
+      protectedRoots: [...run.writePolicy.protectedRoots],
+    } } : {}),
+    requireHifiHumanApproval: run.requireHifiHumanApproval === true,
+    ...(run.roleProfiles ? { roleProfiles: run.roleProfiles.map((entry) => ({ ...entry, responsibilities: [...entry.responsibilities] })) } : {}),
+    ...(run.skillSnapshots ? { skillSnapshots: run.skillSnapshots.map((entry) => ({ ...entry })) } : {}),
+    ...(run.artifactRevisions ? { artifactRevisions: run.artifactRevisions.map((entry) => ({ ...entry })) } : {}),
+    ...(run.attempts ? { attempts: run.attempts.map((entry) => ({
+      ...entry,
+      inputRevisionIds: [...entry.inputRevisionIds],
+      skillSnapshotIds: [...entry.skillSnapshotIds],
+      outputRevisionIds: [...entry.outputRevisionIds],
+    })) } : {}),
+    ...(run.verdictRecords ? { verdictRecords: run.verdictRecords.map((entry) => ({
+      ...entry,
+      inputRevisionIds: [...entry.inputRevisionIds],
+      approvedRevisionIds: [...entry.approvedRevisionIds],
+    })) } : {}),
+    ...(run.gates ? { gates: run.gates.map((entry) => ({
+      ...entry,
+      candidateRevisionIds: [...entry.candidateRevisionIds],
+      ...(entry.decision ? { decision: { ...entry.decision } } : {}),
+    })) } : {}),
+    ...(run.designReviewSets ? { designReviewSets: run.designReviewSets.map((entry) => ({ ...entry, revisionIds: [...entry.revisionIds] })) } : {}),
+    ...(run.authorizedRevisions ? { authorizedRevisions: { ...run.authorizedRevisions } } : {}),
+    ...(run.foundationEvidence ? { foundationEvidence: run.foundationEvidence.map((entry) => ({
+      ...entry,
+      artifactRevisionIds: [...entry.artifactRevisionIds],
+    })) } : {}),
     evidence: run.evidence.map((entry) => ({ ...entry })),
     executionTimeline: executionTimeline.map((entry) => ({
       ...entry,
@@ -1561,6 +1828,15 @@ export async function launchEvolutionRun(options: LaunchEvolutionRunOptions): Pr
   const normalizedRequest = normalizeEvolutionLaunchRequest(options.projectRoot, options.request);
   const validated = validateEvolutionLaunchRequest(normalizedRequest);
   if (!validated.ok) return validated as EvolutionOrchestratorResult<EvolutionProjection>;
+  let greenfieldInventorySha256: string | undefined;
+  if (validated.value.developmentMode === 'greenfield_new_system' && validated.value.developmentTargetRelativeDir) {
+    const inspection = await inspectGreenfieldTarget(
+      options.projectRoot,
+      validated.value.developmentTargetRelativeDir,
+    );
+    if (!inspection.ok) return fail(inspection.code, inspection.message, 'developmentTargetRelativeDir');
+    greenfieldInventorySha256 = inspection.inventorySha256;
+  }
   const request = validated.value;
   const fingerprint = launchFingerprint(request);
   const cached = requestProjectionByFingerprint.get(fingerprint);
@@ -1574,6 +1850,12 @@ export async function launchEvolutionRun(options: LaunchEvolutionRunOptions): Pr
       ...(typeof options.nowMs === 'number' ? { nowMs: options.nowMs } : {}),
       ...(options.runId ? { runId: options.runId } : {}),
     });
+    if (greenfieldInventorySha256 && run.writePolicy && run.developmentTargetRelativeDir) {
+      run.writePolicy.targetRelativeDir = run.developmentTargetRelativeDir;
+      run.writePolicy.targetInventorySha256 = greenfieldInventorySha256;
+      run.writePolicy.inventoryCapturedAt = options.nowMs ?? Date.now();
+      await writeEvolutionRun(projectRoot, run);
+    }
     upsertRuntime(projectRoot, run);
     const projection = buildEvolutionProjection(run, options.nowMs ?? Date.now());
     requestProjectionByFingerprint.set(fingerprint, projection);
@@ -1612,6 +1894,11 @@ export async function launchEvolutionDemoRun(options: LaunchEvolutionDemoRunOpti
       autoCommitPush: options.autoCommitPush === true,
       roundtableGateMode: options.roundtableGateMode ?? 'planning',
       designTargetSurface: options.designTargetSurface ?? 'auto',
+      developmentMode: options.developmentMode ?? 'brownfield_refactor',
+      ...(options.executionPolicy ? { executionPolicy: options.executionPolicy } : {}),
+      ...(options.developmentTargetRelativeDir ? { developmentTargetRelativeDir: options.developmentTargetRelativeDir } : {}),
+      ...(options.greenfieldTopology ? { greenfieldTopology: options.greenfieldTopology } : {}),
+      requireHifiHumanApproval: options.requireHifiHumanApproval === true,
     },
   });
 }
@@ -1723,9 +2010,12 @@ export async function launchEvolutionRunFromInboxCandidate(options: {
       sourceRelativePath: options.candidate.sourceRelativePath,
       sourceSizeBytes: options.candidate.sizeBytes,
       requestedBy: 'watcher',
+      executionPolicy: 'governed',
       autoStart: true,
       autoStartImplementation: options.autoStartImplementation ?? true,
       autoDeliverPresetId: 'standard',
+      roundtableGateMode: 'strict',
+      requireHifiHumanApproval: true,
     },
   });
 }
@@ -1837,9 +2127,12 @@ export async function launchEvolutionRunFromInboxCandidateGroup(options: {
       sourceRelativePath: briefRelativePath,
       sourceSizeBytes: briefStat.size,
       requestedBy: 'watcher',
+      executionPolicy: 'governed',
       autoStart: true,
       autoStartImplementation: options.autoStartImplementation ?? true,
       autoDeliverPresetId: 'standard',
+      roundtableGateMode: 'strict',
+      requireHifiHumanApproval: true,
     },
   });
 }
@@ -1998,6 +2291,104 @@ export async function pauseEvolutionRun(options: PauseEvolutionRunOptions): Prom
   return ok(projection);
 }
 
+export async function applyEvolutionGateAction(
+  options: ApplyEvolutionGateActionOptions,
+): Promise<EvolutionOrchestratorResult<EvolutionProjection>> {
+  const validRunId = validateEvolutionRunId(options.runId);
+  if (!validRunId.ok) return validRunId as EvolutionOrchestratorResult<EvolutionProjection>;
+  const entry = getRuntimeEntry(validRunId.value);
+  if (!entry) return fail('evolution_run_not_found', `Evolution run not found: ${validRunId.value}`, 'runId');
+  const run = entry.run;
+  const nowMs = options.nowMs ?? Date.now();
+  initializeEvolutionControlState(run);
+  if (!options.mutationId.trim()) return fail('invalid_mutation_id', 'mutationId is required.', 'mutationId');
+  if ((run.processedMutationIds ?? []).includes(options.mutationId)) return ok(buildEvolutionProjection(run, nowMs));
+  if (options.expectedRunRevision !== (run.runRevision ?? 0)) {
+    return fail(
+      'stale_evolution_run_revision',
+      `Gate action expected run revision ${options.expectedRunRevision}, current revision is ${run.runRevision ?? 0}.`,
+      'expectedRunRevision',
+    );
+  }
+  const gate = (run.gates ?? []).find((entry) => entry.id === options.gateId);
+  if (!gate) return fail('evolution_gate_not_found', `Gate not found: ${options.gateId}`, 'gateId');
+  if (gate.status !== 'open') {
+    return fail('evolution_gate_not_open', `Gate ${gate.id} is already ${gate.status}.`, 'gateId');
+  }
+  if (gate.kind !== 'design_review') {
+    return fail('unsupported_evolution_gate_action', `Gate ${gate.kind} does not support this action yet.`, 'gateId');
+  }
+  if (options.action === 'waive') {
+    return fail('evolution_gate_waiver_forbidden', 'High-fidelity human review cannot be waived.', 'action');
+  }
+  if (options.action === 'request_changes' && !options.feedback?.trim()) {
+    return fail('evolution_gate_feedback_required', 'Request Changes requires feedback.', 'feedback');
+  }
+  if (options.action === 'approve') {
+    const missingRevisionId = gate.candidateRevisionIds.find((revisionId) => (
+      !(run.artifactRevisions ?? []).some((entry) => entry.id === revisionId)
+    ));
+    if (missingRevisionId) {
+      return fail('evolution_gate_revision_missing', `Gate candidate revision is missing: ${missingRevisionId}`, 'gateId');
+    }
+  }
+
+  gate.status = options.action === 'approve' ? 'approved' : 'rejected';
+  gate.resolvedAt = nowMs;
+  gate.decision = {
+    id: options.mutationId,
+    action: options.action,
+    actor: 'human',
+    expectedRunRevision: options.expectedRunRevision,
+    ...(options.feedback?.trim() ? { feedback: options.feedback.trim().slice(0, 2_000) } : {}),
+    createdAt: nowMs,
+  };
+  const reviewSet = gate.reviewSetId
+    ? (run.designReviewSets ?? []).find((entry) => entry.id === gate.reviewSetId)
+    : undefined;
+  if (reviewSet) {
+    reviewSet.status = options.action === 'approve' ? 'approved' : 'rejected';
+    reviewSet.decidedAt = nowMs;
+    if (options.feedback?.trim()) reviewSet.feedback = options.feedback.trim().slice(0, 2_000);
+    await persistEvolutionReviewSet(entry.projectRoot, run, reviewSet);
+  }
+  if (options.action === 'approve') {
+    for (const revisionId of gate.candidateRevisionIds) {
+      const revision = (run.artifactRevisions ?? []).find((entry) => entry.id === revisionId);
+      if (!revision) continue;
+      revision.status = 'approved';
+      revision.assurance = 'human_approved';
+      run.authorizedRevisions![revision.logicalPath] = revision.id;
+      const artifact = run.artifacts.find((entry) => entry.revisionId === revision.id);
+      if (artifact) {
+        artifact.status = 'approved';
+        artifact.assurance = 'human_approved';
+      }
+    }
+  } else {
+    for (const revisionId of gate.candidateRevisionIds) {
+      const revision = (run.artifactRevisions ?? []).find((entry) => entry.id === revisionId);
+      if (!revision || revision.status === 'approved') continue;
+      revision.status = 'rejected';
+      const artifact = run.artifacts.find((entry) => entry.revisionId === revision.id);
+      if (artifact) artifact.status = 'rejected';
+    }
+  }
+  run.processedMutationIds = [...(run.processedMutationIds ?? []), options.mutationId].slice(-200);
+  await persistEvolutionGate(entry.projectRoot, run, gate);
+  await persistAndProject(entry, nowMs);
+
+  const result = await continueEvolutionRun({
+    runId: run.runId,
+    targetStage: options.action === 'approve' ? 'design_hifi' : 'design_lofi',
+    message: options.action === 'approve'
+      ? 'High-fidelity review set approved through the typed gate.'
+      : `${EVOLUTION_HIFI_REDESIGN_MESSAGE_PREFIX} ${options.feedback?.trim() ?? ''}`,
+    nowMs,
+  });
+  return result;
+}
+
 export async function continueEvolutionRun(options: ContinueEvolutionRunOptions): Promise<EvolutionOrchestratorResult<EvolutionProjection>> {
   const validRunId = validateEvolutionRunId(options.runId);
   if (!validRunId.ok) return validRunId as EvolutionOrchestratorResult<EvolutionProjection>;
@@ -2042,16 +2433,67 @@ export async function continueEvolutionRun(options: ContinueEvolutionRunOptions)
     return ok(projection);
   }
 
+  const openTypedGate = (run.executionPolicy ?? 'draft_preview') === 'governed'
+    ? (run.gates ?? []).find((gate) => gate.status === 'open')
+    : undefined;
+  if (openTypedGate) {
+    return fail(
+      'typed_gate_action_required',
+      `Gate ${openTypedGate.id} requires an explicit approve or request_changes action with revision CAS.`,
+      'gateId',
+    );
+  }
+
   const targetStage = options.targetStage ?? inferHumanContinueTargetStage(run);
+  if (!targetStage) {
+    const unresolved = run.blockingQuestions.at(-1)?.id ?? 'unknown';
+    return fail('unresolved_human_gate', `Cannot infer a safe resume stage for blocker: ${unresolved}.`, 'blockingQuestions');
+  }
   if (!isEvolutionStage(targetStage)) return fail('invalid_target_stage', 'targetStage is not canonical.', 'targetStage');
+  if (options.message?.startsWith(EVOLUTION_HIFI_REDESIGN_MESSAGE_PREFIX)) {
+    const feedback = options.message.slice(EVOLUTION_HIFI_REDESIGN_MESSAGE_PREFIX.length).trim();
+    const snapshot = await snapshotRejectedHifiReviewSet(entry, feedback, nowMs);
+    upsertArtifact(run, snapshot);
+    const invalidatedRoundtables = (run.roundtables ?? []).filter((roundtable) => roundtable.stage === 'design_hifi');
+    if (invalidatedRoundtables.length > 0) {
+      run.roundtables = (run.roundtables ?? []).filter((roundtable) => roundtable.stage !== 'design_hifi');
+      const invalidatedIds = new Set(invalidatedRoundtables.map((roundtable) => roundtable.id));
+      run.blockingQuestions = run.blockingQuestions.filter((question) => (
+        ![...invalidatedIds].some((roundtableId) => question.id === `strict-roundtable-${run.runId}-${roundtableId}-blocked`)
+      ));
+      appendEvidence(run, {
+        source: 'human_design_rework_review_invalidation',
+        summary: [
+          'Human Redesign invalidated prior design_hifi roundtable decisions so regenerated visuals require fresh governed review.',
+          ...invalidatedRoundtables.map((roundtable) => (
+            `${roundtable.id}: status=${roundtable.status}` +
+            `${roundtable.p2pRunId ? `, p2pRunId=${roundtable.p2pRunId}` : ''}` +
+            `${roundtable.summary ? `, verdict=${roundtable.summary.slice(0, 300)}` : ''}`
+          )),
+        ].join(' '),
+        artifactId: snapshot.id,
+        createdAt: nowMs,
+      });
+    }
+    appendEvidence(run, {
+      source: 'human_design_rework',
+      summary: 'Human requested a new high-fidelity design pass; the rejected review set was frozen before regeneration.',
+      artifactId: snapshot.id,
+      createdAt: nowMs,
+    });
+    run.blockingQuestions = run.blockingQuestions.filter((question) => question.id !== `design-hifi-approval-${run.runId}`);
+  }
   releaseUserPauseGateForHumanContinue(run, targetStage, options.message, nowMs);
-  releaseRoundtableGateForHumanContinue(run, targetStage, options.message, nowMs);
-  return advanceEvolutionRunStage({
+  const retryRoundtable = releaseRoundtableGateForHumanContinue(run, targetStage, options.message, nowMs);
+  const advanced = await advanceEvolutionRunStage({
     runId: validRunId.value,
     nextStage: targetStage,
     reason: options.message ?? `Human gate resolved; continuing at ${targetStage}.`,
     nowMs,
   });
+  if (!advanced.ok || !retryRoundtable) return advanced;
+  await maybeStartRoundtablesForStage(entry, null, nowMs, targetStage);
+  return ok(buildEvolutionProjection(run, nowMs));
 }
 
 export async function recordEvolutionUserMessage(options: RecordEvolutionUserMessageOptions): Promise<EvolutionOrchestratorResult<EvolutionProjection>> {
@@ -2269,6 +2711,28 @@ export async function updateEvolutionRoleSkill(options: UpdateEvolutionRoleSkill
     );
     upsertArtifact(entry.run, updated.artifact);
     upsertArtifact(entry.run, releaseCandidate);
+    const updatedSkillContent = await readFile(
+      safeProjectRelativePath(entry.projectRoot, updated.relativePath),
+      'utf8',
+    );
+    await registerEvolutionArtifactRevision({
+      projectRoot: entry.projectRoot,
+      run: entry.run,
+      artifact: updated.artifact,
+      content: updatedSkillContent,
+      status: 'approved',
+      assurance: 'human_approved',
+    });
+    await captureEvolutionSkillSnapshot({
+      projectRoot: entry.projectRoot,
+      run: entry.run,
+      roleId: options.roleId,
+      skillName: updated.skillName,
+      sourcePath: updated.relativePath,
+      source: 'custom_user',
+      content: updatedSkillContent,
+      nowMs,
+    });
     const role = entry.run.roles.find((item) => item.roleId === options.roleId);
     if (role) {
       role.currentAction = `Skill playbook updated in War Room: ${updated.skillName}`;
@@ -3405,14 +3869,18 @@ type PlanningRoundtableGateDecision =
   | { disposition: 'defer'; reason: string }
   | { disposition: 'block'; reason: string };
 
-function planningRoundtableVerdict(summary: string | undefined): 'pass' | 'rework' | 'unknown' {
-  const normalized = (summary ?? '').trim().replace(/\s+/g, ' ');
-  if (!normalized) return 'unknown';
-  const upper = normalized.toUpperCase();
-  if (/^(REWORK|BLOCKED|FAIL|FAILED)\b/.test(upper)) return 'rework';
-  if (/^PASS\b/.test(upper) && !/\bREWORK\b/.test(upper)) return 'pass';
-  if (/\bREWORK\b|\bBLOCKED\b|\bFAILED?\b/.test(upper)) return 'rework';
-  if (/\bPASS\b/.test(upper)) return 'pass';
+function planningRoundtableVerdict(
+  summary: string | undefined,
+  allowLegacy = false,
+): 'pass' | 'rework' | 'unknown' {
+  const marker = (summary ?? '').match(/<!--\s*EVOLUTION_VERDICT:\s*(PASS|REWORK|BLOCKED)\s*-->/i)?.[1]?.toUpperCase();
+  if (marker === 'PASS') return 'pass';
+  if (marker === 'REWORK' || marker === 'BLOCKED') return 'rework';
+  if (allowLegacy) {
+    const normalized = (summary ?? '').trim().replace(/\s+/g, ' ').toUpperCase();
+    if (/^(REWORK|BLOCKED|FAIL|FAILED)\b/.test(normalized) || /\bREWORK\b|\bBLOCKED\b|\bFAILED?\b/.test(normalized)) return 'rework';
+    if (/^PASS\b/.test(normalized)) return 'pass';
+  }
   return 'unknown';
 }
 
@@ -3426,13 +3894,13 @@ function planningRoundtableGateDecision(run: EvolutionRun): PlanningRoundtableGa
   if (roundtable.status === 'failed') {
     return { disposition: 'block', reason: `planning_roundtable_failed: ${roundtable.error ?? roundtable.summary ?? 'unknown_error'}` };
   }
-  const verdict = planningRoundtableVerdict(roundtable.summary);
+  const verdict = planningRoundtableVerdict(roundtable.summary, (run.executionPolicy ?? 'draft_preview') !== 'governed');
   if (verdict === 'pass') return { disposition: 'allow', reason: 'planning_roundtable_passed' };
   if (verdict === 'rework') return { disposition: 'block', reason: `planning_roundtable_requires_rework: ${roundtable.summary ?? 'REWORK'}` };
   return { disposition: 'block', reason: `planning_roundtable_missing_pass_verdict: ${roundtable.summary ?? 'missing_summary'}` };
 }
 
-function roundtableGateDecision(roundtable: EvolutionRoundtableRef): PlanningRoundtableGateDecision {
+function roundtableGateDecision(roundtable: EvolutionRoundtableRef, run?: EvolutionRun): PlanningRoundtableGateDecision {
   if (roundtable.status === 'skipped') return { disposition: 'allow', reason: roundtable.error ?? `${roundtable.id}_skipped` };
   if (roundtable.status === 'planned' || roundtable.status === 'running') {
     return { disposition: 'defer', reason: `waiting_for_${roundtable.id}` };
@@ -3440,7 +3908,7 @@ function roundtableGateDecision(roundtable: EvolutionRoundtableRef): PlanningRou
   if (roundtable.status === 'failed') {
     return { disposition: 'block', reason: `${roundtable.id}_failed: ${roundtable.error ?? roundtable.summary ?? 'unknown_error'}` };
   }
-  const verdict = planningRoundtableVerdict(roundtable.summary);
+  const verdict = planningRoundtableVerdict(roundtable.summary, (run?.executionPolicy ?? 'draft_preview') !== 'governed');
   if (verdict === 'pass') return { disposition: 'allow', reason: `${roundtable.id}_passed` };
   if (verdict === 'rework') return { disposition: 'block', reason: `${roundtable.id}_requires_rework: ${roundtable.summary ?? 'REWORK'}` };
   return { disposition: 'block', reason: `${roundtable.id}_missing_pass_verdict: ${roundtable.summary ?? 'missing_summary'}` };
@@ -3468,7 +3936,7 @@ function strictRoundtableGateDecisionForStage(run: EvolutionRun, stage: Evolutio
   for (const spec of specs) {
     const roundtable = (run.roundtables ?? []).find((entry) => entry.id === spec.id);
     if (!roundtable) return { disposition: 'allow', reason: `${spec.id}_not_started` };
-    const decision = roundtableGateDecision(roundtable);
+    const decision = roundtableGateDecision(roundtable, run);
     if (decision.disposition !== 'allow') return decision;
   }
   return { disposition: 'allow', reason: 'enforced_roundtables_passed_or_skipped' };
@@ -3481,7 +3949,7 @@ function strictRoundtableGateBlockForStage(
   for (const spec of enforcedGateSpecsForStage(run, stage)) {
     const roundtable = (run.roundtables ?? []).find((entry) => entry.id === spec.id);
     if (!roundtable) continue;
-    const decision = roundtableGateDecision(roundtable);
+    const decision = roundtableGateDecision(roundtable, run);
     if (decision.disposition === 'block') {
       return { roundtable, reason: decision.reason };
     }
@@ -3592,9 +4060,22 @@ function roundtableStatusForP2p(status: P2pRunStatus): EvolutionRoundtableRef['s
   return 'running';
 }
 
+function structuredEvolutionVerdictMarker(value: string | undefined): string | undefined {
+  const lines = (value ?? '').replace(/\r\n/g, '\n').trim().split('\n');
+  const lastLine = lines.at(-1)?.trim();
+  return lastLine && /^<!--\s*EVOLUTION_VERDICT:\s*(PASS|REWORK|BLOCKED)\s*-->$/i.test(lastLine)
+    ? lastLine
+    : undefined;
+}
+
 function summarizeP2pRoundtable(run: P2pRunUpdatePayload): string {
-  const result = typeof run.result_summary === 'string' && run.result_summary.trim()
-    ? run.result_summary.trim().replace(/\s+/g, ' ').slice(0, 500)
+  const rawResult = typeof run.result_summary === 'string' ? run.result_summary.trim() : '';
+  const marker = structuredEvolutionVerdictMarker(rawResult);
+  const summaryText = rawResult
+    .replace(/<!--\s*EVOLUTION_VERDICT:\s*(PASS|REWORK|BLOCKED)\s*-->/gi, '')
+    .trim();
+  const result = rawResult
+    ? `${marker ? `${marker} ` : ''}${summaryText.replace(/\s+/g, ' ')}`.trim().slice(0, 500)
     : '';
   if (result) return result;
   if (run.error) return run.error;
@@ -3602,14 +4083,21 @@ function summarizeP2pRoundtable(run: P2pRunUpdatePayload): string {
   return `P2P roundtable ${run.id} is ${run.status} (${active}).`;
 }
 
-function extractRoundtableContextSummary(markdown: string): string | null {
+function extractRoundtableContextSummary(markdown: string, allowLegacy: boolean): string | null {
   const normalized = markdown.replace(/\r\n/g, '\n');
   const markerMatches = [...normalized.matchAll(/^##\s+(Business Summary|Result|Summary|Assistant|Final|结论|讨论结果)\b.*$/gim)];
   const markerIndex = markerMatches.length > 0 ? markerMatches[markerMatches.length - 1]?.index ?? -1 : -1;
   const body = markerIndex >= 0 ? normalized.slice(markerIndex) : normalized.slice(Math.max(0, normalized.length - 8_000));
-  const verdict = body.match(/(?:^|\n)\s*(?:[-*]\s*)?(?:(?:结论|Verdict|Decision|Conclusion)\s*[:：]\s*)?(PASS|REWORK|BLOCKED|FAIL(?:ED)?)\b/i);
-  if (!verdict || verdict.index === undefined) return null;
-  const summary = body.slice(verdict.index).trim().replace(/\s+/g, ' ').slice(0, 500);
+  const verdict = structuredEvolutionVerdictMarker(body);
+  if (!verdict && allowLegacy) {
+    const legacy = body.match(/(?:^|\n)\s*(?:[-*]\s*)?(?:(?:结论|Verdict|Decision|Conclusion)\s*[:：]\s*)?(PASS|REWORK|BLOCKED|FAIL(?:ED)?)\b/i);
+    if (!legacy || legacy.index === undefined) return null;
+    return body.slice(legacy.index).trim().replace(/\s+/g, ' ').slice(0, 500);
+  }
+  if (!verdict) return null;
+  const summary = `${verdict} ${body.replace(/<!--\s*EVOLUTION_VERDICT:\s*(PASS|REWORK|BLOCKED)\s*-->/gi, '').trim()}`
+    .replace(/\s+/g, ' ')
+    .slice(0, 500);
   return summary.length > 0 ? summary : null;
 }
 
@@ -3618,7 +4106,10 @@ async function readRoundtableContextSummary(entry: RuntimeEntry, roundtable: Evo
   try {
     const contextPath = safeProjectRelativePath(entry.projectRoot, roundtable.contextPath);
     const markdown = await readFile(contextPath, 'utf8');
-    return extractRoundtableContextSummary(markdown);
+    return extractRoundtableContextSummary(
+      markdown,
+      (entry.run.executionPolicy ?? 'draft_preview') !== 'governed',
+    );
   } catch {
     return null;
   }
@@ -3648,6 +4139,31 @@ async function reconcileRuntimeRoundtableContextFiles(
     };
     delete next.currentTargetSession;
     delete next.error;
+    if (next.attemptId) {
+      const machineVerdict = planningRoundtableVerdict(summary, (run.executionPolicy ?? 'draft_preview') !== 'governed');
+      const attempt = await completeEvolutionAttempt({
+        projectRoot: entry.projectRoot,
+        run,
+        attemptId: next.attemptId,
+        status: machineVerdict === 'pass' ? 'passed' : 'rework',
+        allowRecovery: true,
+        ...(next.p2pRunId ? { p2pRunId: next.p2pRunId } : {}),
+        nowMs,
+      });
+      const verdict = await recordEvolutionVerdict({
+        projectRoot: entry.projectRoot,
+        run,
+        attempt,
+        checkerRoleId: attempt.checkerRoleId ?? next.roles[next.roles.length - 1] ?? next.roles[0]!,
+        verdict: machineVerdict === 'pass' ? 'PASS' : 'REWORK',
+        machineReadable: /<!--\s*EVOLUTION_VERDICT:/i.test(summary),
+        summary,
+        approvedRevisionIds: machineVerdict === 'pass' ? attempt.inputRevisionIds : [],
+        ...(next.p2pRunId ? { p2pRunId: next.p2pRunId } : {}),
+        nowMs,
+      });
+      next.verdictId = verdict.id;
+    }
     upsertRoundtable(run, next);
     const staleBlockerIds = new Set([`strict-roundtable-${run.runId}-${roundtable.id}-blocked`]);
     if (roundtable.id === PLANNING_ROUNDTABLE_ID) {
@@ -3700,7 +4216,7 @@ async function reconcileRuntimeRoundtableContextFiles(
       if (roundtableId === PLANNING_ROUNDTABLE_ID) continue;
       const roundtable = (run.roundtables ?? []).find((item) => item.id === roundtableId);
       if (!roundtable) continue;
-      const gate = roundtableGateDecision(roundtable);
+      const gate = roundtableGateDecision(roundtable, run);
       if (gate.disposition === 'block') {
         projection = await markStrictRoundtableGateBlocked(entry, roundtable, gate.reason, nowMs, serverLink);
         break;
@@ -3885,6 +4401,17 @@ export async function recordEvolutionP2pRunProjection(options: RecordEvolutionP2
     const previousStatus = roundtable.status;
     const nextStatus = roundtableStatusForP2p(p2pRun.status);
     const summary = summarizeP2pRoundtable(p2pRun);
+    if (previousStatus === 'complete' || previousStatus === 'failed') {
+      appendEvidence(run, {
+        source: 'p2p_roundtable_late_callback_ignored',
+        summary: `Ignored late ${nextStatus} callback for terminal ${roundtable.id}; existing status=${previousStatus}, p2pRunId=${p2pRun.id}. Terminal summaries and verdicts are immutable.`,
+        createdAt: nowMs,
+      });
+      const projection = await persistAndProject(entry, nowMs);
+      updated.push(projection);
+      if (options.serverLink) send(options.serverLink, { type: EVOLUTION_PIPELINE_MSG.PROJECTION, projection });
+      continue;
+    }
     const next: EvolutionRoundtableRef = {
       ...roundtable,
       status: nextStatus,
@@ -3907,9 +4434,7 @@ export async function recordEvolutionP2pRunProjection(options: RecordEvolutionP2
     // C7 attempt counter derives from evidence tags, and per-tick appends
     // could evict attempt entries within a single multi-minute review round.
     const meaningfulChange = previousStatus !== nextStatus
-      || roundtable.summary !== summary
-      || nextStatus === 'complete'
-      || nextStatus === 'failed';
+      || roundtable.summary !== summary;
     if (meaningfulChange) appendEvidence(run, {
       source: 'p2p_roundtable',
       summary: run.latestMessage,
@@ -3930,7 +4455,7 @@ export async function recordEvolutionP2pRunProjection(options: RecordEvolutionP2
       },
       createdAt: nowMs,
     });
-    if (previousStatus !== nextStatus || nextStatus === 'complete' || nextStatus === 'failed') {
+    if (previousStatus !== nextStatus) {
       appendDiscussion(run, {
         kind: nextStatus === 'failed' ? 'gate' : 'role_update',
         stage: roundtable.stage,
@@ -3943,6 +4468,44 @@ export async function recordEvolutionP2pRunProjection(options: RecordEvolutionP2
             : `圆桌进行中：${summary}`,
         createdAt: nowMs,
       });
+    }
+    if ((nextStatus === 'complete' || nextStatus === 'failed') && next.attemptId) {
+      const machineVerdict = nextStatus === 'complete'
+        ? planningRoundtableVerdict(summary, (run.executionPolicy ?? 'draft_preview') !== 'governed')
+        : 'unknown';
+      const attemptStatus = nextStatus === 'failed'
+        ? 'failed'
+        : machineVerdict === 'pass'
+          ? 'passed'
+          : machineVerdict === 'rework'
+            ? 'rework'
+            : 'blocked';
+      const attempt = await completeEvolutionAttempt({
+        projectRoot: entry.projectRoot,
+        run,
+        attemptId: next.attemptId,
+        status: attemptStatus,
+        p2pRunId: p2pRun.id,
+        ...(machineVerdict === 'unknown' ? { error: 'machine_readable_evolution_verdict_missing' } : {}),
+        nowMs,
+      });
+      if (machineVerdict !== 'unknown') {
+        const checkerRoleId = attempt.checkerRoleId ?? next.roles[next.roles.length - 1] ?? next.roles[0]!;
+        const verdict = await recordEvolutionVerdict({
+          projectRoot: entry.projectRoot,
+          run,
+          attempt,
+          checkerRoleId,
+          verdict: machineVerdict === 'pass' ? 'PASS' : 'REWORK',
+          machineReadable: /<!--\s*EVOLUTION_VERDICT:/i.test(summary),
+          summary,
+          approvedRevisionIds: machineVerdict === 'pass' ? attempt.inputRevisionIds : [],
+          p2pRunId: p2pRun.id,
+          nowMs,
+        });
+        next.verdictId = verdict.id;
+        upsertRoundtable(run, next);
+      }
     }
     let projection = await persistAndProject(entry, nowMs);
     if (roundtable.id === PLANNING_ROUNDTABLE_ID && (nextStatus === 'complete' || nextStatus === 'failed')) {
@@ -3957,7 +4520,7 @@ export async function recordEvolutionP2pRunProjection(options: RecordEvolutionP2
       // `alwaysGate` specs in every mode.
       const spec = enforcedGateSpecsForStage(run, roundtable.stage).find((item) => item.id === roundtable.id);
       if (spec) {
-        const gate = roundtableGateDecision(next);
+        const gate = roundtableGateDecision(next, run);
         if (gate.disposition === 'block') {
           // C7: a completed fidelity review that returned REWORK first goes
           // through the bounded maker/checker retry loop; only exhaustion
@@ -4283,7 +4846,7 @@ const EVOLUTION_ROUNDTABLE_SPECS: EvolutionRoundtableSpec[] = [
     stage: 'product_discussion',
     topic: '产品需求圆桌',
     roles: ['product_manager', 'product_critic', 'loop_supervisor'],
-    artifactKinds: ['normalized_requirement', 'discussion', 'role_skill'],
+    artifactKinds: ['normalized_requirement', 'discussion', 'prd', 'prd_review', 'role_skill'],
     prompt: renderProductRoundtablePrompt,
   },
   {
@@ -4332,9 +4895,25 @@ function roundtableArtifactPaths(run: EvolutionRun, spec: EvolutionRoundtableSpe
     .map((artifact) => artifact.path);
 }
 
-function roundtableRoleInstructions(run: EvolutionRun, roles: readonly EvolutionRoleId[]): EvolutionRoundtableRoleInstruction[] {
-  return roles.map((roleId) => {
+async function roundtableRoleInstructions(
+  projectRoot: string,
+  run: EvolutionRun,
+  roles: readonly EvolutionRoleId[],
+): Promise<EvolutionRoundtableRoleInstruction[]> {
+  return Promise.all(roles.map(async (roleId) => {
     const role = run.roles.find((entry) => entry.roleId === roleId);
+    const snapshot = [...(run.skillSnapshots ?? [])].reverse().find((entry) => entry.roleId === roleId);
+    let skillContent: string | undefined;
+    if (snapshot) {
+      try {
+        skillContent = await readFile(
+          join(getEvolutionRunPaths(projectRoot, run.runId).skillSnapshotsDir, `${snapshot.id}.md`),
+          'utf8',
+        );
+      } catch {
+        skillContent = undefined;
+      }
+    }
     return {
       roleId,
       label: role?.label ?? roleId,
@@ -4342,14 +4921,17 @@ function roundtableRoleInstructions(run: EvolutionRun, roles: readonly Evolution
       ...(role?.skillSummary ? { skillSummary: role.skillSummary } : {}),
       responsibilities: role?.responsibilities ? [...role.responsibilities] : [],
       ...(role?.currentAction ? { currentAction: role.currentAction } : {}),
+      ...(snapshot ? { skillSnapshotId: snapshot.id, skillSha256: snapshot.sha256 } : {}),
+      ...(skillContent ? { skillContent } : {}),
     };
-  });
+  }));
 }
 
 function lightModeRoundtableFallbackReason(run: EvolutionRun, spec: EvolutionRoundtableSpec): string | null {
   // An alwaysGate spec is an evidence-checkable hard bar — it must run for
   // real in every mode, never as a deterministic local review.
   if (spec.alwaysGate) return null;
+  if ((run.executionPolicy ?? 'draft_preview') === 'governed') return null;
   if ((run.roundtableGateMode ?? 'planning') === 'strict') return null;
   if (spec.gatesAutoDelivery) {
     return run.autoDelivery?.enabled ? null : 'planning_roundtable_not_needed_without_auto_delivery';
@@ -4457,12 +5039,43 @@ async function maybeStartRoundtable(
   const roundtableId = spec.id;
   if ((run.roundtables ?? []).some((roundtable) => roundtable.id === roundtableId)) return null;
 
+  const requiresLiveRoundtable = (run.executionPolicy ?? 'draft_preview') === 'governed'
+    || spec.alwaysGate
+    || (run.roundtableGateMode ?? 'planning') === 'strict';
+  const artifactPaths = roundtableArtifactPaths(run, spec);
+  const inputRevisionIds = artifactPaths
+    .map((path) => run.artifacts.find((artifact) => artifact.path === path)?.revisionId)
+    .filter((value): value is string => typeof value === 'string');
+  const skillSnapshotIds = (run.skillSnapshots ?? [])
+    .filter((snapshot) => spec.roles.includes(snapshot.roleId))
+    .map((snapshot) => snapshot.id);
+  const primaryRoleId = roundtablePrimaryRole(spec);
+  const checkerRoleId = spec.roles.find((roleId) => roleId !== primaryRoleId && (
+    roleId === 'product_critic'
+    || roleId === 'visual_fidelity_checker'
+    || roleId === 'security_reviewer'
+    || roleId === 'qa_engineer'
+  )) ?? [...spec.roles].reverse().find((roleId) => roleId !== primaryRoleId) ?? spec.roles[0]!;
+  const attempt = requiresLiveRoundtable
+    ? await createEvolutionAttempt({
+        projectRoot: entry.projectRoot,
+        run,
+        kind: 'checker',
+        stage: spec.stage,
+        roleId: primaryRoleId,
+        checkerRoleId,
+        inputRevisionIds,
+        skillSnapshotIds,
+        nowMs,
+      })
+    : undefined;
   const base: EvolutionRoundtableRef = {
     id: roundtableId,
     stage: spec.stage,
     topic: spec.topic,
     roles: spec.roles,
     status: 'planned',
+    ...(attempt ? { attemptId: attempt.id, dispatchToken: attempt.dispatchToken } : {}),
     createdAt: nowMs,
     updatedAt: nowMs,
   };
@@ -4482,7 +5095,17 @@ async function maybeStartRoundtable(
 
   if (!roundtableLauncher) {
     const reason = 'roundtable_launcher_unavailable';
-    if (spec.alwaysGate) return failRoundtableWithoutFallback(entry, serverLink, nowMs, spec, base, reason);
+    if (requiresLiveRoundtable) {
+      if (attempt) await completeEvolutionAttempt({
+        projectRoot: entry.projectRoot,
+        run,
+        attemptId: attempt.id,
+        status: 'failed',
+        error: reason,
+        nowMs,
+      });
+      return failRoundtableWithoutFallback(entry, serverLink, nowMs, spec, base, reason);
+    }
     return completeRoundtableWithLocalFallback(
       entry,
       serverLink,
@@ -4502,15 +5125,25 @@ async function maybeStartRoundtable(
     stage: spec.stage,
     topic: base.topic,
     roles: spec.roles,
-    roleInstructions: roundtableRoleInstructions(run, spec.roles),
+    roleInstructions: await roundtableRoleInstructions(entry.projectRoot, run, spec.roles),
     prompt: spec.prompt(run),
-    artifactPaths: roundtableArtifactPaths(run, spec),
+    artifactPaths,
     roundtableSpecId: spec.id,
   }, serverLink ?? null);
 
   if (!result.ok && result.skippedReason) {
     const reason = result.skippedReason;
-    if (spec.alwaysGate) return failRoundtableWithoutFallback(entry, serverLink, nowMs, spec, base, reason);
+    if (requiresLiveRoundtable) {
+      if (attempt) await completeEvolutionAttempt({
+        projectRoot: entry.projectRoot,
+        run,
+        attemptId: attempt.id,
+        status: 'failed',
+        error: reason,
+        nowMs,
+      });
+      return failRoundtableWithoutFallback(entry, serverLink, nowMs, spec, base, reason);
+    }
     return completeRoundtableWithLocalFallback(
       entry,
       serverLink,
@@ -4535,6 +5168,17 @@ async function maybeStartRoundtable(
         status: result.skippedReason ? 'skipped' : 'failed',
         error: result.skippedReason ?? result.error ?? 'roundtable_launch_failed',
       };
+  if (attempt && result.p2pRunId) attempt.p2pRunId = result.p2pRunId;
+  if (attempt && !result.ok) {
+    await completeEvolutionAttempt({
+      projectRoot: entry.projectRoot,
+      run,
+      attemptId: attempt.id,
+      status: 'failed',
+      error: next.error ?? 'roundtable_launch_failed',
+      nowMs,
+    });
+  }
   upsertRoundtable(run, next);
   appendDiscussion(run, {
     kind: result.ok ? 'role_update' : 'gate',
@@ -4583,6 +5227,28 @@ async function maybeStartAutoDelivery(
   }
   if (!run.linkedOpenSpecChange) {
     return markAutoDeliveryLaunchBlocked(entry, 'missing_linked_openspec_change', nowMs, serverLink);
+  }
+  if (run.developmentMode === 'greenfield_new_system') {
+    const targetRelativeDir = run.writePolicy?.targetRelativeDir ?? run.developmentTargetRelativeDir;
+    const expectedInventorySha256 = run.writePolicy?.targetInventorySha256;
+    if (!targetRelativeDir || !expectedInventorySha256) {
+      return markAutoDeliveryLaunchBlocked(entry, 'greenfield_write_policy_inventory_missing', nowMs, serverLink);
+    }
+    const inspection = await inspectGreenfieldTarget(entry.projectRoot, targetRelativeDir);
+    if (!inspection.ok) {
+      return markAutoDeliveryLaunchBlocked(entry, `${inspection.code}: ${inspection.message}`, nowMs, serverLink);
+    }
+    if (inspection.inventorySha256 !== expectedInventorySha256) {
+      return markAutoDeliveryLaunchBlocked(entry, 'greenfield_target_inventory_changed', nowMs, serverLink);
+    }
+  }
+  if ((run.executionPolicy ?? 'draft_preview') === 'governed') {
+    try {
+      requireAuthorizedEvolutionRevision(run, `openspec/changes/${run.linkedOpenSpecChange}/tasks.md`);
+      requireAuthorizedEvolutionRevision(run, 'implementation/agent-task-matrix.md');
+    } catch (error) {
+      return markAutoDeliveryLaunchBlocked(entry, describeUnknownError(error), nowMs, serverLink);
+    }
   }
   if (!serverLink) {
     return deferAutoDeliveryForServerLink(entry, nowMs);
@@ -4660,6 +5326,38 @@ export async function runEvolutionAutopilot(
     const entry = getRuntimeEntry(validRunId.value);
     if (!entry) return fail('evolution_run_not_found', `Evolution run not found: ${validRunId.value}`, 'runId');
     try {
+      // A resumed/hydrated run can already be sitting on a governed stage.
+      // Re-evaluate that stage's gate before the stage runner writes any
+      // downstream artifact; transition callbacks alone do not cover resumes.
+      const entryStage = entry.run.stage;
+      await maybeStartRoundtablesForStage(entry, serverLink, options.nowMs ?? Date.now(), entryStage);
+      const entryBlocked = strictRoundtableGateBlockForStage(entry.run, entryStage);
+      if (entryBlocked) {
+        const projection = await markStrictRoundtableGateBlocked(
+          entry,
+          entryBlocked.roundtable,
+          entryBlocked.reason,
+          options.nowMs ?? Date.now(),
+          serverLink,
+        );
+        return ok(projection);
+      }
+      if (shouldPauseForStrictRoundtableGate(entry.run)) {
+        const nowMs = options.nowMs ?? Date.now();
+        const gate = strictRoundtableGateDecisionForStage(entry.run, entryStage);
+        const pauseMessage = `Evolution planning paused at ${entryStage}: ${gate.reason}.`;
+        if (entry.run.latestMessage !== pauseMessage) {
+          entry.run.latestMessage = pauseMessage;
+          appendEvidence(entry.run, {
+            source: 'p2p_roundtable_gate',
+            summary: pauseMessage,
+            createdAt: nowMs,
+          });
+        }
+        const projection = await persistAndProject(entry, nowMs);
+        if (serverLink) send(serverLink, { type: EVOLUTION_PIPELINE_MSG.PROJECTION, projection });
+        return ok(projection);
+      }
       await runEvolutionPlanningStages({
         projectRoot: entry.projectRoot,
         run: entry.run,
@@ -4790,6 +5488,15 @@ export async function handleEvolutionPipelineCommand(cmd: Record<string, unknown
       const designTargetSurface = typeof cmd.designTargetSurface === 'string' && (EVOLUTION_DESIGN_TARGET_SURFACES as readonly string[]).includes(cmd.designTargetSurface)
         ? cmd.designTargetSurface as EvolutionDesignTargetSurface
         : undefined;
+      const developmentMode = typeof cmd.developmentMode === 'string' && (EVOLUTION_DEVELOPMENT_MODES as readonly string[]).includes(cmd.developmentMode)
+        ? cmd.developmentMode as EvolutionDevelopmentMode
+        : undefined;
+      const greenfieldTopology = typeof cmd.greenfieldTopology === 'string' && (EVOLUTION_GREENFIELD_TOPOLOGIES as readonly string[]).includes(cmd.greenfieldTopology)
+        ? cmd.greenfieldTopology as EvolutionGreenfieldTopology
+        : undefined;
+      const executionPolicy = typeof cmd.executionPolicy === 'string' && (EVOLUTION_EXECUTION_POLICIES as readonly string[]).includes(cmd.executionPolicy)
+        ? cmd.executionPolicy as EvolutionExecutionPolicy
+        : undefined;
       const result = await launchEvolutionDemoRun({
         projectRoot,
         requestId,
@@ -4803,6 +5510,11 @@ export async function handleEvolutionPipelineCommand(cmd: Record<string, unknown
         autoCommitPush: cmd.autoCommitPush === true,
         ...(roundtableGateMode ? { roundtableGateMode } : {}),
         ...(designTargetSurface ? { designTargetSurface } : {}),
+        ...(developmentMode ? { developmentMode } : {}),
+        ...(executionPolicy ? { executionPolicy } : {}),
+        ...(typeof cmd.developmentTargetRelativeDir === 'string' ? { developmentTargetRelativeDir: cmd.developmentTargetRelativeDir } : {}),
+        ...(greenfieldTopology ? { greenfieldTopology } : {}),
+        requireHifiHumanApproval: cmd.requireHifiHumanApproval === true,
       });
       sendResult(serverLink, EVOLUTION_PIPELINE_MSG.LAUNCH_DEMO_ACK, result, { requestId });
       if (result.ok) {
@@ -4979,6 +5691,46 @@ export async function handleEvolutionPipelineCommand(cmd: Record<string, unknown
       if (result.ok && !isEvolutionTerminalStage(result.value.stage)) {
         void runEvolutionAutopilot(result.value.runId, serverLink);
       }
+      return;
+    }
+    case EVOLUTION_PIPELINE_MSG.GATE_ACTION: {
+      if (typeof cmd.runId !== 'string') {
+        send(serverLink, { type: EVOLUTION_PIPELINE_MSG.LAUNCH_ERROR, issues: [issue('missing_run_id', 'runId is required.', 'runId')], requestId: cmd.requestId });
+        return;
+      }
+      if (typeof cmd.action !== 'string' || !(EVOLUTION_GATE_ACTIONS as readonly string[]).includes(cmd.action)) {
+        send(serverLink, { type: EVOLUTION_PIPELINE_MSG.LAUNCH_ERROR, issues: [issue('invalid_gate_action', 'action must be approve, request_changes, or waive.', 'action')], requestId: cmd.requestId });
+        return;
+      }
+      const result = await applyEvolutionGateAction({
+        runId: cmd.runId,
+        gateId: typeof cmd.gateId === 'string' ? cmd.gateId : '',
+        action: cmd.action as EvolutionGateAction,
+        mutationId: typeof cmd.mutationId === 'string' ? cmd.mutationId : '',
+        expectedRunRevision: typeof cmd.expectedRunRevision === 'number' ? cmd.expectedRunRevision : -1,
+        ...(typeof cmd.feedback === 'string' ? { feedback: cmd.feedback } : {}),
+      });
+      sendResult(serverLink, EVOLUTION_PIPELINE_MSG.GATE_ACTION_ACK, result, { requestId: cmd.requestId });
+      if (result.ok && !isEvolutionTerminalStage(result.value.stage)) {
+        void runEvolutionAutopilot(result.value.runId, serverLink);
+      }
+      return;
+    }
+    case EVOLUTION_PIPELINE_MSG.ROLE_CATALOG_REQUEST: {
+      send(serverLink, {
+        type: EVOLUTION_PIPELINE_MSG.ROLE_CATALOG,
+        requestId: cmd.requestId,
+        roles: EVOLUTION_ROLE_SKILL_DEFINITIONS.map((definition) => ({
+          id: `role-profile:${definition.roleId}:1`,
+          roleId: definition.roleId,
+          label: definition.label,
+          summary: definition.skillSummary,
+          responsibilities: [...definition.responsibilities],
+          skillName: definition.skillName,
+          roleSource: 'project',
+          version: 1,
+        })),
+      });
       return;
     }
     case EVOLUTION_PIPELINE_MSG.USER_MESSAGE: {

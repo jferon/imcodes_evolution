@@ -743,6 +743,20 @@
     "upgrade_blocked_toolchain_unavailable": "Falta Node en el host del daemon (toolchain eliminado). Reinstala Node; la actualización automática está deshabilitada hasta entonces."
   },
   "discussion": {
+    "field_domain_role": "Rol de dominio",
+    "field_runtime": "Entorno del agente",
+    "domain_role_loop_supervisor": "Supervisor del ciclo",
+    "domain_role_product_manager": "Responsable de producto",
+    "domain_role_product_critic": "Crítico de producto",
+    "domain_role_ux_designer": "Diseñador UX",
+    "domain_role_visual_designer": "Diseñador visual",
+    "domain_role_visual_fidelity_checker": "Revisor de fidelidad visual",
+    "domain_role_tech_director": "Director técnico",
+    "domain_role_backend_developer": "Desarrollador backend",
+    "domain_role_frontend_developer": "Desarrollador frontend",
+    "domain_role_qa_engineer": "Ingeniero QA",
+    "domain_role_security_reviewer": "Revisor de seguridad",
+    "domain_role_ops_release_manager": "Operaciones / Lanzamientos",
     "role_critic": "Crítico",
     "role_pragmatist": "Pragmático",
     "role_innovator": "Innovador",
@@ -2524,5 +2538,24 @@
     "error_request_failed": "Error de solicitud.",
     "error_app_server_timeout": "Codex agotó el tiempo.",
     "error_invalid_params": "Solicitud no válida."
+  },
+  "evolution": {
+    "development_mode": "Modo de desarrollo",
+    "mode_brownfield_refactor": "Refactorizar / ampliar el sistema actual",
+    "mode_greenfield_new_system": "Crear un sistema nuevo",
+    "greenfield_target": "Directorio del sistema nuevo",
+    "greenfield_topology": "Topología del sistema nuevo",
+    "topology_monolith": "Monolito (infraestructura mínima)",
+    "topology_modular_monolith": "Monolito modular (recomendado)",
+    "topology_services": "Servicios (requiere controles de infraestructura adicionales)",
+    "greenfield_help": "Crea tareas de arquitectura, infraestructura y esqueleto funcional dentro de un destino del proyecto. Los repositorios externos y producción requieren autorización aparte.",
+    "brownfield_help": "Reutiliza arquitectura, módulos, contratos, componentes y despliegue actuales, con planes de migración y reversión.",
+    "hifi_review_title": "Revisar diseño de alta fidelidad",
+    "hifi_review_help": "Previsualiza todas las imágenes antes de arquitectura. Aprueba el conjunto o solicita otro diseño con comentarios.",
+    "images": "imágenes",
+    "approve_hifi": "Aprobar y continuar",
+    "redesign_hifi": "Solicitar rediseño",
+    "hifi_approved_message": "El usuario aprobó el conjunto de alta fidelidad.",
+    "redesign_default_feedback": "Rediseña el conjunto de alta fidelidad manteniendo los requisitos y las referencias."
   }
 }

@@ -9,6 +9,9 @@ import {
   type EvolutionApproveRoleSkillCandidatePayload,
   type EvolutionCheckStagingPayload,
   type EvolutionContinuePayload,
+  type EvolutionGateAction,
+  type EvolutionGateActionPayload,
+  type EvolutionGreenfieldTopology,
   type EvolutionInboxWatcherStatus,
   type EvolutionImportReferencesPayload,
   type EvolutionLaunchDemoPayload,
@@ -17,8 +20,10 @@ import {
   type EvolutionReferenceAttachmentInput,
   type EvolutionReferenceBriefImportResult,
   type EvolutionDesignTargetSurface,
+  type EvolutionDevelopmentMode,
   type EvolutionRoundtableGateMode,
   type EvolutionRoleId,
+  type EvolutionStage,
   type EvolutionScanInboxPayload,
   type EvolutionSetInboxDirectoryPayload,
   type EvolutionStatusPayload,
@@ -57,6 +62,10 @@ interface LaunchOptions {
   autoCommitPush?: boolean;
   roundtableGateMode?: EvolutionRoundtableGateMode;
   designTargetSurface?: EvolutionDesignTargetSurface;
+  developmentMode?: EvolutionDevelopmentMode;
+  developmentTargetRelativeDir?: string;
+  greenfieldTopology?: EvolutionGreenfieldTopology;
+  requireHifiHumanApproval?: boolean;
 }
 
 interface LaunchDemoOptions {
@@ -68,6 +77,10 @@ interface LaunchDemoOptions {
   autoCommitPush?: boolean;
   roundtableGateMode?: EvolutionRoundtableGateMode;
   designTargetSurface?: EvolutionDesignTargetSurface;
+  developmentMode?: EvolutionDevelopmentMode;
+  developmentTargetRelativeDir?: string;
+  greenfieldTopology?: EvolutionGreenfieldTopology;
+  requireHifiHumanApproval?: boolean;
 }
 
 interface CreateReferenceBriefOptions {
@@ -96,7 +109,8 @@ interface State {
   setInboxDirectory: (directoryPath: string, projectName?: string) => string | null;
   checkStaging: (runId?: string) => string | null;
   stop: (runId?: string) => string | null;
-  continueRun: (runId?: string, message?: string) => string | null;
+  continueRun: (targetStage?: EvolutionStage, message?: string, runId?: string) => string | null;
+  applyGateAction: (gateId: string, action: EvolutionGateAction, feedback?: string, runId?: string) => string | null;
   sendUserMessage: (text: string, roleId?: EvolutionRoleId, runId?: string) => string | null;
   updateRoleSkill: (roleId: EvolutionRoleId, markdown: string, runId?: string) => string | null;
   approveRoleSkillCandidate: (roleId: EvolutionRoleId, candidateArtifactId: string, approvalMessage?: string, runId?: string, approverId?: string) => string | null;
@@ -131,6 +145,7 @@ function extractProjections(msg: Record<string, unknown>): EvolutionProjection[]
     && raw.type !== EVOLUTION_PIPELINE_MSG.LAUNCH_DEMO_ACK
     && raw.type !== EVOLUTION_PIPELINE_MSG.STOP_ACK
     && raw.type !== EVOLUTION_PIPELINE_MSG.CONTINUE_ACK
+    && raw.type !== EVOLUTION_PIPELINE_MSG.GATE_ACTION_ACK
     && raw.type !== EVOLUTION_PIPELINE_MSG.TERMINAL
   ) {
     return [];
@@ -440,8 +455,12 @@ export function useEvolutionPipeline({ ws, serverId, sessionName, projectRoot }:
     autoStartImplementation = false,
     autoDeliverPresetId = 'standard',
     autoCommitPush = false,
-    roundtableGateMode = 'planning',
+    roundtableGateMode = 'strict',
     designTargetSurface = 'auto',
+    developmentMode = 'brownfield_refactor',
+    developmentTargetRelativeDir,
+    greenfieldTopology = 'modular_monolith',
+    requireHifiHumanApproval = true,
   }: LaunchOptions) => {
     const trimmedSource = sourceRelativePath.trim();
     if (!ws || !sessionName || !trimmedSource) {
@@ -465,6 +484,11 @@ export function useEvolutionPipeline({ ws, serverId, sessionName, projectRoot }:
       autoCommitPush,
       roundtableGateMode,
       designTargetSurface,
+      developmentMode,
+      executionPolicy: 'governed',
+      ...(developmentTargetRelativeDir ? { developmentTargetRelativeDir } : {}),
+      ...(developmentMode === 'greenfield_new_system' ? { greenfieldTopology } : {}),
+      requireHifiHumanApproval,
     };
     clearLaunchTimeout();
     activeLaunchRequestIdRef.current = requestId;
@@ -494,8 +518,12 @@ export function useEvolutionPipeline({ ws, serverId, sessionName, projectRoot }:
     autoStartImplementation = true,
     autoDeliverPresetId = 'standard',
     autoCommitPush = false,
-    roundtableGateMode = 'planning',
+    roundtableGateMode = 'strict',
     designTargetSurface = 'auto',
+    developmentMode = 'brownfield_refactor',
+    developmentTargetRelativeDir,
+    greenfieldTopology = 'modular_monolith',
+    requireHifiHumanApproval = true,
   }: LaunchDemoOptions = {}) => {
     if (!ws || !sessionName) {
       setLastError('An active session is required to start the Evolution demo.');
@@ -516,6 +544,11 @@ export function useEvolutionPipeline({ ws, serverId, sessionName, projectRoot }:
       autoCommitPush,
       roundtableGateMode,
       designTargetSurface,
+      developmentMode,
+      executionPolicy: 'governed',
+      ...(developmentTargetRelativeDir ? { developmentTargetRelativeDir } : {}),
+      ...(developmentMode === 'greenfield_new_system' ? { greenfieldTopology } : {}),
+      requireHifiHumanApproval,
     };
     clearLaunchTimeout();
     activeLaunchRequestIdRef.current = requestId;
@@ -570,7 +603,7 @@ export function useEvolutionPipeline({ ws, serverId, sessionName, projectRoot }:
     return requestId;
   }, [clearStopTimeout, projection, serverId, sessionName, ws]);
 
-  const continueRun = useCallback((runId = projection?.runId, message?: string) => {
+  const continueRun = useCallback((targetStage?: EvolutionStage, message?: string, runId = projection?.runId) => {
     if (!ws || !sessionName || !runId || isEvolutionTerminalProjection(projection)) return null;
     const requestId = makeRequestId('evolution-continue');
     const payload: EvolutionContinuePayload = {
@@ -579,6 +612,7 @@ export function useEvolutionPipeline({ ws, serverId, sessionName, projectRoot }:
       serverId,
       sessionName,
       runId,
+      ...(targetStage ? { targetStage } : {}),
       ...(message?.trim() ? { message: message.trim() } : {}),
     };
     clearContinueTimeout();
@@ -598,6 +632,47 @@ export function useEvolutionPipeline({ ws, serverId, sessionName, projectRoot }:
       clearContinueTimeout();
       setContinuePending(false);
       setLastError('Evolution continue timed out.');
+    }, EVOLUTION_CONTINUE_TIMEOUT_MS);
+    return requestId;
+  }, [clearContinueTimeout, projection, serverId, sessionName, ws]);
+
+  const applyGateAction = useCallback((
+    gateId: string,
+    action: EvolutionGateAction,
+    feedback?: string,
+    runId = projection?.runId,
+  ) => {
+    if (!ws || !sessionName || !runId || !gateId || typeof projection?.runRevision !== 'number') return null;
+    const requestId = makeRequestId('evolution-gate');
+    const payload: EvolutionGateActionPayload = {
+      type: EVOLUTION_PIPELINE_MSG.GATE_ACTION,
+      requestId,
+      serverId,
+      sessionName,
+      runId,
+      gateId,
+      action,
+      mutationId: makeRequestId('evolution-gate-mutation'),
+      expectedRunRevision: projection.runRevision,
+      ...(feedback?.trim() ? { feedback: feedback.trim() } : {}),
+    };
+    clearContinueTimeout();
+    activeContinueRequestIdRef.current = requestId;
+    setContinuePending(true);
+    setLastError(null);
+    try {
+      ws.send(payload);
+    } catch (error) {
+      clearContinueTimeout();
+      setContinuePending(false);
+      setLastError(error instanceof Error ? error.message : String(error));
+      return null;
+    }
+    continueTimeoutRef.current = setTimeout(() => {
+      if (activeContinueRequestIdRef.current !== requestId) return;
+      clearContinueTimeout();
+      setContinuePending(false);
+      setLastError('Evolution gate action timed out.');
     }, EVOLUTION_CONTINUE_TIMEOUT_MS);
     return requestId;
   }, [clearContinueTimeout, projection, serverId, sessionName, ws]);
@@ -806,10 +881,11 @@ export function useEvolutionPipeline({ ws, serverId, sessionName, projectRoot }:
     checkStaging,
     stop,
     continueRun,
+    applyGateAction,
     sendUserMessage,
     updateRoleSkill,
     approveRoleSkillCandidate,
     requestStatus,
     clearError: () => setLastError(null),
-  }), [approveRoleSkillCandidate, checkStaging, continuePending, continueRun, createReferenceBrief, lastError, lastReferenceBrief, launch, launchDemo, launchPending, projection, referenceBriefPending, requestStatus, scanInbox, scanPending, sendUserMessage, setInboxDirectory, skillUpdatePending, stagingCheckPending, stop, stopPending, updateRoleSkill, watchers]);
+  }), [applyGateAction, approveRoleSkillCandidate, checkStaging, continuePending, continueRun, createReferenceBrief, lastError, lastReferenceBrief, launch, launchDemo, launchPending, projection, referenceBriefPending, requestStatus, scanInbox, scanPending, sendUserMessage, setInboxDirectory, skillUpdatePending, stagingCheckPending, stop, stopPending, updateRoleSkill, watchers]);
 }

@@ -118,6 +118,27 @@ describe('evolution pipeline shared contract', () => {
     }
   });
 
+  it('requires a safe dedicated target for greenfield development', () => {
+    const base = {
+      requestId: 'req-greenfield',
+      sessionName: 'deck_demo_brain',
+      sourceRelativePath: `${EVOLUTION_REQUIREMENT_INBOX_DIR}/greenfield.md`,
+      developmentMode: 'greenfield_new_system',
+    };
+    expect(validateEvolutionLaunchRequest(base).ok).toBe(false);
+    expect(validateEvolutionLaunchRequest({ ...base, developmentTargetRelativeDir: '.imc/new-system' }).ok).toBe(false);
+    const valid = validateEvolutionLaunchRequest({
+      ...base,
+      developmentTargetRelativeDir: 'apps/new-system',
+      requireHifiHumanApproval: true,
+    });
+    expect(valid.ok).toBe(true);
+    if (valid.ok) {
+      expect(valid.value.developmentTargetRelativeDir).toBe('apps/new-system');
+      expect(valid.value.requireHifiHumanApproval).toBe(true);
+    }
+  });
+
   it('rejects oversized requirement launch payloads before daemon file reads', () => {
     const result = validateEvolutionLaunchRequest({
       requestId: 'req-oversize',
@@ -310,6 +331,196 @@ describe('evolution pipeline shared contract', () => {
       expect(projection.value.liveEvents[0]?.kind).toBe('task_progress');
       expect(projection.value.loopControl.source).toBe('loop_engineering');
       expect(projection.value.loopControl.signals[0]?.status).toBe('complete');
+
+      const malformedV2 = validateEvolutionProjection({
+        ...projection.value,
+        controlVersion: 2,
+        runRevision: -1,
+        artifactRevisions: [],
+        authorizedRevisions: { 'artifacts/prd.md': 'revision-missing' },
+      });
+      expect(malformedV2.ok).toBe(false);
+      if (!malformedV2.ok) {
+        expect(malformedV2.issues.map((entry) => entry.code)).toEqual(expect.arrayContaining([
+          'invalid_run_revision',
+          'unknown_authorized_revision',
+        ]));
+      }
+
+      const revisionId = 'revision-prd-v2';
+      const skillSnapshotId = 'skill-product-v2';
+      const attemptId = 'attempt-product-check-v2';
+      const verdictId = 'verdict-product-pass-v2';
+      const reviewSetId = 'review-product-v2';
+      const validV2 = validateEvolutionProjection({
+        ...projection.value,
+        controlVersion: 2,
+        runRevision: 3,
+        executionPolicy: 'governed',
+        skillSnapshots: [{
+          id: skillSnapshotId,
+          roleId: 'product_manager',
+          skillName: 'product-prd',
+          sourcePath: 'builtin:evolution/product-prd',
+          source: 'builtin',
+          sha256: sha,
+          bytes: 100,
+          capturedAt: 10,
+        }],
+        artifactRevisions: [{
+          id: revisionId,
+          artifactId: 'prd',
+          kind: 'prd',
+          logicalPath: 'artifacts/prd.md',
+          immutablePath: `revisions/blobs/${sha}.md`,
+          sha256: sha,
+          bytes: 42,
+          stage: 'product_discussion',
+          roleId: 'product_manager',
+          status: 'approved',
+          assurance: 'checker_verified',
+          producerAttemptId: attemptId,
+          authorizedByVerdictId: verdictId,
+          createdAt: 10,
+        }],
+        attempts: [{
+          id: attemptId,
+          kind: 'checker',
+          stage: 'product_discussion',
+          roleId: 'product_manager',
+          checkerRoleId: 'product_critic',
+          status: 'passed',
+          dispatchToken: 'dispatch-product-v2',
+          inputRevisionIds: [revisionId],
+          skillSnapshotIds: [skillSnapshotId],
+          outputRevisionIds: [],
+          startedAt: 10,
+          completedAt: 11,
+        }],
+        verdictRecords: [{
+          id: verdictId,
+          attemptId,
+          stage: 'product_discussion',
+          checkerRoleId: 'product_critic',
+          verdict: 'PASS',
+          machineReadable: true,
+          summary: '<!-- EVOLUTION_VERDICT: PASS -->',
+          inputRevisionIds: [revisionId],
+          approvedRevisionIds: [revisionId],
+          createdAt: 11,
+        }],
+        designReviewSets: [{
+          id: reviewSetId,
+          attemptId,
+          revisionIds: [revisionId],
+          immutableManifestPath: `review-sets/${reviewSetId}.approved.json`,
+          status: 'approved',
+          createdAt: 11,
+          decidedAt: 12,
+        }],
+        gates: [{
+          id: 'gate-product-v2',
+          kind: 'product_review',
+          stage: 'product_discussion',
+          status: 'approved',
+          candidateRevisionIds: [revisionId],
+          reviewSetId,
+          requiredAssurance: 'checker_verified',
+          openedAt: 11,
+          resolvedAt: 12,
+          decision: {
+            id: 'mutation-product-v2',
+            action: 'approve',
+            actor: 'human',
+            expectedRunRevision: 2,
+            createdAt: 12,
+          },
+        }],
+        authorizedRevisions: {
+          'artifacts/prd.md': revisionId,
+        },
+      });
+      expect(validV2.ok, JSON.stringify(validV2)).toBe(true);
+
+      const brokenReferences = validateEvolutionProjection({
+        ...(validV2.ok ? validV2.value : projection.value),
+        artifactRevisions: [{
+          ...(validV2.ok ? validV2.value.artifactRevisions?.[0] : {}),
+          id: revisionId,
+          artifactId: 'prd',
+          kind: 'prd',
+          logicalPath: 'artifacts/prd.md',
+          immutablePath: `revisions/blobs/${sha}.md`,
+          sha256: sha,
+          bytes: 42,
+          stage: 'product_discussion',
+          status: 'approved',
+          assurance: 'checker_verified',
+          producerAttemptId: 'attempt-missing',
+          authorizedByVerdictId: 'verdict-missing',
+          supersedesRevisionId: 'revision-missing-parent',
+          createdAt: 10,
+        }],
+        attempts: [{
+          ...(validV2.ok ? validV2.value.attempts?.[0] : {}),
+          id: attemptId,
+          kind: 'checker',
+          stage: 'product_discussion',
+          roleId: 'product_manager',
+          status: 'passed',
+          dispatchToken: 'dispatch-product-v2',
+          inputRevisionIds: ['revision-missing-input'],
+          outputRevisionIds: ['revision-missing-output'],
+          skillSnapshotIds: ['skill-missing'],
+          startedAt: 10,
+        }],
+        verdictRecords: [{
+          ...(validV2.ok ? validV2.value.verdictRecords?.[0] : {}),
+          id: verdictId,
+          attemptId: 'attempt-missing',
+          verdict: 'PASS',
+          machineReadable: true,
+          approvedRevisionIds: ['revision-missing-approved'],
+        }],
+        designReviewSets: [{
+          ...(validV2.ok ? validV2.value.designReviewSets?.[0] : {}),
+          id: reviewSetId,
+          attemptId: 'attempt-missing',
+          revisionIds: ['revision-missing-review'],
+          status: 'pending',
+        }],
+        gates: [{
+          ...(validV2.ok ? validV2.value.gates?.[0] : {}),
+          id: 'gate-product-v2',
+          kind: 'product_review',
+          status: 'open',
+          candidateRevisionIds: ['revision-missing-gate'],
+          reviewSetId: 'review-missing',
+          requiredAssurance: 'human_approved',
+        }],
+        authorizedRevisions: {},
+      });
+      expect(brokenReferences.ok).toBe(false);
+      if (!brokenReferences.ok) {
+        const codes = brokenReferences.issues.map((entry) => entry.code);
+        expect(codes).toEqual(expect.arrayContaining([
+          'unknown_revision_reference',
+          'unknown_skill_snapshot_reference',
+          'unknown_attempt_reference',
+          'unknown_verdict_reference',
+          'unknown_review_set_reference',
+        ]));
+        expect(brokenReferences.issues.map((entry) => entry.path)).toEqual(expect.arrayContaining([
+          'artifactRevisions[0].supersedesRevisionId',
+          'artifactRevisions[0].producerAttemptId',
+          'artifactRevisions[0].authorizedByVerdictId',
+          'attempts[0].outputRevisionIds',
+          'verdictRecords[0].approvedRevisionIds',
+          'designReviewSets[0].revisionIds',
+          'gates[0].candidateRevisionIds',
+          'gates[0].reviewSetId',
+        ]));
+      }
     }
   });
 });

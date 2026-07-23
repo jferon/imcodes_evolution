@@ -1651,6 +1651,8 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case EVOLUTION_PIPELINE_MSG.LAUNCH:
     case EVOLUTION_PIPELINE_MSG.LAUNCH_DEMO:
     case EVOLUTION_PIPELINE_MSG.CONTINUE:
+    case EVOLUTION_PIPELINE_MSG.GATE_ACTION:
+    case EVOLUTION_PIPELINE_MSG.ROLE_CATALOG_REQUEST:
     case EVOLUTION_PIPELINE_MSG.STOP:
     case EVOLUTION_PIPELINE_MSG.STATUS_REQUEST:
     case EVOLUTION_PIPELINE_MSG.SCAN_INBOX:
@@ -6161,6 +6163,7 @@ async function handleDiscussionStart(cmd: Record<string, unknown>, serverLink: S
     agentType: (p.agentType as string) ?? 'claude-code',
     model: p.model as string | undefined,
     roleId: (p.roleId as string) ?? 'custom',
+    domainRoleId: p.domainRoleId as string | undefined,
     roleLabel: p.roleLabel as string | undefined,
     rolePrompt: p.rolePrompt as string | undefined,
     sessionName: p.sessionName as string | undefined,

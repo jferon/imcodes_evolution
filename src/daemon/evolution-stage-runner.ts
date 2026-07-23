@@ -19,6 +19,12 @@ import type {
 import { getEvolutionRunPaths, writeEvolutionRun } from './evolution-artifact-store.js';
 import { runEvolutionTasteHifiGeneration } from './evolution-design-runner.js';
 import { appendDiscussion, appendEvidence, appendLiveEvent, upsertArtifact, upsertScore } from './evolution-run-helpers.js';
+import {
+  persistEvolutionGate,
+  persistEvolutionReviewSet,
+  registerEvolutionArtifactRevision,
+  requireAuthorizedEvolutionRevision,
+} from './evolution-control-plane.js';
 
 export interface RunEvolutionPlanningStagesOptions {
   projectRoot: string;
@@ -836,7 +842,8 @@ async function writeRunArtifact(options: {
   await mkdir(dirname(fullPath), { recursive: true });
   await writeFile(fullPath, options.content, 'utf8');
   const preview = buildArtifactPreview(options.path, options.content);
-  upsertArtifact(options.run, {
+  const previousRevisionId = options.run.artifacts.find((entry) => entry.path === options.path)?.revisionId;
+  const artifact = {
     id: artifactId(options.kind, options.path),
     kind: options.kind,
     path: options.path,
@@ -847,7 +854,17 @@ async function writeRunArtifact(options: {
     sha256: sha256(options.content),
     bytes: Buffer.byteLength(options.content),
     createdAt: options.nowMs,
+  };
+  await registerEvolutionArtifactRevision({
+    projectRoot: options.projectRoot,
+    run: options.run,
+    artifact,
+    content: options.content,
+    status: 'candidate',
+    assurance: 'pipeline_draft',
+    ...(previousRevisionId ? { supersedesRevisionId: previousRevisionId } : {}),
   });
+  upsertArtifact(options.run, artifact);
 }
 
 async function registerExistingRunArtifact(options: {
@@ -864,7 +881,8 @@ async function registerExistingRunArtifact(options: {
   const fullPath = safeJoin(paths.runDir, options.path);
   const content = await readFile(fullPath);
   const preview = buildFileArtifactPreview(options.path, content);
-  upsertArtifact(options.run, {
+  const previousRevisionId = options.run.artifacts.find((entry) => entry.path === options.path)?.revisionId;
+  const artifact = {
     id: artifactId(options.kind, options.path),
     kind: options.kind,
     path: options.path,
@@ -875,7 +893,18 @@ async function registerExistingRunArtifact(options: {
     sha256: sha256(content),
     bytes: content.byteLength,
     createdAt: options.nowMs,
+  };
+  const observedInput = options.kind === 'design_reference_image';
+  await registerEvolutionArtifactRevision({
+    projectRoot: options.projectRoot,
+    run: options.run,
+    artifact,
+    content,
+    status: observedInput ? 'approved' : 'candidate',
+    assurance: observedInput ? 'observed' : 'pipeline_draft',
+    ...(previousRevisionId ? { supersedesRevisionId: previousRevisionId } : {}),
   });
+  upsertArtifact(options.run, artifact);
 }
 
 async function writeProjectArtifact(options: {
@@ -893,7 +922,8 @@ async function writeProjectArtifact(options: {
   await mkdir(dirname(fullPath), { recursive: true });
   await writeFile(fullPath, options.content, 'utf8');
   const preview = buildArtifactPreview(options.path, options.content);
-  upsertArtifact(options.run, {
+  const previousRevisionId = options.run.artifacts.find((entry) => entry.path === options.path)?.revisionId;
+  const artifact = {
     id: artifactId(options.kind, options.path),
     kind: options.kind,
     path: options.path,
@@ -904,7 +934,17 @@ async function writeProjectArtifact(options: {
     sha256: sha256(options.content),
     bytes: Buffer.byteLength(options.content),
     createdAt: options.nowMs,
+  };
+  await registerEvolutionArtifactRevision({
+    projectRoot: options.projectRoot,
+    run: options.run,
+    artifact,
+    content: options.content,
+    status: 'candidate',
+    assurance: 'pipeline_draft',
+    ...(previousRevisionId ? { supersedesRevisionId: previousRevisionId } : {}),
   });
+  upsertArtifact(options.run, artifact);
 }
 
 async function transition(options: RunEvolutionPlanningStagesOptions, stage: EvolutionStage, summary?: string): Promise<void> {
@@ -1584,11 +1624,38 @@ function renderDesignHandoffPackage(digest: RequirementDigest, run: EvolutionRun
   }, null, 2);
 }
 
-function renderArchitectureBaseline(digest: RequirementDigest, uiModel: ProductUiModel, changeSlug: string, instructions: WarRoomInstruction[]): string {
+function renderArchitectureBaseline(
+  digest: RequirementDigest,
+  uiModel: ProductUiModel,
+  changeSlug: string,
+  instructions: WarRoomInstruction[],
+  developmentMode: EvolutionRun['developmentMode'],
+  developmentTargetRelativeDir: string | undefined,
+  greenfieldTopology: EvolutionRun['greenfieldTopology'],
+): string {
+  const modeLines = developmentMode === 'greenfield_new_system'
+    ? [
+      '## Development Mode',
+      '- Mode: `greenfield_new_system` — build a new system rather than refactoring existing product modules.',
+      `- Target boundary: \`${developmentTargetRelativeDir ?? 'UNRESOLVED'}\` inside the current project root.`,
+      `- Topology: \`${greenfieldTopology ?? 'modular_monolith'}\`; select services only when independent scaling/deployment justifies the extra infrastructure.`,
+      '- Foundation first: repository/package scaffold, local environment, build/test harness, service health check, CI baseline, container/staging plan, observability and rollback.',
+      '- Feature work must depend on a walking-skeleton task that proves build, tests, startup and health checks.',
+      '- Remote repository creation, production infrastructure apply and cloud credentials remain separately authorized actions.',
+      '',
+    ]
+    : [
+      '## Development Mode',
+      '- Mode: `brownfield_refactor` — extend/refactor the current system in place.',
+      '- Reuse current module boundaries, authentication, data contracts, components, design tokens, build tooling and deployment conventions.',
+      '- Record migration, compatibility and rollback requirements before replacing existing behavior.',
+      '',
+    ];
   if (uiModel.type === 'evolution_war_room') {
     return [
       '# Architecture Baseline',
       '',
+      ...modeLines,
       '## Pattern',
       'Evolution Pipeline sits above existing IM.codes P2P, OpenSpec Auto Deliver, MCP, timeline and session runtime.',
       '',
@@ -1616,8 +1683,11 @@ function renderArchitectureBaseline(digest: RequirementDigest, uiModel: ProductU
   return [
     '# Architecture Baseline',
     '',
+    ...modeLines,
     '## Source-Bound Pattern',
-    `Implement "${digest.title}" inside the existing project surfaces described by the source MD, not as a new IM.codes orchestration product.`,
+    developmentMode === 'greenfield_new_system'
+      ? `Implement "${digest.title}" as a new system under \`${developmentTargetRelativeDir ?? 'UNRESOLVED'}\`, while keeping the source MD as the delivery contract.`
+      : `Implement "${digest.title}" inside the existing project surfaces described by the source MD, not as a new IM.codes orchestration product.`,
     '',
     '## Target Surfaces',
     `- ${uiModel.primarySurface}`,
@@ -1701,16 +1771,36 @@ function renderOpenSpecProposal(digest: RequirementDigest, uiModel: ProductUiMod
   ].join('\n');
 }
 
-function renderOpenSpecDesign(digest: RequirementDigest, uiModel: ProductUiModel, instructions: WarRoomInstruction[]): string {
+function renderOpenSpecDesign(
+  digest: RequirementDigest,
+  uiModel: ProductUiModel,
+  instructions: WarRoomInstruction[],
+  developmentMode: EvolutionRun['developmentMode'],
+  developmentTargetRelativeDir: string | undefined,
+  greenfieldTopology: EvolutionRun['greenfieldTopology'],
+): string {
+  const implementationNotes = developmentMode === 'greenfield_new_system'
+    ? [
+      `- Keep all new-system code inside \`${developmentTargetRelativeDir ?? 'UNRESOLVED'}\`; do not overwrite existing application modules.`,
+      `- Topology is \`${greenfieldTopology ?? 'modular_monolith'}\`; repository/runtime/data/CI/observability/deployment capabilities must each produce foundation evidence.`,
+      '- Establish architecture boundaries, environment/config validation, build/test/CI, health checks, container/staging, observability and rollback before feature expansion.',
+      '- Prove one walking skeleton through UI/API/domain/storage boundaries before parallel feature work.',
+    ]
+    : [
+      '- Reuse existing project patterns before adding abstractions or dependencies.',
+      '- Document migration, compatibility and rollback constraints for every replaced behavior.',
+    ];
   return [
     `# Design: ${digest.title}`,
     '',
     '## Approach',
-    `Implement the smallest coherent increment that satisfies the PRD for ${uiModel.primarySurface}.`,
+    developmentMode === 'greenfield_new_system'
+      ? `Create a new system in \`${developmentTargetRelativeDir ?? 'UNRESOLVED'}\`, beginning with an operable foundation and the smallest end-to-end increment for ${uiModel.primarySurface}.`
+      : `Refactor the existing system with the smallest coherent increment that satisfies the PRD for ${uiModel.primarySurface}.`,
     '',
     '## Implementation Notes',
     '- Keep changes scoped to the OpenSpec tasks and source MD.',
-    '- Reuse existing project patterns before adding abstractions or dependencies.',
+    ...implementationNotes,
     `- Preserve domain objects: ${uiModel.entities.slice(0, 10).join('、')}.`,
     `- Preserve UI states: ${uiModel.screens.flatMap((screen) => screen.states).slice(0, 12).join(' / ')}.`,
     '- Preserve observability: tests, evidence, and task checkboxes must be updated.',
@@ -1726,14 +1816,34 @@ function renderOpenSpecDesign(digest: RequirementDigest, uiModel: ProductUiModel
   ].join('\n');
 }
 
-function renderOpenSpecTasks(digest: RequirementDigest, uiModel: ProductUiModel, instructions: WarRoomInstruction[]): string {
+function renderOpenSpecTasks(
+  digest: RequirementDigest,
+  uiModel: ProductUiModel,
+  instructions: WarRoomInstruction[],
+  developmentMode: EvolutionRun['developmentMode'],
+  developmentTargetRelativeDir: string | undefined,
+  greenfieldTopology: EvolutionRun['greenfieldTopology'],
+): string {
   const entities = uiModel.entities.slice(0, 8);
   const actions = uiModel.actions.slice(0, 8);
   const screens = uiModel.screens.slice(0, 6);
+  const foundationTasks = developmentMode === 'greenfield_new_system'
+    ? [
+      `- [ ] Create and enforce the new-system boundary at \`${developmentTargetRelativeDir ?? 'UNRESOLVED'}\`; record language/runtime, module, API, data and dependency decisions in an ADR.`,
+      `- [ ] Implement the selected \`${greenfieldTopology ?? 'modular_monolith'}\` topology and document why its operational cost is justified.`,
+      '- [ ] Scaffold package/workspace metadata, environment templates, configuration validation, local startup, build, typecheck, lint and test commands.',
+      '- [ ] Add service health/readiness checks, structured logging, metrics/error reporting hooks and a secret-free local configuration path.',
+      '- [ ] Add CI validation plus container/staging and rollback baselines; keep remote repository creation and cloud/production apply behind separate authorization.',
+      '- [ ] Prove a walking skeleton across UI/API/domain/storage boundaries and make all later feature tasks depend on its build, test, startup and health evidence.',
+    ]
+    : [
+      `- [ ] Inspect current project structure for "${digest.title}" and identify exact backend/frontend/data files affected by the source MD.`,
+      '- [ ] Record compatibility, migration and rollback constraints before replacing existing behavior.',
+    ];
   return [
     '# Tasks',
     '',
-    `- [ ] Inspect current project structure for "${digest.title}" and identify exact backend/frontend/data files affected by the source MD.`,
+    ...foundationTasks,
     `- [ ] Map domain objects (${entities.join('、') || 'source-defined objects'}) to existing or new data/API contracts; document migrations and compatibility rules.`,
     `- [ ] Implement core actions (${actions.join('、') || 'source-defined actions'}) with permissions, validation, success/failure feedback and audit evidence.`,
     ...screens.map((screen) => `- [ ] Implement or update UI screen "${screen.name}" with states ${screen.states.join(' / ')} and source/reference-image terminology.`),
@@ -1787,11 +1897,20 @@ function renderOpenSpecSpec(digest: RequirementDigest, instructions: WarRoomInst
   ].join('\n');
 }
 
-function renderImplementationTaskMatrix(digest: RequirementDigest, changeSlug: string, instructions: WarRoomInstruction[]): string {
+function renderImplementationTaskMatrix(
+  digest: RequirementDigest,
+  changeSlug: string,
+  instructions: WarRoomInstruction[],
+  developmentMode: EvolutionRun['developmentMode'],
+  developmentTargetRelativeDir: string | undefined,
+  greenfieldTopology: EvolutionRun['greenfieldTopology'],
+): string {
   return [
     `# Multi-Agent Implementation Task Matrix: ${digest.title}`,
     '',
     '## Development Loop Contract',
+    `- Mode: \`${developmentMode ?? 'brownfield_refactor'}\`${developmentMode === 'greenfield_new_system' ? `; target boundary: \`${developmentTargetRelativeDir ?? 'UNRESOLVED'}\`.` : '; modify the existing system in place with compatibility evidence.'}`,
+    ...(developmentMode === 'greenfield_new_system' ? [`- Topology: \`${greenfieldTopology ?? 'modular_monolith'}\`; foundation evidence must precede feature task fan-out.`] : []),
     '- Tech Director owns scope control, task ordering, and architecture/risk decisions.',
     '- Backend and frontend developers implement only assigned slices and update OpenSpec checkboxes.',
     '- QA, security, and ops are checker roles; they do not self-verify developer output.',
@@ -2150,6 +2269,32 @@ export async function runEvolutionPlanningStages(options: RunEvolutionPlanningSt
   }
 
   if (run.stage === 'intake_normalized') {
+    // Materialize the product candidate before dispatching the governed
+    // product checker. The previous order launched the roundtable first and
+    // generated the PRD only after PASS, so the PASS could not authorize the
+    // document consumed by design.
+    await writeRunArtifact({
+      projectRoot,
+      run,
+      kind: 'prd',
+      path: 'artifacts/prd.md',
+      title: 'PRD Candidate',
+      roleId: 'product_manager',
+      stage: 'product_discussion',
+      content: renderPrd(digest, uiModel, instructions),
+      nowMs,
+    });
+    await writeRunArtifact({
+      projectRoot,
+      run,
+      kind: 'prd_review',
+      path: 'artifacts/prd-review.md',
+      title: 'Deterministic PRD Preflight',
+      roleId: 'product_critic',
+      stage: 'product_discussion',
+      content: renderPrdReview(),
+      nowMs,
+    });
     await writeRunArtifact({
       projectRoot,
       run,
@@ -2183,28 +2328,20 @@ export async function runEvolutionPlanningStages(options: RunEvolutionPlanningSt
   }
 
   if (run.stage === 'product_discussion') {
-    await writeRunArtifact({
-      projectRoot,
-      run,
-      kind: 'prd',
-      path: 'artifacts/prd.md',
-      title: 'PRD',
-      roleId: 'product_manager',
-      stage: 'prd_ready',
-      content: renderPrd(digest, uiModel, instructions),
-      nowMs,
-    });
-    await writeRunArtifact({
-      projectRoot,
-      run,
-      kind: 'prd_review',
-      path: 'artifacts/prd-review.md',
-      title: 'PRD Review',
-      roleId: 'product_critic',
-      stage: 'prd_ready',
-      content: renderPrdReview(),
-      nowMs,
-    });
+    if ((run.executionPolicy ?? 'draft_preview') === 'governed') {
+      requireAuthorizedEvolutionRevision(run, 'artifacts/prd.md');
+      requireAuthorizedEvolutionRevision(run, 'artifacts/prd-review.md');
+    }
+    const prdArtifact = run.artifacts.find((artifact) => artifact.path === 'artifacts/prd.md');
+    const prdReviewArtifact = run.artifacts.find((artifact) => artifact.path === 'artifacts/prd-review.md');
+    if (prdArtifact) {
+      prdArtifact.title = 'PRD';
+      prdArtifact.stage = 'prd_ready';
+    }
+    if (prdReviewArtifact) {
+      prdReviewArtifact.title = 'PRD Review';
+      prdReviewArtifact.stage = 'prd_ready';
+    }
     upsertScore(run, { module: 'product', score: 8, maxScore: 10, summary: 'PRD includes goals, non-goals, user stories, acceptance criteria, and explicit assumptions.' });
     appendDiscussion(run, {
       kind: 'artifact_summary',
@@ -2563,6 +2700,149 @@ export async function runEvolutionPlanningStages(options: RunEvolutionPlanningSt
   }
 
   if (run.stage === 'design_hifi') {
+    const approvalQuestionId = `design-hifi-approval-${run.runId}`;
+    const approvalQuestion = run.blockingQuestions.find((question) => question.id === approvalQuestionId);
+    const reviewArtifacts = run.artifacts
+        .filter((artifact) => artifact.stage === 'design_hifi' && (
+          artifact.kind === 'hifi_mockup'
+          || artifact.kind === 'taste_hifi_output'
+          || artifact.kind === 'taste_hifi_reference'
+        ));
+    const reviewArtifactIds = reviewArtifacts.map((artifact) => artifact.id);
+    const reviewRevisionIds = reviewArtifacts
+      .map((artifact) => artifact.revisionId)
+      .filter((revisionId): revisionId is string => typeof revisionId === 'string');
+    const currentReviewAlreadyApproved = (run.designReviewSets ?? []).some((entry) => (
+      entry.status === 'approved'
+      && entry.revisionIds.length === reviewRevisionIds.length
+      && entry.revisionIds.every((revisionId) => reviewRevisionIds.includes(revisionId))
+    ));
+    if (run.requireHifiHumanApproval && !approvalQuestion && !currentReviewAlreadyApproved) {
+      const reviewSetId = `design-review-${sha256(reviewRevisionIds.join(':')).slice(0, 16)}`;
+      const unchangedRejectedSet = (run.designReviewSets ?? []).find((entry) => (
+        entry.id === reviewSetId
+        && entry.status === 'rejected'
+        && entry.revisionIds.length === reviewRevisionIds.length
+        && entry.revisionIds.every((revisionId) => reviewRevisionIds.includes(revisionId))
+      ));
+      if (unchangedRejectedSet) {
+        const unchangedQuestionId = `design-hifi-regeneration-unchanged-${run.runId}`;
+        if (!run.blockingQuestions.some((question) => question.id === unchangedQuestionId)) {
+          run.blockingQuestions.push({
+            id: unchangedQuestionId,
+            stage: 'design_hifi',
+            roleId: 'visual_designer',
+            question: '重新设计后的高保真图片与已退回评审集完全相同。请调整设计生成器、参考图或提示词后重试；系统不会把相同图片伪装成新的评审版本。',
+            createdAt: nowMs,
+          });
+          appendEvidence(run, {
+            source: 'human_design_rework_unchanged',
+            summary: `Regeneration reproduced rejected review set ${unchangedRejectedSet.id}; a fresh human gate was not opened.`,
+            createdAt: nowMs,
+          });
+        }
+        await transition(options, 'needs_human', '高保真重新设计未产生任何图片变化，等待调整生成输入后重试。');
+        return run;
+      }
+      const reviewSet = {
+        id: reviewSetId,
+        revisionIds: reviewRevisionIds,
+        immutableManifestPath: `review-sets/${reviewSetId}.pending.json`,
+        status: 'pending' as const,
+        createdAt: nowMs,
+      };
+      if (!(run.designReviewSets ?? []).some((entry) => entry.id === reviewSetId)) {
+        run.designReviewSets = [...(run.designReviewSets ?? []), reviewSet];
+        await persistEvolutionReviewSet(projectRoot, run, reviewSet);
+      }
+      const gateId = `gate:design_review:${reviewSetId}`;
+      if (!(run.gates ?? []).some((entry) => entry.id === gateId && entry.status === 'open')) {
+        const gate = {
+          id: gateId,
+          kind: 'design_review' as const,
+          stage: 'design_hifi' as const,
+          status: 'open' as const,
+          candidateRevisionIds: reviewRevisionIds,
+          reviewSetId,
+          requiredAssurance: 'human_approved' as const,
+          openedAt: nowMs,
+        };
+        run.gates = [...(run.gates ?? []), gate];
+        await persistEvolutionGate(projectRoot, run, gate);
+      }
+      run.blockingQuestions.push({
+        id: approvalQuestionId,
+        stage: 'design_hifi',
+        roleId: 'visual_designer',
+        question: '高保真设计已生成。请先在 War Room 预览全部高保真图片：满意后批准进入架构；不满意请选择“重新设计”并补充修改意见。',
+        createdAt: nowMs,
+      });
+      appendDiscussion(run, {
+        kind: 'gate',
+        stage: 'design_hifi',
+        roleId: 'visual_designer',
+        author: '视觉设计师',
+        text: '高保真评审集已准备完成，等待用户预览并明确选择“批准”或“重新设计”。未经人工确认不会进入架构阶段。',
+        artifactIds: reviewArtifactIds,
+        createdAt: nowMs,
+      });
+      await transition(options, 'needs_human', '高保真设计等待人工预览与批准。');
+      return run;
+    }
+    if (approvalQuestion) {
+      const openGate = (run.gates ?? []).find((gate) => gate.kind === 'design_review' && gate.status === 'open');
+      const reviewSet = openGate?.reviewSetId
+        ? (run.designReviewSets ?? []).find((entry) => entry.id === openGate.reviewSetId)
+        : undefined;
+      if (openGate) {
+        openGate.status = 'approved';
+        openGate.resolvedAt = nowMs;
+        openGate.decision ??= {
+          id: `legacy-human-approval-${run.runId}-${nowMs}`,
+          action: 'approve',
+          actor: 'human',
+          expectedRunRevision: run.runRevision ?? 0,
+          createdAt: nowMs,
+        };
+        await persistEvolutionGate(projectRoot, run, openGate);
+        for (const revisionId of openGate.candidateRevisionIds) {
+          const revision = (run.artifactRevisions ?? []).find((entry) => entry.id === revisionId);
+          if (!revision) continue;
+          revision.status = 'approved';
+          revision.assurance = 'human_approved';
+          run.authorizedRevisions ??= {};
+          run.authorizedRevisions[revision.logicalPath] = revision.id;
+          const artifact = run.artifacts.find((entry) => entry.revisionId === revision.id);
+          if (artifact) {
+            artifact.status = 'approved';
+            artifact.assurance = 'human_approved';
+          }
+        }
+      }
+      if (reviewSet && reviewSet.status === 'pending') {
+        reviewSet.status = 'approved';
+        reviewSet.decidedAt = nowMs;
+        await persistEvolutionReviewSet(projectRoot, run, reviewSet);
+      }
+      run.blockingQuestions = run.blockingQuestions.filter((question) => question.id !== approvalQuestionId);
+      appendEvidence(run, {
+        source: 'human_design_approval',
+        summary: 'Human approved the high-fidelity review set before architecture planning.',
+        createdAt: nowMs,
+      });
+    }
+    if ((run.executionPolicy ?? 'draft_preview') === 'governed' && run.requireHifiHumanApproval) {
+      const approvedReviewSet = [...(run.designReviewSets ?? [])].reverse().find((entry) => entry.status === 'approved');
+      if (!approvedReviewSet || approvedReviewSet.revisionIds.length === 0) {
+        throw new Error('evolution_hifi_approved_review_set_required');
+      }
+      for (const revisionId of approvedReviewSet.revisionIds) {
+        const revision = (run.artifactRevisions ?? []).find((entry) => entry.id === revisionId);
+        if (!revision || revision.assurance !== 'human_approved' || revision.status !== 'approved') {
+          throw new Error(`evolution_hifi_revision_not_human_approved:${revisionId}`);
+        }
+      }
+    }
     await writeRunArtifact({
       projectRoot,
       run,
@@ -2571,7 +2851,15 @@ export async function runEvolutionPlanningStages(options: RunEvolutionPlanningSt
       title: 'Architecture Baseline',
       roleId: 'tech_director',
       stage: 'architecture_baseline',
-      content: renderArchitectureBaseline(digest, uiModel, changeSlug, instructions),
+      content: renderArchitectureBaseline(
+        digest,
+        uiModel,
+        changeSlug,
+        instructions,
+        run.developmentMode ?? 'brownfield_refactor',
+        run.developmentTargetRelativeDir,
+        run.greenfieldTopology,
+      ),
       nowMs,
     });
     await writeRunArtifact({
@@ -2585,6 +2873,32 @@ export async function runEvolutionPlanningStages(options: RunEvolutionPlanningSt
       content: renderAdr(digest, uiModel),
       nowMs,
     });
+    if (run.developmentMode === 'greenfield_new_system') {
+      const foundationRevisionIds = ['artifacts/architecture-baseline.md', 'artifacts/adr-0001-evolution-pipeline.md']
+        .map((path) => run.artifacts.find((artifact) => artifact.path === path)?.revisionId)
+        .filter((revisionId): revisionId is string => typeof revisionId === 'string');
+      const externalClassByCapability = {
+        repository: 'sandbox_write',
+        runtime: 'sandbox_write',
+        database: 'shared_environment',
+        auth: 'shared_environment',
+        observability: 'external_preview',
+        ci: 'external_preview',
+        deployment: 'shared_environment',
+      } as const;
+      run.foundationEvidence = (Object.keys(externalClassByCapability) as Array<keyof typeof externalClassByCapability>).map((capability) => ({
+        id: `foundation:${run.runId}:${capability}`,
+        capability,
+        status: 'planned',
+        ownerRoleId: capability === 'ci' || capability === 'deployment' || capability === 'observability'
+          ? 'ops_release_manager'
+          : 'tech_director',
+        artifactRevisionIds: foundationRevisionIds,
+        externalActionClass: externalClassByCapability[capability],
+        summary: `${capability} foundation is planned for ${run.greenfieldTopology ?? 'modular_monolith'}; it is not verified until an execution attempt records reproducible evidence.`,
+        createdAt: nowMs,
+      }));
+    }
     upsertScore(run, { module: 'architecture', score: 8, maxScore: 10, summary: 'Architecture baseline chooses a thin loop layer over existing IM.codes primitives.' });
     upsertScore(run, { module: 'risk', score: 7, maxScore: 10, summary: 'Production deploy, auth, payments, secrets, migrations, and infra remain human-gated.' });
     appendDiscussion(run, {
@@ -2612,6 +2926,10 @@ export async function runEvolutionPlanningStages(options: RunEvolutionPlanningSt
   }
 
   if (run.stage === 'architecture_baseline') {
+    if ((run.executionPolicy ?? 'draft_preview') === 'governed') {
+      requireAuthorizedEvolutionRevision(run, 'artifacts/architecture-baseline.md');
+      requireAuthorizedEvolutionRevision(run, 'artifacts/adr-0001-evolution-pipeline.md');
+    }
     const changeRoot = `openspec/changes/${changeSlug}`;
     await writeProjectArtifact({
       projectRoot,
@@ -2632,7 +2950,14 @@ export async function runEvolutionPlanningStages(options: RunEvolutionPlanningSt
       title: 'OpenSpec Design',
       roleId: 'tech_director',
       stage: 'tasks_ready',
-      content: renderOpenSpecDesign(digest, uiModel, instructions),
+      content: renderOpenSpecDesign(
+        digest,
+        uiModel,
+        instructions,
+        run.developmentMode ?? 'brownfield_refactor',
+        run.developmentTargetRelativeDir,
+        run.greenfieldTopology,
+      ),
       nowMs,
     });
     await writeProjectArtifact({
@@ -2643,7 +2968,14 @@ export async function runEvolutionPlanningStages(options: RunEvolutionPlanningSt
       title: 'OpenSpec Tasks',
       roleId: 'tech_director',
       stage: 'tasks_ready',
-      content: renderOpenSpecTasks(digest, uiModel, instructions),
+      content: renderOpenSpecTasks(
+        digest,
+        uiModel,
+        instructions,
+        run.developmentMode ?? 'brownfield_refactor',
+        run.developmentTargetRelativeDir,
+        run.greenfieldTopology,
+      ),
       nowMs,
     });
     await writeProjectArtifact({
@@ -2665,7 +2997,14 @@ export async function runEvolutionPlanningStages(options: RunEvolutionPlanningSt
       title: 'Multi-Agent Implementation Task Matrix',
       roleId: 'tech_director',
       stage: 'tasks_ready',
-      content: renderImplementationTaskMatrix(digest, changeSlug, instructions),
+      content: renderImplementationTaskMatrix(
+        digest,
+        changeSlug,
+        instructions,
+        run.developmentMode ?? 'brownfield_refactor',
+        run.developmentTargetRelativeDir,
+        run.greenfieldTopology,
+      ),
       nowMs,
     });
     await writeRunArtifact({

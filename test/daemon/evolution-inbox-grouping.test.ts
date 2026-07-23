@@ -201,7 +201,7 @@ describe('A1 — requirement classification gate (watcher-triggered runs only)',
     expect(run?.value?.blockingQuestions.some((question) => question.id.startsWith('requirement-classification-'))).toBe(true);
   });
 
-  it('a clear feature request proceeds past detected unchanged', async () => {
+  it('a clear feature request passes classification and then waits for a live role helper', async () => {
     const root = await makeRoot();
     const groupRel = `${EVOLUTION_REQUIREMENT_INBOX_DIR}/feature-g`;
     await mkdir(join(root, groupRel), { recursive: true });
@@ -216,9 +216,17 @@ describe('A1 — requirement classification gate (watcher-triggered runs only)',
     if (!result.ok) return;
     await runEvolutionAutopilot(result.value.runId, null);
     const run = getEvolutionRun(result.value.runId);
-    expect(run?.value?.stage).not.toBe('needs_human');
+    expect(run?.value?.stage).toBe('needs_human');
     expect(run?.value?.blockingQuestions.some((question) => question.id.startsWith('requirement-classification-'))).toBe(false);
     // Verdict is still recorded as an auditable artifact even when proceeding.
     expect(run?.value?.artifacts.some((artifact) => artifact.kind === 'requirement_classification')).toBe(true);
+    expect(run?.value?.roundtableGateMode).toBe('strict');
+    expect(run?.value?.requireHifiHumanApproval).toBe(true);
+    expect(run?.value?.roundtables).toContainEqual(expect.objectContaining({
+      id: 'product-review',
+      status: 'failed',
+      error: 'roundtable_launcher_unavailable',
+    }));
+    expect(run?.value?.evidence.some((entry) => entry.source === 'local_roundtable_review')).toBe(false);
   });
 });

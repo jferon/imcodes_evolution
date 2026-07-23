@@ -138,10 +138,11 @@ describe('StartDiscussionDialog contract', () => {
     fireEvent.click(screen.getByRole('button', { name: 'discussion.start_button' }));
 
     expect(saveUserPrefMock).toHaveBeenCalledWith('discussion_prefs', {
+      prefsSchemaVersion: 2,
       participants: [
-        { roleId: 'critic', customRoleLabel: undefined, customRolePrompt: undefined, agentType: 'gemini', model: 'opus[1M]' },
-        { roleId: 'custom', customRoleLabel: 'QA', customRolePrompt: 'Find regressions', agentType: 'codex', model: undefined },
-        { roleId: 'pragmatist', customRoleLabel: undefined, customRolePrompt: undefined, agentType: 'claude-code', model: 'sonnet' },
+        { roleId: 'critic', domainRoleId: 'product_critic', customRoleLabel: undefined, customRolePrompt: undefined, agentType: 'gemini', model: 'opus[1M]' },
+        { roleId: 'custom', domainRoleId: 'tech_director', customRoleLabel: 'QA', customRolePrompt: 'Find regressions', agentType: 'codex', model: undefined },
+        { roleId: 'pragmatist', domainRoleId: 'loop_supervisor', customRoleLabel: undefined, customRolePrompt: undefined, agentType: 'claude-code', model: 'sonnet' },
       ],
       verdictIdx: 1,
       maxRounds: 5,
@@ -150,9 +151,9 @@ describe('StartDiscussionDialog contract', () => {
       topic: 'Ship the file preview worker safely',
       cwd: '/repo',
       participants: [
-        { agentType: 'gemini', model: 'opus[1M]', roleId: 'critic', roleLabel: undefined, rolePrompt: undefined, sessionName: 'deck_sub_existing' },
-        { agentType: 'codex', model: undefined, roleId: 'custom', roleLabel: 'QA', rolePrompt: 'Find regressions', sessionName: undefined },
-        { agentType: 'claude-code', model: 'sonnet', roleId: 'pragmatist', roleLabel: undefined, rolePrompt: undefined, sessionName: undefined },
+        { agentType: 'gemini', model: 'opus[1M]', roleId: 'critic', domainRoleId: 'product_critic', roleLabel: undefined, rolePrompt: undefined, sessionName: 'deck_sub_existing' },
+        { agentType: 'codex', model: undefined, roleId: 'custom', domainRoleId: 'tech_director', roleLabel: 'QA', rolePrompt: 'Find regressions', sessionName: undefined },
+        { agentType: 'claude-code', model: 'sonnet', roleId: 'pragmatist', domainRoleId: 'loop_supervisor', roleLabel: undefined, rolePrompt: undefined, sessionName: undefined },
       ],
       maxRounds: 5,
       verdictIdx: 1,
@@ -209,9 +210,10 @@ describe('StartDiscussionDialog contract', () => {
     fireEvent.click(screen.getAllByText('✕')[1]);
     expect(screen.getAllByText('discussion.arbiter')).toHaveLength(1);
 
-    const comboboxes = screen.getAllByRole('combobox');
-    changeSelect(comboboxes[2], 'gemini');
-    expect(screen.getAllByDisplayValue('Sonnet').length).toBeGreaterThan(0);
+    const runtimeSelectors = screen.getAllByLabelText('discussion.field_runtime');
+    changeSelect(runtimeSelectors[0], 'gemini');
+    expect((runtimeSelectors[0] as HTMLSelectElement).value).toBe('gemini');
+    expect(screen.queryByDisplayValue('Sonnet')).toBeNull();
 
     const overlay = container.querySelector('.dialog-overlay') as HTMLElement;
     fireEvent.click(overlay);

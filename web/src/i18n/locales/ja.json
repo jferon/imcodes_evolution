@@ -743,6 +743,20 @@
     "upgrade_blocked_toolchain_unavailable": "daemon ホストの Node が見つかりません（ツールチェーンが削除されました）。Node を再インストールしてください。それまで自動アップグレードは無効です。"
   },
   "discussion": {
+    "field_domain_role": "ドメインロール",
+    "field_runtime": "Agent ランタイム",
+    "domain_role_loop_supervisor": "ループ監督",
+    "domain_role_product_manager": "プロダクトマネージャー",
+    "domain_role_product_critic": "プロダクトレビュー",
+    "domain_role_ux_designer": "UX デザイナー",
+    "domain_role_visual_designer": "ビジュアルデザイナー",
+    "domain_role_visual_fidelity_checker": "ビジュアル忠実度レビュー",
+    "domain_role_tech_director": "テクニカルディレクター",
+    "domain_role_backend_developer": "バックエンド開発",
+    "domain_role_frontend_developer": "フロントエンド開発",
+    "domain_role_qa_engineer": "QA エンジニア",
+    "domain_role_security_reviewer": "セキュリティレビュー",
+    "domain_role_ops_release_manager": "運用 / リリース管理",
     "role_critic": "批評家",
     "role_pragmatist": "実用主義者",
     "role_innovator": "革新者",
@@ -2523,5 +2537,24 @@
     "error_request_failed": "リクエストに失敗しました。",
     "error_app_server_timeout": "Codex がタイムアウトしました。",
     "error_invalid_params": "無効なリクエストです。"
+  },
+  "evolution": {
+    "development_mode": "開発モード",
+    "mode_brownfield_refactor": "既存システムをリファクタリング / 拡張",
+    "mode_greenfield_new_system": "新しいシステムを全面開発",
+    "greenfield_target": "新システムの対象ディレクトリ",
+    "greenfield_topology": "新システムのトポロジー",
+    "topology_monolith": "モノリス（最小限のインフラ）",
+    "topology_modular_monolith": "モジュラーモノリス（推奨）",
+    "topology_services": "サービス（追加のインフラゲートが必要）",
+    "greenfield_help": "プロジェクト内の専用対象にアーキテクチャ、基盤、walking skeleton タスクを作成します。外部リポジトリと本番基盤は別途承認が必要です。",
+    "brownfield_help": "既存のアーキテクチャ、モジュール、データ契約、コンポーネント、デプロイ規約を再利用し、移行とロールバックを計画します。",
+    "hifi_review_title": "高忠実度デザインを確認",
+    "hifi_review_help": "アーキテクチャ作業前に全画像を確認し、承認するかフィードバック付きで再設計を依頼します。",
+    "images": "枚",
+    "approve_hifi": "承認して続行",
+    "redesign_hifi": "再設計を依頼",
+    "hifi_approved_message": "ユーザーが高忠実度レビューセットを承認しました。",
+    "redesign_default_feedback": "要件と参照画像の制約を保って高忠実度セットを再設計してください。"
   }
 }

@@ -4,7 +4,10 @@ import {
   EVOLUTION_STAGES,
   EVOLUTION_TERMINAL_STAGES,
   type EvolutionAutoDeliverPresetId,
+  type EvolutionDevelopmentMode,
   type EvolutionDesignTargetSurface,
+  type EvolutionGateAction,
+  type EvolutionGreenfieldTopology,
   type EvolutionRoleId,
   type EvolutionRoundtableGateMode,
   type EvolutionStage,
@@ -17,7 +20,7 @@ import type {
 } from '@shared/evolution-pipeline-types.js';
 
 export { EVOLUTION_PIPELINE_MSG, EVOLUTION_ROLE_IDS, EVOLUTION_STAGES, EVOLUTION_TERMINAL_STAGES };
-export type { EvolutionDesignTargetSurface, EvolutionRoleId, EvolutionRoundtableGateMode, EvolutionStage } from '@shared/evolution-pipeline-constants.js';
+export type { EvolutionDesignTargetSurface, EvolutionDevelopmentMode, EvolutionGateAction, EvolutionGreenfieldTopology, EvolutionRoleId, EvolutionRoundtableGateMode, EvolutionStage } from '@shared/evolution-pipeline-constants.js';
 export type {
   EvolutionArtifactRef,
   EvolutionEvidence,
@@ -50,6 +53,11 @@ export interface EvolutionLaunchDemoPayload {
   autoCommitPush?: boolean;
   roundtableGateMode?: EvolutionRoundtableGateMode;
   designTargetSurface?: EvolutionDesignTargetSurface;
+  developmentMode?: EvolutionDevelopmentMode;
+  executionPolicy?: 'draft_preview' | 'governed';
+  developmentTargetRelativeDir?: string;
+  greenfieldTopology?: EvolutionGreenfieldTopology;
+  requireHifiHumanApproval?: boolean;
 }
 
 export interface EvolutionStatusPayload {
@@ -125,6 +133,19 @@ export interface EvolutionContinuePayload {
   runId: string;
   targetStage?: EvolutionStage;
   message?: string;
+}
+
+export interface EvolutionGateActionPayload {
+  type: typeof EVOLUTION_PIPELINE_MSG.GATE_ACTION;
+  requestId: string;
+  serverId?: string;
+  sessionName?: string;
+  runId: string;
+  gateId: string;
+  action: EvolutionGateAction;
+  mutationId: string;
+  expectedRunRevision: number;
+  feedback?: string;
 }
 
 export interface EvolutionUserMessagePayload {
