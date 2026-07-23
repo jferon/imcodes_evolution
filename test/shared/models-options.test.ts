@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CLAUDE_CODE_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions, normalizeClaudeCodeModelId } from '../../src/shared/models/options.js';
+import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions, normalizeClaudeCodeModelId } from '../../src/shared/models/options.js';
 
 describe('normalizeClaudeCodeModelId', () => {
   it('maps opus alias to opus[1M]', () => {
@@ -36,6 +36,14 @@ describe('CLAUDE_CODE_MODEL_IDS', () => {
   it('lists fable (Mythos-class) first as the top-tier option', () => {
     expect(CLAUDE_CODE_MODEL_IDS[0]).toBe('fable');
     expect(CLAUDE_CODE_MODEL_IDS).toContain('opus[1M]');
+  });
+});
+
+describe('CODEX_MODEL_IDS', () => {
+  it('includes the account-supported gpt-5.6 variants for cold-start fallback', () => {
+    expect(CODEX_MODEL_IDS).toContain('gpt-5.6-sol');
+    expect(CODEX_MODEL_IDS).toContain('gpt-5.6-terra');
+    expect(CODEX_MODEL_IDS).toContain('gpt-5.6-luna');
   });
 });
 

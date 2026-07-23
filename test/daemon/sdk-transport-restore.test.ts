@@ -147,7 +147,8 @@ vi.mock('../../src/agent/sdk-runtime-config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../src/agent/sdk-runtime-config.js')>()),
   getClaudeSdkRuntimeConfig: vi.fn(async () => ({})),
 }));
-vi.mock('../../src/agent/codex-runtime-config.js', () => ({ getCodexRuntimeConfig: vi.fn(async () => ({})) }));
+const getCodexRuntimeConfigMock = vi.hoisted(() => vi.fn(async () => ({})));
+vi.mock('../../src/agent/codex-runtime-config.js', () => ({ getCodexRuntimeConfig: getCodexRuntimeConfigMock }));
 vi.mock('../../src/agent/provider-display.js', () => ({ getQwenDisplayMetadata: vi.fn(() => ({})) }));
 vi.mock('../../src/agent/provider-quota.js', () => ({ getQwenOAuthQuotaUsageLabel: vi.fn(() => '') }));
 vi.mock('../../src/agent/agent-version.js', () => ({ getAgentVersion: vi.fn(async () => 'test') }));
@@ -267,6 +268,8 @@ describe('sdk transport session restore', () => {
     timelineEmitterEmitMock.mockClear();
     timelineReadByTypesPreferredMock.mockReset();
     timelineReadByTypesPreferredMock.mockResolvedValue([]);
+    getCodexRuntimeConfigMock.mockReset();
+    getCodexRuntimeConfigMock.mockResolvedValue({});
     setSessionEventCallback(() => {});
     setSessionPersistCallback(async () => {});
   });
@@ -1004,6 +1007,53 @@ describe('sdk transport session restore', () => {
       mode: 'resume',
       id: 'codex-thread-opus-restore',
       options: expect.objectContaining({ model: 'gpt-5.5' }),
+    });
+  });
+
+  it('migrates a stored bare Codex model family to the available default variant on restore', async () => {
+    getCodexRuntimeConfigMock.mockResolvedValue({
+      availableModels: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5'],
+      defaultModel: 'gpt-5.6-sol',
+    });
+    mocks.store.set('deck_sdk_cx_bare_model_brain', {
+      name: 'deck_sdk_cx_bare_model_brain',
+      projectName: 'sdkcxbaremodel',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/tmp/sdk-cx-bare-model',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'codex-sdk',
+      providerSessionId: 'route-cx-bare-model-restore',
+      codexSessionId: 'codex-thread-bare-model-restore',
+      requestedModel: 'gpt-5.6',
+      activeModel: 'gpt-5.6',
+      modelDisplay: 'gpt-5.6',
+      codexAvailableModels: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5'],
+    });
+
+    await connectProvider('codex-sdk', {});
+    await restoreTransportSessions('codex-sdk');
+
+    expect(mocks.store.get('deck_sdk_cx_bare_model_brain')).toMatchObject({
+      requestedModel: 'gpt-5.6-sol',
+      activeModel: 'gpt-5.6-sol',
+      modelDisplay: 'gpt-5.6-sol',
+    });
+
+    const runtime = getTransportRuntime('deck_sdk_cx_bare_model_brain');
+    expect(runtime).toBeDefined();
+    runtime!.send('resume with migrated model');
+    await settleCodexRun('deck_sdk_cx_bare_model_brain', 'resume');
+
+    expect(codexRunForSession('deck_sdk_cx_bare_model_brain', 'resume')).toMatchObject({
+      mode: 'resume',
+      id: 'codex-thread-bare-model-restore',
+      options: expect.objectContaining({ model: 'gpt-5.6-sol' }),
     });
   });
 

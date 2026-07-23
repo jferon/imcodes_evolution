@@ -1301,6 +1301,23 @@ async function isP2pCompletionIdle(
   }
 }
 
+function getFreshTransportProviderFailure(
+  session: string,
+  dispatchStartedAt: number,
+): { code: string; message: string } | null {
+  const runtime = getTransportRuntime(session);
+  if (!runtime) return null;
+  const snapshot = runtime.getDiagnosticSnapshot(Date.now());
+  const providerError = snapshot.lastProviderError;
+  if (snapshot.status !== 'error' || !providerError || providerError.at < dispatchStartedAt) {
+    return null;
+  }
+  return {
+    code: providerError.code,
+    message: providerError.message,
+  };
+}
+
 // ── Start a P2P run ───────────────────────────────────────────────────────
 
 function buildHelperEligibleSnapshot(initiatorSession: string, targets: P2pTarget[]): P2pParticipantSnapshotEntry[] {
@@ -4407,6 +4424,32 @@ async function dispatchHop(
           pushState(run, serverLink);
           return true;
         }
+      }
+
+      const providerFailure = getFreshTransportProviderFailure(session, run.hopStartedAt);
+      if (providerFailure && !fileGrew && !headingFound) {
+        idleWaiter.cancel();
+        const errorMessage = `provider_error:${providerFailure.code}: ${providerFailure.message}`;
+        logger.warn(
+          {
+            runId: run.id,
+            session,
+            activePhase: run.activePhase,
+            providerErrorCode: providerFailure.code,
+            providerErrorMessage: providerFailure.message,
+          },
+          'P2P: provider rejected hop before producing discussion output',
+        );
+        if (queuedDispatch) {
+          purgeQueuedP2pPromptByCommandId(run, session, queuedCommandId, 'provider_error');
+        }
+        await finishHop('failed', errorMessage);
+        if (required && run.advancedP2pEnabled) {
+          failRun(run, 'provider_error', errorMessage, serverLink);
+        } else {
+          pushState(run, serverLink);
+        }
+        return false;
       }
 
       const settleForGrowth = IDLE_POLL_MS * FILE_SETTLE_CYCLES;
