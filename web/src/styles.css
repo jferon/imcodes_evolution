@@ -1447,7 +1447,14 @@ html.native-ios-mac .chat-dl-btn {
   .menu-dropdown-p2p .menu-divider,
   .p2p-menu-section-label { white-space: normal; }
 }
-.btn { padding: 6px 12px; border-radius: 7px; border: 1px solid transparent; cursor: pointer; font-size: 12px; font-family: inherit; font-weight: 600; transition: color 0.15s, background 0.15s, border-color 0.15s, box-shadow 0.15s, transform 0.15s; box-shadow: inset 0 1px 0 rgba(255,255,255,0.04); }
+/* Base .btn ships its own neutral look (rather than relying on a color
+   variant) because several call sites use bare class="btn"/"btn btn-sm"
+   with no -primary/-secondary/-danger suffix; without this they fell
+   through to unstyled native button chrome. .btn-primary/-secondary/-danger
+   below override background/border-color/color and win the cascade (same
+   specificity, declared later in the file). */
+.btn { padding: 6px 12px; border-radius: 7px; border: 1px solid rgba(125,211,252,0.14); cursor: pointer; font-size: 12px; font-family: inherit; font-weight: 600; transition: color 0.15s, background 0.15s, border-color 0.15s, box-shadow 0.15s, transform 0.15s; box-shadow: inset 0 1px 0 rgba(255,255,255,0.04); background: rgba(15,23,42,0.55); color: #94a3b8; }
+.btn:hover:not(:disabled) { background: rgba(15,23,42,0.78); border-color: rgba(125,211,252,0.3); color: #cbd5e1; }
 .btn-compact { padding: 3px 8px; font-size: 10px; }
 .controls-icon-btn { padding: 6px 10px; }
 .btn-primary { background: linear-gradient(180deg, rgba(34,211,238,0.92), rgba(37,99,235,0.92)); border-color: rgba(125,211,252,0.38); color: #f8fafc; box-shadow: 0 0 14px rgba(34,211,238,0.16), inset 0 1px 0 rgba(255,255,255,0.16); }
@@ -1575,6 +1582,50 @@ html.native-ios-mac .chat-dl-btn {
 .btn-danger:hover:not(:disabled) { background: linear-gradient(180deg, rgba(248,113,113,0.96), rgba(185,28,28,0.96)); border-color: rgba(252,165,165,0.62); box-shadow: 0 0 14px rgba(239,68,68,0.22); }
 .btn-secondary { background: rgba(15,23,42,0.62); border-color: rgba(125,211,252,0.16); color: #94a3b8; }
 .btn-secondary:hover:not(:disabled) { background: rgba(8,145,178,0.14); border-color: rgba(34,211,238,0.42); color: #dbeafe; box-shadow: 0 0 12px rgba(34,211,238,0.12); }
+.btn-sm { padding: 4px 10px; font-size: 11px; border-radius: 6px; }
+
+/* ── Form inputs (text / textarea / select) ──────────────────────────────────
+   `.input` is referenced by ~15 dialogs across the app (StartSubSessionDialog,
+   SessionSettingsDialog, LoginPage, StartDiscussionDialog, ...) but had no
+   matching rule, so every text field/select rendered as an unstyled native
+   control (white box) inside otherwise dark-themed dialogs. Kept in the same
+   "glass" palette as .btn/.btn-secondary (rgba(15,23,42,..) fill, cyan-tinted
+   border, cyan focus glow) so it reads as one system rather than a patch. */
+.input {
+  padding: 7px 10px;
+  background: rgba(15,23,42,0.62);
+  border: 1px solid rgba(125,211,252,0.16);
+  border-radius: 7px;
+  color: #e2e8f0;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+  transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
+}
+.input::placeholder { color: #64748b; }
+.input:hover:not(:disabled):not(:focus) { border-color: rgba(148,163,184,0.34); }
+.input:focus {
+  outline: none;
+  border-color: rgba(34,211,238,0.55);
+  box-shadow: 0 0 0 3px rgba(34,211,238,0.14), inset 0 1px 0 rgba(255,255,255,0.03);
+  background: rgba(15,23,42,0.88);
+}
+.input:disabled { opacity: 0.46; cursor: not-allowed; }
+select.input {
+  appearance: none; -webkit-appearance: none;
+  padding-right: 26px;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%2364748b' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+}
+select.input:hover:not(:disabled) {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%2394a3b8' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+.input-sm { padding: 4px 8px; font-size: 11.5px; border-radius: 6px; }
+select.input-sm { padding-right: 22px; background-position: right 7px center; }
+.field-label { font-size: 12px; font-weight: 700; color: #94a3b8; margin-bottom: 6px; }
 
 /* Quick Input Panel */
 .qp-trigger-wrap { position: relative; flex-shrink: 0; }
@@ -2632,7 +2683,17 @@ html.native-ios-mac .chat-dl-btn {
 .subsession-type-btn.active { background: #1e3a5f; border-color: #3b82f6; color: #93c5fd; }
 
 /* ── Discussion dialog ────────────────────────────────────────────────────── */
-.discussion-participant-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 6px 8px; background: #0f172a; border: 1px solid #1e293b; border-radius: 6px; }
+.discussion-participant-row {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 10px; background: rgba(15,23,42,0.55);
+  border: 1px solid rgba(125,211,252,0.10); border-radius: 8px;
+  transition: border-color 0.15s, background 0.15s;
+}
+.discussion-participant-row:hover { border-color: rgba(125,211,252,0.22); background: rgba(15,23,42,0.72); }
+.discussion-participant-row .btn-sm { flex-shrink: 0; }
+.discussion-participant-row select.input-sm { flex: 1 1 108px; min-width: 92px; }
+.discussion-participant-row .discussion-role-select { flex-basis: 128px; min-width: 112px; }
+.discussion-participant-row .discussion-session-select { flex-basis: 136px; min-width: 118px; }
 .discussion-verdict-badge { font-size: 14px; margin-left: 2px; flex-shrink: 0; }
 .discussion-panel {
   display: flex;
@@ -4216,35 +4277,46 @@ html.native-ios-mac .chat-dl-btn {
   }
 }
 
-/* Evolution Factory / War Room */
+/* Evolution Factory / War Room
+   launcher is a small free-floating circular bubble (drag anywhere; position
+   persists via localStorage in EvolutionLauncherBubble) rather than a fixed
+   wide pill, so it no longer permanently covers the top-right toolbar. */
 .evolution-global-launcher {
   position: fixed;
-  right: 24px;
-  top: 84px;
   z-index: 10055;
   display: inline-flex;
   align-items: center;
-  gap: 12px;
-  min-width: 238px;
-  max-width: min(360px, calc(100vw - 32px));
-  padding: 12px 15px 12px 12px;
+  justify-content: center;
+  width: 52px;
+  height: 52px;
+  padding: 0;
   border: 1px solid rgba(56, 189, 248, 0.55);
-  border-radius: 18px;
+  border-radius: 50%;
   background:
-    radial-gradient(circle at 20% 0%, rgba(34, 211, 238, 0.28), transparent 38%),
-    linear-gradient(135deg, rgba(15, 23, 42, 0.98), rgba(8, 47, 73, 0.95));
-  color: #e0f2fe;
-  box-shadow: 0 18px 52px rgba(2, 132, 199, 0.26), inset 0 1px 0 rgba(255, 255, 255, 0.08);
-  cursor: pointer;
+    radial-gradient(circle at 30% 22%, rgba(255, 255, 255, 0.32), transparent 42%),
+    linear-gradient(135deg, #22d3ee, #2563eb);
+  color: white;
+  font-weight: 900;
+  font-size: 17px;
+  letter-spacing: 0.02em;
+  box-shadow: 0 10px 26px rgba(2, 132, 199, 0.32), inset 0 1px 0 rgba(255, 255, 255, 0.28);
+  cursor: grab;
   font-family: inherit;
-  text-align: left;
-  transition: transform 0.14s ease, border-color 0.14s ease, box-shadow 0.14s ease, opacity 0.14s ease;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  transition: border-color 0.14s ease, box-shadow 0.14s ease, transform 0.1s ease, opacity 0.14s ease;
+}
+
+.evolution-global-launcher:active:not(:disabled) {
+  cursor: grabbing;
+  transform: scale(0.96);
 }
 
 .evolution-global-launcher:hover:not(:disabled) {
-  transform: translateY(-2px);
   border-color: rgba(125, 211, 252, 0.92);
-  box-shadow: 0 22px 64px rgba(2, 132, 199, 0.36), 0 0 0 1px rgba(125, 211, 252, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  box-shadow: 0 14px 34px rgba(2, 132, 199, 0.42), 0 0 0 1px rgba(125, 211, 252, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.32);
+  transform: scale(1.06);
 }
 
 .evolution-global-launcher:disabled {
@@ -4254,48 +4326,8 @@ html.native-ios-mac .chat-dl-btn {
 
 .evolution-global-launcher.is-active {
   border-color: rgba(74, 222, 128, 0.9);
-  box-shadow: 0 18px 58px rgba(34, 197, 94, 0.28), 0 0 0 1px rgba(74, 222, 128, 0.26);
+  box-shadow: 0 10px 30px rgba(34, 197, 94, 0.32), 0 0 0 1px rgba(74, 222, 128, 0.3);
   animation: evolution-global-launcher-pulse 2s ease-in-out infinite;
-}
-
-.evolution-global-launcher-mark {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 48px;
-  height: 48px;
-  border-radius: 15px;
-  background: linear-gradient(135deg, #22d3ee, #2563eb);
-  color: white;
-  font-weight: 900;
-  font-size: 14px;
-  letter-spacing: 0.04em;
-  box-shadow: inset 0 1px 0 rgba(255,255,255,0.32), 0 10px 26px rgba(37, 99, 235, 0.28);
-  flex-shrink: 0;
-}
-
-.evolution-global-launcher-copy {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.evolution-global-launcher-copy strong {
-  font-size: 14px;
-  line-height: 1.1;
-  letter-spacing: 0.01em;
-}
-
-.evolution-global-launcher-copy em {
-  max-width: 245px;
-  overflow: hidden;
-  color: #93c5fd;
-  font-size: 11px;
-  font-style: normal;
-  line-height: 1.25;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 @keyframes evolution-global-launcher-pulse {
@@ -4713,19 +4745,8 @@ html.native-ios-mac .chat-dl-btn {
 }
 
 @media (max-width: 720px) {
-  .evolution-global-launcher {
-    right: 12px;
-    top: auto;
-    bottom: 12px;
-    min-width: 0;
-    width: calc(100vw - 24px);
-  }
-
-  .evolution-global-launcher-mark {
-    width: 42px;
-    height: 42px;
-    border-radius: 13px;
-  }
+  /* Bubble keeps its fixed 52px size and free drag position on mobile too —
+     EvolutionLauncherBubble's clamp already keeps it inside the viewport. */
 
   .evolution-control-console {
     position: fixed;

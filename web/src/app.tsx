@@ -45,6 +45,7 @@ import { useOpenSpecAutoDeliver } from './hooks/useOpenSpecAutoDeliver.js';
 import { isOpenSpecAutoDeliverActiveProjection } from './openspec-auto-deliver.js';
 import { EvolutionWarRoomPanel } from './components/EvolutionWarRoom.js';
 import { EvolutionControlConsole } from './components/EvolutionControlConsole.js';
+import { EvolutionLauncherBubble } from './components/EvolutionLauncherBubble.js';
 import { useEvolutionPipeline } from './hooks/useEvolutionPipeline.js';
 import { isEvolutionActiveProjection } from './evolution-pipeline.js';
 import { DesktopWindowMaximizeButton } from './components/DesktopWindowMaximizeButton.js';
@@ -4551,20 +4552,12 @@ export function App() {
   return (
     <div class="layout" key={selectedServerId ?? ''}>
       {selectedServerId && !appEvolutionConsoleOpen && (
-        <button
-          type="button"
-          class={`evolution-global-launcher${appEvolutionActive ? ' is-active' : ''}`}
+        <EvolutionLauncherBubble
           disabled={appEvolutionDisabled}
-          onClick={() => setAppEvolutionConsoleOpen(true)}
-          title="打开 Evolution Factory 自我进化工厂"
-          aria-label="打开 Evolution Factory 自我进化工厂"
-        >
-          <span class="evolution-global-launcher-mark">Evo</span>
-          <span class="evolution-global-launcher-copy">
-            <strong>Evolution Factory</strong>
-            <em>{appEvolutionActive ? '运行中' : appEvolutionProjectLabel}</em>
-          </span>
-        </button>
+          isActive={appEvolutionActive}
+          onOpen={() => setAppEvolutionConsoleOpen(true)}
+          title={`打开 Evolution Factory 自我进化工厂${appEvolutionActive ? ' · 运行中' : appEvolutionProjectLabel ? ` · ${appEvolutionProjectLabel}` : ''}`}
+        />
       )}
 
       {/* Desktop 3-column: [ServerIconBar][SidebarPanel][MainContent] */}

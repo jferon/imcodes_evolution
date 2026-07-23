@@ -120,9 +120,9 @@ export function StartDiscussionDialog({ onStartRequested, defaultCwd, existingSe
 
   return (
     <div class="dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
-      <div class="dialog" style={{ width: 520 }}>
+      <div class="dialog" style={{ width: 560 }}>
         <div class="dialog-header">
-          <span>{t('discussion.dialog_title')}</span>
+          <h2>{t('discussion.dialog_title')}</h2>
           <button class="dialog-close" onClick={onClose}>✕</button>
         </div>
 
@@ -167,16 +167,16 @@ export function StartDiscussionDialog({ onStartRequested, defaultCwd, existingSe
                   {/* Verdict selector */}
                   <button
                     type="button"
-                    class={`btn btn-sm${verdictIdx === idx ? ' btn-primary' : ''}`}
+                    class={`btn btn-sm${verdictIdx === idx ? ' btn-primary' : ' btn-secondary'}`}
                     onClick={() => setVerdictIdx(idx)}
-                    style={{ whiteSpace: 'nowrap', minWidth: 60, fontSize: 12 }}
+                    style={{ whiteSpace: 'nowrap', minWidth: 72, flexShrink: 0 }}
                   >
                     {verdictIdx === idx ? t('discussion.arbiter_active') : t('discussion.arbiter')}
                   </button>
 
                   {/* Role selector */}
                   <select
-                    class="input input-sm"
+                    class="input input-sm discussion-role-select"
                     value={p.roleId}
                     onChange={(e) => updateParticipant(idx, { roleId: (e.target as HTMLSelectElement).value })}
                   >
@@ -208,7 +208,7 @@ export function StartDiscussionDialog({ onStartRequested, defaultCwd, existingSe
                   {/* Session source: new or reuse */}
                   {p.roleId !== 'custom' && (
                     <select
-                      class="input input-sm"
+                      class="input input-sm discussion-session-select"
                       value={p.sessionName ?? '_new'}
                       onChange={(e) => {
                         const val = (e.target as HTMLSelectElement).value;
