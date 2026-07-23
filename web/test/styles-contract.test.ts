@@ -14,6 +14,32 @@ describe('styles.css regression contracts', () => {
   const css = readFileSync(resolve(__dirname, '../src/styles.css'), 'utf8');
   const cssWithoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
 
+  it('Evolution launcher mirrors the sub-session cyan-to-indigo breathing ring', () => {
+    const launcherShellRule = cssWithoutComments.match(/\.evolution-global-launcher-shell\s*\{[^}]*\}/);
+    expect(launcherShellRule).not.toBeNull();
+    expect(launcherShellRule![0]).toMatch(/isolation:\s*isolate/);
+    expect(launcherShellRule![0]).toMatch(/--evolution-launcher-aura-mid:\s*#00e5ff/);
+    expect(launcherShellRule![0]).toMatch(/--evolution-launcher-aura-peak:\s*#818cf8/);
+
+    const haloRule = cssWithoutComments.match(/\.evolution-global-launcher-shell::before\s*\{[^}]*\}/);
+    expect(haloRule).not.toBeNull();
+    expect(haloRule![0]).toMatch(/content:\s*""/);
+    expect(haloRule![0]).toMatch(/pointer-events:\s*none/);
+    expect(haloRule![0]).toMatch(/inset:\s*-2px/);
+    expect(haloRule![0]).toMatch(/border:\s*1px solid/);
+    expect(haloRule![0]).toMatch(/animation:\s*evolution-global-launcher-ambient-breathe\s+3\.6s\s+ease-in-out\s+infinite/);
+
+    expect(cssWithoutComments).toMatch(/@keyframes\s+evolution-global-launcher-ambient-breathe/);
+    expect(cssWithoutComments).toMatch(/border-color:\s*var\(--evolution-launcher-aura-mid\)/);
+    expect(cssWithoutComments).toMatch(/border-color:\s*var\(--evolution-launcher-aura-peak\)/);
+    expect(cssWithoutComments).toMatch(/box-shadow:\s*0 0 12px var\(--evolution-launcher-aura-mid-shadow\)/);
+    expect(cssWithoutComments).toMatch(/transform:\s*scale\(1\.04\)/);
+    expect(cssWithoutComments).toMatch(/\.evolution-global-launcher-shell\.is-disabled::before\s*\{[^}]*animation-play-state:\s*paused/);
+    expect(cssWithoutComments).toMatch(
+      /@media\s*\(prefers-reduced-motion:\s*reduce\)\s*\{\s*\.evolution-global-launcher\.is-active,\s*\.evolution-global-launcher-shell::before\s*\{[^}]*animation:\s*none/,
+    );
+  });
+
   it('.chat-view-preview must NOT be a scroll container', () => {
     // User reported: card chat history flickers / oscillates infinitely
     // near the bottom at certain heights — only resolves after manual

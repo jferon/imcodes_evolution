@@ -110,20 +110,24 @@ export function EvolutionLauncherBubble({ disabled, isActive, title, onOpen }: P
   }, [disabled, onOpen]);
 
   return (
-    <button
-      type="button"
-      class={`evolution-global-launcher${isActive ? ' is-active' : ''}`}
-      disabled={disabled}
-      title={title}
-      aria-label={title}
+    <span
+      class={`evolution-global-launcher-shell${isActive ? ' is-active' : ''}${disabled ? ' is-disabled' : ''}`}
       style={{ left: pos.x, top: pos.y }}
-      onPointerDown={handlePointerDown}
-      onPointerMove={handlePointerMove}
-      onPointerUp={endDrag}
-      onPointerCancel={endDrag}
-      onClick={handleClick}
     >
-      E
-    </button>
+      <button
+        type="button"
+        class={`evolution-global-launcher${isActive ? ' is-active' : ''}`}
+        disabled={disabled}
+        title={title}
+        aria-label={title}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
+        onClick={handleClick}
+      >
+        E
+      </button>
+    </span>
   );
 }

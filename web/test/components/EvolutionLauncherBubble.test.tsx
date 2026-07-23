@@ -18,6 +18,12 @@ function setViewport(width: number, height: number) {
   Object.defineProperty(window, 'innerHeight', { configurable: true, value: height });
 }
 
+function launcherShell(button: HTMLElement): HTMLElement {
+  const shell = button.parentElement;
+  expect(shell?.classList.contains('evolution-global-launcher-shell')).toBe(true);
+  return shell!;
+}
+
 // `window.PointerEvent` is undefined in this jsdom version, so Preact can't
 // register real native 'pointerdown'/'pointermove'/'pointerup' listeners for
 // onPointerDown/onPointerMove/onPointerUp — it falls back to registering
@@ -71,18 +77,25 @@ describe('EvolutionLauncherBubble', () => {
   it('renders the compact "E" mark with the given tooltip and no leftover pill copy', () => {
     render(<EvolutionLauncherBubble title="Open Evolution Factory" onOpen={() => {}} />);
     const button = screen.getByRole('button', { name: 'Open Evolution Factory' });
+    const shell = launcherShell(button);
     expect(button.textContent).toBe('E');
     expect(button.getAttribute('title')).toBe('Open Evolution Factory');
+    expect(shell.getAttribute('aria-hidden')).toBeNull();
+    expect(button.style.left).toBe('');
+    expect(button.style.top).toBe('');
     expect(button.querySelector('.evolution-global-launcher-mark')).toBeNull();
     expect(button.querySelector('.evolution-global-launcher-copy')).toBeNull();
   });
 
   it('applies the is-active class only when isActive is true', () => {
     const { rerender } = render(<EvolutionLauncherBubble title="x" onOpen={() => {}} />);
-    expect(screen.getByRole('button').className).not.toContain('is-active');
+    const button = screen.getByRole('button');
+    expect(button.className).not.toContain('is-active');
+    expect(launcherShell(button).className).not.toContain('is-active');
 
     rerender(<EvolutionLauncherBubble title="x" isActive onOpen={() => {}} />);
     expect(screen.getByRole('button').className).toContain('is-active');
+    expect(launcherShell(screen.getByRole('button')).className).toContain('is-active');
   });
 
   it('opens the console on a plain click with no pointer movement', () => {
@@ -130,8 +143,9 @@ describe('EvolutionLauncherBubble', () => {
     const onOpen = vi.fn();
     render(<EvolutionLauncherBubble title="x" onOpen={onOpen} />);
     const button = screen.getByRole('button') as HTMLButtonElement;
-    const startLeft = parseFloat(button.style.left);
-    const startTop = parseFloat(button.style.top);
+    const shell = launcherShell(button);
+    const startLeft = parseFloat(shell.style.left);
+    const startTop = parseFloat(shell.style.top);
 
     // Default spawn position is near the right edge (viewport - SIZE - 24),
     // so drag left/down by a modest amount that stays well clear of the
@@ -142,19 +156,20 @@ describe('EvolutionLauncherBubble', () => {
     firePointer(button, 'pointerup', { pointerId: 2, clientX: 170, clientY: 220 });
     fireEvent.click(button); // must be swallowed — this was a drag, not a tap
 
-    expect(parseFloat(button.style.left)).toBe(startLeft - 30);
-    expect(parseFloat(button.style.top)).toBe(startTop + 20);
+    expect(parseFloat(shell.style.left)).toBe(startLeft - 30);
+    expect(parseFloat(shell.style.top)).toBe(startTop + 20);
     expect(onOpen).not.toHaveBeenCalled();
   });
 
   it('ignores pointermove events from an unrelated pointerId while dragging', () => {
     render(<EvolutionLauncherBubble title="x" onOpen={() => {}} />);
     const button = screen.getByRole('button') as HTMLButtonElement;
-    const startLeft = parseFloat(button.style.left);
+    const shell = launcherShell(button);
+    const startLeft = parseFloat(shell.style.left);
 
     firePointer(button, 'pointerdown', { pointerId: 7, clientX: 200, clientY: 200 });
     firePointer(button, 'pointermove', { pointerId: 99, clientX: 500, clientY: 500 }); // different pointer — must not move it
-    expect(parseFloat(button.style.left)).toBe(startLeft);
+    expect(parseFloat(shell.style.left)).toBe(startLeft);
 
     firePointer(button, 'pointerup', { pointerId: 7, clientX: 200, clientY: 200 });
   });
@@ -162,81 +177,88 @@ describe('EvolutionLauncherBubble', () => {
   it('persists the dragged position to localStorage and restores it on the next mount', () => {
     const first = render(<EvolutionLauncherBubble title="x" onOpen={() => {}} />);
     const button = screen.getByRole('button') as HTMLButtonElement;
+    const shell = launcherShell(button);
 
     firePointer(button, 'pointerdown', { pointerId: 3, clientX: 200, clientY: 200 });
     firePointer(button, 'pointermove', { pointerId: 3, clientX: 150, clientY: 260 }); // dx=-50, dy=60
     firePointer(button, 'pointerup', { pointerId: 3, clientX: 150, clientY: 260 });
 
-    const left = button.style.left;
-    const top = button.style.top;
+    const left = shell.style.left;
+    const top = shell.style.top;
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? 'null');
     expect(saved).toEqual({ x: parseFloat(left), y: parseFloat(top) });
 
     first.unmount();
     render(<EvolutionLauncherBubble title="x" onOpen={() => {}} />);
     const remounted = screen.getByRole('button') as HTMLButtonElement;
-    expect(remounted.style.left).toBe(left);
-    expect(remounted.style.top).toBe(top);
+    const remountedShell = launcherShell(remounted);
+    expect(remountedShell.style.left).toBe(left);
+    expect(remountedShell.style.top).toBe(top);
   });
 
   it('clamps the dragged position so the bubble always stays fully inside the viewport', () => {
     render(<EvolutionLauncherBubble title="x" onOpen={() => {}} />);
     const button = screen.getByRole('button') as HTMLButtonElement;
+    const shell = launcherShell(button);
 
     firePointer(button, 'pointerdown', { pointerId: 4, clientX: 0, clientY: 0 });
     firePointer(button, 'pointermove', { pointerId: 4, clientX: -5000, clientY: -5000 });
     firePointer(button, 'pointerup', { pointerId: 4, clientX: -5000, clientY: -5000 });
-    expect(parseFloat(button.style.left)).toBe(EDGE_MARGIN);
-    expect(parseFloat(button.style.top)).toBe(EDGE_MARGIN);
+    expect(parseFloat(shell.style.left)).toBe(EDGE_MARGIN);
+    expect(parseFloat(shell.style.top)).toBe(EDGE_MARGIN);
 
     firePointer(button, 'pointerdown', { pointerId: 5, clientX: 0, clientY: 0 });
     firePointer(button, 'pointermove', { pointerId: 5, clientX: 5000, clientY: 5000 });
     firePointer(button, 'pointerup', { pointerId: 5, clientX: 5000, clientY: 5000 });
-    expect(parseFloat(button.style.left)).toBe(1024 - SIZE - EDGE_MARGIN);
-    expect(parseFloat(button.style.top)).toBe(768 - SIZE - EDGE_MARGIN);
+    expect(parseFloat(shell.style.left)).toBe(1024 - SIZE - EDGE_MARGIN);
+    expect(parseFloat(shell.style.top)).toBe(768 - SIZE - EDGE_MARGIN);
   });
 
   it('defaults to the top-right corner area when nothing is saved yet', () => {
     render(<EvolutionLauncherBubble title="x" onOpen={() => {}} />);
     const button = screen.getByRole('button') as HTMLButtonElement;
-    expect(parseFloat(button.style.left)).toBe(1024 - SIZE - 24);
-    expect(parseFloat(button.style.top)).toBe(84);
+    const shell = launcherShell(button);
+    expect(parseFloat(shell.style.left)).toBe(1024 - SIZE - 24);
+    expect(parseFloat(shell.style.top)).toBe(84);
   });
 
   it('ignores corrupted localStorage content and falls back to the default position', () => {
     localStorage.setItem(STORAGE_KEY, '{not-json');
     render(<EvolutionLauncherBubble title="x" onOpen={() => {}} />);
     const button = screen.getByRole('button') as HTMLButtonElement;
-    expect(parseFloat(button.style.left)).toBe(1024 - SIZE - 24);
-    expect(parseFloat(button.style.top)).toBe(84);
+    const shell = launcherShell(button);
+    expect(parseFloat(shell.style.left)).toBe(1024 - SIZE - 24);
+    expect(parseFloat(shell.style.top)).toBe(84);
   });
 
   it('re-clamps on window resize so the bubble is never stranded off-screen', () => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ x: 900, y: 700 }));
     render(<EvolutionLauncherBubble title="x" onOpen={() => {}} />);
     const button = screen.getByRole('button') as HTMLButtonElement;
-    expect(parseFloat(button.style.left)).toBe(900);
-    expect(parseFloat(button.style.top)).toBe(700);
+    const shell = launcherShell(button);
+    expect(parseFloat(shell.style.left)).toBe(900);
+    expect(parseFloat(shell.style.top)).toBe(700);
 
     act(() => {
       setViewport(500, 400);
       window.dispatchEvent(new Event('resize'));
     });
 
-    expect(parseFloat(button.style.left)).toBe(500 - SIZE - EDGE_MARGIN);
-    expect(parseFloat(button.style.top)).toBe(400 - SIZE - EDGE_MARGIN);
+    expect(parseFloat(shell.style.left)).toBe(500 - SIZE - EDGE_MARGIN);
+    expect(parseFloat(shell.style.top)).toBe(400 - SIZE - EDGE_MARGIN);
   });
 
   it('does not attempt to drag when disabled', () => {
     render(<EvolutionLauncherBubble title="x" onOpen={() => {}} disabled />);
     const button = screen.getByRole('button') as HTMLButtonElement;
-    const startLeft = button.style.left;
+    const shell = launcherShell(button);
+    const startLeft = shell.style.left;
 
     firePointer(button, 'pointerdown', { pointerId: 6, clientX: 200, clientY: 200 });
     firePointer(button, 'pointermove', { pointerId: 6, clientX: 260, clientY: 240 });
     firePointer(button, 'pointerup', { pointerId: 6, clientX: 260, clientY: 240 });
 
-    expect(button.style.left).toBe(startLeft);
+    expect(shell.style.left).toBe(startLeft);
     expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
   });
 });
