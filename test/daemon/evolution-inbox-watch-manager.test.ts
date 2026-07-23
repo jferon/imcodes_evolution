@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { EVOLUTION_PIPELINE_MSG, EVOLUTION_REQUIREMENT_INBOX_DIR } from '../../shared/evolution-pipeline-constants.js';
 import type { EvolutionProjection } from '../../shared/evolution-pipeline-types.js';
 import {
+  configureEvolutionInboxWatcherDirectory,
   listEvolutionInboxWatchers,
   scanEvolutionInboxWatchers,
   stopAllEvolutionInboxWatchers,
@@ -33,6 +34,15 @@ async function waitForProjection(
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error(`Timed out waiting for Evolution projection after ${timeoutMs}ms.`);
+}
+
+async function waitForWatcherDirectory(directoryPath: string, timeoutMs = 2_000): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (listEvolutionInboxWatchers().some((watcher) => watcher.inboxAbsolutePath === directoryPath)) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`Timed out waiting for Evolution watcher directory ${directoryPath}.`);
 }
 
 afterEach(async () => {
@@ -150,5 +160,65 @@ describe('evolution inbox watch manager', () => {
       10_000,
     );
     expect(projection.source.requestedBy).toBe('watcher');
+  });
+
+  it('switches to a browsed directory, imports its requirements safely, and restores it after restart', async () => {
+    const root = await makeRoot();
+    const selectedDirectory = join(root, 'product-requirements');
+    await mkdir(selectedDirectory, { recursive: true });
+    const sent: Record<string, unknown>[] = [];
+    const serverLink = {
+      send(message: Record<string, unknown>) {
+        sent.push(message);
+      },
+    };
+
+    syncEvolutionInboxWatchers(serverLink as never, [
+      { name: 'deck_demo_brain', projectName: 'demo', projectDir: root, state: 'running' },
+    ]);
+
+    const configured = await configureEvolutionInboxWatcherDirectory({
+      sessionName: 'deck_demo_brain',
+      projectRoot: root,
+      directoryPath: selectedDirectory,
+      serverLink: serverLink as never,
+    });
+
+    expect(configured.watchers).toEqual([
+      expect.objectContaining({
+        sessionName: 'deck_demo_brain',
+        projectRoot: root,
+        inboxAbsolutePath: selectedDirectory,
+        active: true,
+      }),
+    ]);
+
+    const selectedRequirement = join(selectedDirectory, 'feature.md');
+    await writeFile(selectedRequirement, '# Feature\n\nBuild the selected-directory flow.\n', 'utf8');
+    const stableTime = new Date(Date.now() - 5_000);
+    await utimes(selectedRequirement, stableTime, stableTime);
+
+    const scan = await scanEvolutionInboxWatchers({
+      sessionName: 'deck_demo_brain',
+      projectRoot: root,
+      serverLink: serverLink as never,
+    });
+
+    expect(scan.scanned).toBe(1);
+    expect(scan.candidates).toBe(1);
+    const projection = await waitForProjection(
+      sent,
+      (candidate) => candidate.stage === 'tasks_ready' && candidate.source.fileName === 'feature.md',
+      10_000,
+    );
+    expect(projection.source.relativePath).toMatch(/^\.imcodes\/inbox\/requirements\/imported\//);
+    await expect(readFile(join(root, '.imc/evolution', projection.runId, 'input/feature.md'), 'utf8'))
+      .resolves.toContain('selected-directory flow');
+
+    stopAllEvolutionInboxWatchers();
+    syncEvolutionInboxWatchers(serverLink as never, [
+      { name: 'deck_demo_brain', projectName: 'demo', projectDir: root, state: 'running' },
+    ]);
+    await waitForWatcherDirectory(selectedDirectory);
   });
 });

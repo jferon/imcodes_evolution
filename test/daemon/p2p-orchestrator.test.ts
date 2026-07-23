@@ -554,6 +554,80 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(fakeRuntime.cancel).not.toHaveBeenCalled();
   });
 
+  it('fails a P2P hop immediately when its transport provider rejects the turn', async () => {
+    let providerRejected = false;
+    const providerError = {
+      code: 'PROVIDER_ERROR',
+      message: "The 'gpt-5.6' model is not supported when using Codex with a ChatGPT account.",
+      recoverable: false,
+      at: Date.now(),
+    };
+    const fakeRuntime = {
+      send: vi.fn(() => {
+        providerRejected = true;
+        providerError.at = Date.now();
+        return 'sent';
+      }),
+      pendingCount: 0,
+      pendingVersion: 3,
+      pendingMessages: [],
+      pendingEntries: [],
+      drainPendingIfIdle: vi.fn().mockReturnValue(false),
+      getDiagnosticSnapshot: vi.fn(() => providerRejected
+        ? {
+            status: 'error',
+            sending: false,
+            pendingCount: 0,
+            pendingVersion: 3,
+            activeDispatchCount: 0,
+            stalePendingRecoveryActive: false,
+            providerSessionBound: true,
+            lastActivityAt: Date.now(),
+            lastActivityAgeMs: 0,
+            lastProviderError: providerError,
+          }
+        : {
+            status: 'idle',
+            sending: false,
+            pendingCount: 0,
+            pendingVersion: 3,
+            activeDispatchCount: 0,
+            stalePendingRecoveryActive: false,
+            providerSessionBound: true,
+            lastActivityAt: Date.now(),
+            lastActivityAgeMs: 0,
+          }),
+      cancelStaleActiveTurnWithPending: vi.fn().mockReturnValue(false),
+      cancel: vi.fn().mockResolvedValue(undefined),
+    };
+    vi.mocked(getTransportRuntime).mockImplementation((session: string) =>
+      session === 'deck_proj_w1' ? fakeRuntime as any : undefined,
+    );
+
+    const startedAt = Date.now();
+    const run = await startP2pRun(
+      'deck_proj_brain',
+      [{ session: 'deck_proj_w1', mode: 'audit' }],
+      'provider rejection should fail fast',
+      [],
+      serverLinkMock as any,
+      1,
+      undefined,
+      undefined,
+      1_000,
+    );
+
+    const done = await waitForStatus(run.id, ['completed'], 700);
+    expect(Date.now() - startedAt).toBeLessThan(700);
+    expect(done.hopStates).toEqual([
+      expect.objectContaining({
+        session: 'deck_proj_w1',
+        status: 'failed',
+        error: expect.stringContaining('gpt-5.6'),
+      }),
+    ]);
+  });
+
   it('drains a queued P2P prompt immediately when the transport runtime is already idle', async () => {
     const cancelStaleActiveTurnWithPending = vi.fn().mockReturnValue(false);
     const fakeRuntime = {

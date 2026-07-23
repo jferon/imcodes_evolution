@@ -69,6 +69,16 @@ export interface EvolutionScanInboxPayload {
   projectRoot?: string;
 }
 
+export interface EvolutionSetInboxDirectoryPayload {
+  type: typeof EVOLUTION_PIPELINE_MSG.SET_INBOX_DIRECTORY;
+  requestId: string;
+  serverId?: string;
+  sessionName: string;
+  projectRoot: string;
+  projectName?: string;
+  directoryPath: string;
+}
+
 export interface EvolutionImportReferencesPayload {
   type: typeof EVOLUTION_PIPELINE_MSG.IMPORT_REFERENCES;
   requestId: string;

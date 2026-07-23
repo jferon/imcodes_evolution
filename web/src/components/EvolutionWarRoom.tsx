@@ -576,7 +576,7 @@ export function EvolutionWarRoomPanel({
   const discussion = projection?.discussion ?? [];
   const executionTimeline = projection?.executionTimeline ?? [];
   const liveEvents = projection?.liveEvents ?? [];
-  const inboxPath = useMemo(() => displayInboxPath(projectRoot), [projectRoot]);
+  const defaultInboxPath = useMemo(() => displayInboxPath(projectRoot), [projectRoot]);
   const launchPathExample = useMemo(() => defaultLaunchSourcePath(projectRoot), [projectRoot]);
   useEffect(() => {
     setSourcePath((current) => {
@@ -594,6 +594,7 @@ export function EvolutionWarRoomPanel({
       && (!projectRoot || watcher.projectRoot === projectRoot)
     )) ?? null
   ), [projectRoot, sessionName, watchers]);
+  const inboxPath = activeWatcher?.inboxAbsolutePath ?? defaultInboxPath;
   const trigger = projection?.source.requestedBy
     ?? projection?.autoDelivery?.requestedBy
     ?? (projection?.requestId.startsWith('watcher-') ? 'watcher' : undefined);

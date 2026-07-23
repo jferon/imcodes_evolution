@@ -1,7 +1,8 @@
 import { mkdir, readdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import type { Dirent } from 'node:fs';
-import { join, relative } from 'node:path';
+import { extname, join, relative, resolve } from 'node:path';
 import {
+  EVOLUTION_REQUIREMENT_FILE_EXTENSIONS,
   EVOLUTION_REQUIREMENT_FILE_MAX_BYTES,
   EVOLUTION_REQUIREMENT_IMAGE_MAX_BYTES,
   EVOLUTION_REQUIREMENT_INBOX_DIR,
@@ -14,6 +15,7 @@ import {
 
 export interface EvolutionInboxCandidate {
   sourceRelativePath: string;
+  sourceAbsolutePath?: string;
   sizeBytes: number;
   mtimeMs: number;
 }
@@ -55,7 +57,15 @@ export interface ScanEvolutionInboxOptions {
   nowMs?: number;
   stableMs?: number;
   maxDepth?: number;
+  directoryPath?: string;
 }
+
+const CUSTOM_SCAN_EXCLUDED_DIRECTORIES = new Set([
+  '.git',
+  '.imc',
+  '.imcodes',
+  'node_modules',
+]);
 
 function fileByteLimit(relativePath: string): number {
   return isEvolutionRequirementImagePath(relativePath)
@@ -104,10 +114,52 @@ async function walkRequirementFiles(
   }
 }
 
-/**
- * Legacy flat scan — text documents only, per-file stability, no grouping.
- * Preserved for existing callers/tests; the poller uses the grouped scan.
- */
+/** Walk a user-selected external directory. External inputs stay text-only and
+ * are staged into the project inbox by the watch manager before launch. */
+async function walkRequirementDirectory(
+  directoryPath: string,
+  dirRelativePath: string,
+  depth: number,
+  maxDepth: number,
+  out: EvolutionInboxCandidate[],
+  nowMs: number,
+  stableMs: number,
+): Promise<void> {
+  if (depth > maxDepth) return;
+  const dirPath = dirRelativePath ? join(directoryPath, dirRelativePath) : directoryPath;
+  let entries: Dirent[];
+  try {
+    entries = await readdir(dirPath, { withFileTypes: true });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return;
+    throw err;
+  }
+
+  for (const entry of entries) {
+    const childRelativePath = dirRelativePath ? `${dirRelativePath}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      if (CUSTOM_SCAN_EXCLUDED_DIRECTORIES.has(entry.name)) continue;
+      await walkRequirementDirectory(directoryPath, childRelativePath, depth + 1, maxDepth, out, nowMs, stableMs);
+      continue;
+    }
+    if (!entry.isFile()) continue;
+    const extension = extname(entry.name).toLowerCase();
+    if (!(EVOLUTION_REQUIREMENT_FILE_EXTENSIONS as readonly string[]).includes(extension)) continue;
+    const fullPath = resolve(directoryPath, childRelativePath);
+    const fileStat = await stat(fullPath);
+    if (!fileStat.isFile()) continue;
+    if (fileStat.size > EVOLUTION_REQUIREMENT_FILE_MAX_BYTES) continue;
+    if (nowMs - fileStat.mtimeMs < stableMs) continue;
+    out.push({
+      sourceRelativePath: childRelativePath.split('\\').join('/'),
+      sourceAbsolutePath: fullPath,
+      sizeBytes: fileStat.size,
+      mtimeMs: fileStat.mtimeMs,
+    });
+  }
+}
+
 export async function scanEvolutionRequirementInbox(
   projectRoot: string,
   options: ScanEvolutionInboxOptions = {},
@@ -115,6 +167,11 @@ export async function scanEvolutionRequirementInbox(
   const nowMs = options.nowMs ?? Date.now();
   const stableMs = options.stableMs ?? 2_000;
   const maxDepth = options.maxDepth ?? 4;
+  if (options.directoryPath) {
+    const out: EvolutionInboxCandidate[] = [];
+    await walkRequirementDirectory(resolve(options.directoryPath), '', 0, maxDepth, out, nowMs, stableMs);
+    return out.sort((a, b) => a.sourceRelativePath.localeCompare(b.sourceRelativePath));
+  }
   const files: EvolutionInboxCandidateFile[] = [];
   await walkRequirementFiles(projectRoot, EVOLUTION_REQUIREMENT_INBOX_DIR, 0, maxDepth, files, false);
   return files
@@ -199,7 +256,7 @@ function fileIdentity(relativePath: string, sizeBytes: number, mtimeMs: number):
 }
 
 function candidateIdentity(candidate: EvolutionInboxCandidate): string {
-  return fileIdentity(candidate.sourceRelativePath, candidate.sizeBytes, candidate.mtimeMs);
+  return `${candidate.sourceAbsolutePath ?? candidate.sourceRelativePath}:${candidate.sizeBytes}:${candidate.mtimeMs}`;
 }
 
 async function readInboxLedger(projectRoot: string): Promise<EvolutionInboxLedger> {
@@ -281,8 +338,22 @@ export class EvolutionInboxPoller {
       // poller is live — e.g. the deliberate upload flow recording its own
       // brief/images so they are never treated as new passive drops.
       await this.mergePersistedSeen();
-      const { singles, groups } = await scanEvolutionRequirementInboxGrouped(this.options.projectRoot, this.options);
       const fresh: EvolutionInboxCandidate[] = [];
+
+      if (this.options.directoryPath) {
+        const candidates = await scanEvolutionRequirementInbox(this.options.projectRoot, this.options);
+        for (const candidate of candidates) {
+          const identity = candidateIdentity(candidate);
+          if (this.seen.has(identity)) continue;
+          this.seen.add(identity);
+          await this.persistSeenIfEnabled();
+          fresh.push(candidate);
+          await this.options.onCandidate(candidate);
+        }
+        return fresh;
+      }
+
+      const { singles, groups } = await scanEvolutionRequirementInboxGrouped(this.options.projectRoot, this.options);
 
       for (const file of singles) {
         if (file.kind === 'image') {

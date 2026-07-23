@@ -103,7 +103,11 @@ function shouldAutoRelaunchTransportRuntimeAfterError(
     && /already busy|session is busy|provider is busy/i.test(providerError.message);
 }
 
-function sanitizeCodexSdkStartupModel(value: string | null | undefined): string | undefined {
+function sanitizeCodexSdkStartupModel(
+  value: string | null | undefined,
+  availableModels: readonly string[] = [],
+  defaultModel?: string,
+): string | undefined {
   const trimmed = value?.trim();
   if (!trimmed) return undefined;
   const lower = trimmed.toLowerCase();
@@ -122,7 +126,18 @@ function sanitizeCodexSdkStartupModel(value: string | null | undefined): string 
     || lower.includes('_haiku')
     || lower.includes('claude-')
     || lower.includes('claude_');
-  return isClaudeModel ? DEFAULT_CODEX_SDK_STARTUP_MODEL : trimmed;
+  if (isClaudeModel) return DEFAULT_CODEX_SDK_STARTUP_MODEL;
+  if (availableModels.includes(trimmed)) return trimmed;
+
+  // Codex model families occasionally graduate from a bare id (for example
+  // `gpt-5.6`) to account-specific variants (`gpt-5.6-sol`, `-terra`, ...).
+  // Persisted sessions must not keep replaying the obsolete family id: the
+  // provider rejects it synchronously and P2P runs then appear frozen.
+  const familyVariants = availableModels.filter((model) => model.startsWith(`${trimmed}-`));
+  if (familyVariants.length === 0) return trimmed;
+  return defaultModel && familyVariants.includes(defaultModel)
+    ? defaultModel
+    : familyVariants[0];
 }
 
 /** Start JSONL watcher for a CC session — uses specific file if ccSessionId known, else directory scan. */
@@ -2013,6 +2028,9 @@ export async function restoreTransportSessions(
 ): Promise<void> {
   const all = storeSessions();
   const qwenRuntime = providerId === 'qwen' ? await getQwenRuntimeConfig().catch(() => null) : null;
+  const codexRuntime = providerId === 'codex-sdk'
+    ? await getCodexRuntimeConfig({ probe: false }).catch(() => null)
+    : null;
   const restoreConcurrency = Number.isFinite(options.concurrency) && (options.concurrency ?? 0) >= 1
     ? Math.trunc(options.concurrency!)
     : TRANSPORT_RESTORE_CONCURRENCY;
@@ -2057,7 +2075,13 @@ export async function restoreTransportSessions(
         : [];
       let requestedTransportModel = s.requestedModel ?? s.qwenModel;
       if (s.providerId === 'codex-sdk') {
-        requestedTransportModel = sanitizeCodexSdkStartupModel(requestedTransportModel);
+        requestedTransportModel = sanitizeCodexSdkStartupModel(
+          requestedTransportModel,
+          codexRuntime?.availableModels?.length
+            ? codexRuntime.availableModels
+            : (s.codexAvailableModels ?? []),
+          codexRuntime?.defaultModel,
+        );
       } else if (s.providerId === 'claude-code-sdk' && requestedTransportModel) {
         // Resolve the picker alias (e.g. "fable") to the documented API id before the
         // SDK sees it — symmetric with the model-change path (command-handler) and the
@@ -2495,10 +2519,15 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     if (!opts.fresh && transportResumeId) {
       effectiveSkipCreate = true;
     }
-    sdkDisplay = mergeCodexDisplayMetadata(
-      await getCodexRuntimeConfig({ probe: false }).catch(() => ({})),
-      existing,
+    const codexRuntime = await getCodexRuntimeConfig({ probe: false }).catch(() => null);
+    requestedTransportModel = sanitizeCodexSdkStartupModel(
+      requestedTransportModel,
+      codexRuntime?.availableModels?.length
+        ? codexRuntime.availableModels
+        : (existing?.codexAvailableModels ?? []),
+      codexRuntime?.defaultModel,
     );
+    sdkDisplay = mergeCodexDisplayMetadata(codexRuntime, existing);
   } else if (agentType === 'cursor-headless' || agentType === 'copilot-sdk' || agentType === 'kimi-sdk') {
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;

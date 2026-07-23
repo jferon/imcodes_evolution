@@ -20,6 +20,7 @@ import {
   type EvolutionRoundtableGateMode,
   type EvolutionRoleId,
   type EvolutionScanInboxPayload,
+  type EvolutionSetInboxDirectoryPayload,
   type EvolutionStatusPayload,
   type EvolutionStopPayload,
   type EvolutionUpdateRoleSkillPayload,
@@ -92,6 +93,7 @@ interface State {
   launchDemo: (options?: LaunchDemoOptions) => string | null;
   createReferenceBrief: (options: CreateReferenceBriefOptions) => string | null;
   scanInbox: () => string | null;
+  setInboxDirectory: (directoryPath: string, projectName?: string) => string | null;
   checkStaging: (runId?: string) => string | null;
   stop: (runId?: string) => string | null;
   continueRun: (runId?: string, message?: string) => string | null;
@@ -165,7 +167,11 @@ function isEvolutionReferenceBriefImportResult(value: unknown): value is Evoluti
 }
 
 function extractWatchers(msg: Record<string, unknown>): EvolutionInboxWatcherStatus[] | null {
-  if (msg.type !== EVOLUTION_PIPELINE_MSG.STATUS_PROJECTION && msg.type !== EVOLUTION_PIPELINE_MSG.SCAN_INBOX_ACK) return null;
+  if (
+    msg.type !== EVOLUTION_PIPELINE_MSG.STATUS_PROJECTION
+    && msg.type !== EVOLUTION_PIPELINE_MSG.SCAN_INBOX_ACK
+    && msg.type !== EVOLUTION_PIPELINE_MSG.SET_INBOX_DIRECTORY_ACK
+  ) return null;
   if (!Array.isArray(msg.watchers)) return [];
   return msg.watchers.filter(isEvolutionInboxWatcherStatus);
 }
@@ -314,6 +320,40 @@ export function useEvolutionPipeline({ ws, serverId, sessionName, projectRoot }:
       clearScanTimeout();
       setScanPending(false);
       setLastError('Evolution inbox scan timed out.');
+    }, EVOLUTION_SCAN_TIMEOUT_MS);
+    return requestId;
+  }, [clearScanTimeout, projectRoot, serverId, sessionName, ws]);
+
+  const setInboxDirectory = useCallback((directoryPath: string, projectName?: string) => {
+    const selectedDirectory = directoryPath.trim();
+    if (!ws || !sessionName || !projectRoot || !selectedDirectory) return null;
+    const requestId = makeRequestId('evolution-set-inbox-directory');
+    const payload: EvolutionSetInboxDirectoryPayload = {
+      type: EVOLUTION_PIPELINE_MSG.SET_INBOX_DIRECTORY,
+      requestId,
+      serverId,
+      sessionName,
+      projectRoot,
+      ...(projectName ? { projectName } : {}),
+      directoryPath: selectedDirectory,
+    };
+    clearScanTimeout();
+    activeScanRequestIdRef.current = requestId;
+    setScanPending(true);
+    setLastError(null);
+    try {
+      ws.send(payload);
+    } catch (error) {
+      clearScanTimeout();
+      setScanPending(false);
+      setLastError(error instanceof Error ? error.message : String(error));
+      return null;
+    }
+    scanTimeoutRef.current = setTimeout(() => {
+      if (activeScanRequestIdRef.current !== requestId) return;
+      clearScanTimeout();
+      setScanPending(false);
+      setLastError('Evolution inbox directory update timed out.');
     }, EVOLUTION_SCAN_TIMEOUT_MS);
     return requestId;
   }, [clearScanTimeout, projectRoot, serverId, sessionName, ws]);
@@ -661,7 +701,10 @@ export function useEvolutionPipeline({ ws, serverId, sessionName, projectRoot }:
       const nextWatchers = extractWatchers(raw);
       if (nextWatchers) {
         setWatchers(nextWatchers.filter((watcher) => watcherMatchesSession(watcher, sessionName)));
-        if (raw.type === EVOLUTION_PIPELINE_MSG.SCAN_INBOX_ACK) {
+        if (
+          raw.type === EVOLUTION_PIPELINE_MSG.SCAN_INBOX_ACK
+          || raw.type === EVOLUTION_PIPELINE_MSG.SET_INBOX_DIRECTORY_ACK
+        ) {
           clearScanTimeout();
           setScanPending(false);
         }
@@ -759,6 +802,7 @@ export function useEvolutionPipeline({ ws, serverId, sessionName, projectRoot }:
     launchDemo,
     createReferenceBrief,
     scanInbox,
+    setInboxDirectory,
     checkStaging,
     stop,
     continueRun,
@@ -767,5 +811,5 @@ export function useEvolutionPipeline({ ws, serverId, sessionName, projectRoot }:
     approveRoleSkillCandidate,
     requestStatus,
     clearError: () => setLastError(null),
-  }), [approveRoleSkillCandidate, checkStaging, continuePending, continueRun, createReferenceBrief, lastError, lastReferenceBrief, launch, launchDemo, launchPending, projection, referenceBriefPending, requestStatus, scanInbox, scanPending, sendUserMessage, skillUpdatePending, stagingCheckPending, stop, stopPending, updateRoleSkill, watchers]);
+  }), [approveRoleSkillCandidate, checkStaging, continuePending, continueRun, createReferenceBrief, lastError, lastReferenceBrief, launch, launchDemo, launchPending, projection, referenceBriefPending, requestStatus, scanInbox, scanPending, sendUserMessage, setInboxDirectory, skillUpdatePending, stagingCheckPending, stop, stopPending, updateRoleSkill, watchers]);
 }

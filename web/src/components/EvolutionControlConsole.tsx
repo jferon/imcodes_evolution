@@ -1,5 +1,8 @@
-import { useMemo, useState } from 'preact/hooks';
+import { useEffect, useMemo, useState } from 'preact/hooks';
+import { useTranslation } from 'react-i18next';
 import { EVOLUTION_REQUIREMENT_INBOX_DIR } from '@shared/evolution-pipeline-constants.js';
+import type { WsClient } from '../ws-client.js';
+import { FileBrowser } from './file-browser-lazy.js';
 import {
   EVOLUTION_ROLE_IDS,
   EVOLUTION_STAGES,
@@ -11,6 +14,7 @@ import {
 } from '../evolution-pipeline.js';
 
 interface Props {
+  ws?: WsClient | null;
   projection: EvolutionProjection | null;
   watchers?: EvolutionInboxWatcherStatus[];
   sessionName?: string | null;
@@ -22,6 +26,7 @@ interface Props {
   onOpenWarRoom: () => void;
   onLaunchDemo: () => void;
   onScanInbox: () => void;
+  onSetInboxDirectory: (directoryPath: string) => string | null | void;
   onSendUserMessage: (text: string, roleId?: EvolutionRoleId) => string | null;
   onRefresh: () => void;
   onNewSubSession: () => void;
@@ -96,6 +101,11 @@ function displayInboxPath(projectRoot: string | null | undefined): string {
   return `${projectRoot.replace(/\/+$/, '')}/${EVOLUTION_REQUIREMENT_INBOX_DIR}`;
 }
 
+function sameDirectoryPath(left: string, right: string): boolean {
+  const normalize = (value: string) => value.replace(/\\/g, '/').replace(/\/+$/, '');
+  return normalize(left) === normalize(right);
+}
+
 function formatTime(ms: number | undefined): string {
   if (!ms) return '—';
   try { return new Date(ms).toLocaleString(); } catch { return String(ms); }
@@ -115,6 +125,7 @@ function artifactKindLabel(kind: string): string {
 }
 
 export function EvolutionControlConsole({
+  ws,
   projection,
   watchers = [],
   sessionName,
@@ -126,6 +137,7 @@ export function EvolutionControlConsole({
   onOpenWarRoom,
   onLaunchDemo,
   onScanInbox,
+  onSetInboxDirectory,
   onSendUserMessage,
   onRefresh,
   onNewSubSession,
@@ -136,9 +148,11 @@ export function EvolutionControlConsole({
   robotSessionCount = 0,
   runningDiscussionCount = 0,
 }: Props) {
+  const { t } = useTranslation();
   const [message, setMessage] = useState('');
   const [targetRole, setTargetRole] = useState<'all' | EvolutionRoleId>('all');
-  const inboxPath = displayInboxPath(projectRoot);
+  const [showDirectoryBrowser, setShowDirectoryBrowser] = useState(false);
+  const [selectedInboxPath, setSelectedInboxPath] = useState<string | null>(null);
   const active = isEvolutionActiveProjection(projection);
   const currentStageIndex = stageIndex(projection?.stage);
   const activeWatcher = useMemo(() => (
@@ -148,6 +162,28 @@ export function EvolutionControlConsole({
       && (!projectRoot || watcher.projectRoot === projectRoot)
     )) ?? null
   ), [projectRoot, sessionName, watchers]);
+  const inboxPath = selectedInboxPath ?? activeWatcher?.inboxAbsolutePath ?? displayInboxPath(projectRoot);
+  useEffect(() => {
+    setSelectedInboxPath(null);
+  }, [projectRoot, sessionName]);
+  useEffect(() => {
+    if (
+      selectedInboxPath
+      && activeWatcher
+      && sameDirectoryPath(selectedInboxPath, activeWatcher.inboxAbsolutePath)
+    ) {
+      setSelectedInboxPath(null);
+    }
+  }, [activeWatcher, selectedInboxPath]);
+  useEffect(() => {
+    if (lastError) setSelectedInboxPath(null);
+  }, [lastError]);
+  const applyInboxDirectory = (path: string) => {
+    const requestId = onSetInboxDirectory(path);
+    if (requestId === null) return;
+    setSelectedInboxPath(path);
+    setShowDirectoryBrowser(false);
+  };
   const roles = useMemo(() => (
     projection?.roles?.length
       ? projection.roles.map((role) => ({
@@ -235,13 +271,41 @@ export function EvolutionControlConsole({
             <h2>需求入口</h2>
             <p>支持 .md / .txt / .json。文件稳定约 2 秒后会自动触发自我进化。</p>
           </div>
-          <code>{inboxPath}</code>
+          <button
+            type="button"
+            class="evolution-control-inbox-path-picker"
+            aria-label={t('file_browser.title_dir')}
+            title={t('file_browser.title_dir')}
+            disabled={!ws || !projectRoot || !sessionName || scanPending}
+            onClick={() => setShowDirectoryBrowser(true)}
+          >
+            <code>{inboxPath}</code>
+            <span>{scanPending ? '…' : t('file_browser.browse')}</span>
+          </button>
           <div class="evolution-control-card-footer">
             <span class={activeWatcher ? 'ok' : 'muted'}>Watcher：{activeWatcher ? 'active' : 'inactive'}</span>
             {activeWatcher && <span>扫描：{Math.round(activeWatcher.intervalMs / 1000)}s</span>}
             {activeWatcher && <span>启动：{formatTime(activeWatcher.startedAt)}</span>}
           </div>
         </section>
+
+        {showDirectoryBrowser && ws && (
+          <FileBrowser
+            ws={ws}
+            mode="dir-only"
+            layout="modal"
+            initialPath={projectRoot || '~'}
+            onConfirm={(paths) => {
+              const selectedPath = paths[0];
+              if (!selectedPath) return;
+              applyInboxDirectory(selectedPath);
+            }}
+            onDirectoryCreated={(path) => {
+              applyInboxDirectory(path);
+            }}
+            onClose={() => setShowDirectoryBrowser(false)}
+          />
+        )}
 
         <section class="evolution-control-card evolution-control-workbench-card">
           <div>
