@@ -2305,7 +2305,8 @@ describe('evolution orchestrator', () => {
       nowMs: 16_520,
     });
     expect(blocked[0]?.stage).toBe('needs_human');
-    expect(blocked[0]?.roundtables.find((entry) => entry.id === 'product-review')?.summary)
+    // The first governed roundtable at intake_normalized is now the Product Maker.
+    expect(blocked[0]?.roundtables.find((entry) => entry.id === 'product-maker')?.summary)
       .not.toContain('EVOLUTION_VERDICT');
     expect(blocked[0]?.attempts?.find((entry) => entry.p2pRunId === 'p2p_governed_receipt')?.status)
       .toBe('blocked');

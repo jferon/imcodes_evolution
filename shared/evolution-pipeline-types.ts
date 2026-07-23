@@ -76,6 +76,22 @@ export interface EvolutionLaunchRequest {
   requireHifiHumanApproval?: boolean;
 }
 
+/**
+ * Versioned per-project policy for unattended (watcher/API) launches. Every
+ * field is optional — an absent field keeps the safe default. The policy can
+ * relax OR pre-authorize behavior explicitly, but never silently: the run
+ * records which values came from policy.
+ */
+export interface EvolutionProjectPolicy {
+  version: 1;
+  executionPolicy?: EvolutionExecutionPolicy;
+  roundtableGateMode?: EvolutionRoundtableGateMode;
+  developmentMode?: EvolutionDevelopmentMode;
+  developmentTargetRelativeDir?: string;
+  autoStartImplementation?: boolean;
+  requireHifiHumanApproval?: boolean;
+}
+
 export interface EvolutionSourceDocument {
   relativePath: string;
   fileName: string;

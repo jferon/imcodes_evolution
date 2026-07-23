@@ -79,6 +79,19 @@ export const EVOLUTION_VISUAL_FIDELITY_ROUNDTABLE_ID = 'visual-fidelity-review' 
  * a role label" as the source of high-fidelity design artifacts.
  */
 export const EVOLUTION_DESIGN_MAKER_ROUNDTABLE_ID = 'design-maker' as const;
+/**
+ * Roundtable spec id for the real Product Maker attempt at intake_normalized:
+ * a governed-mode agent turn that authors the PRD (goals, user stories,
+ * acceptance criteria) instead of the deterministic template.
+ */
+export const EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID = 'product-maker' as const;
+/**
+ * Versioned per-project policy consumed by unattended (watcher/API) launches.
+ * Without a policy file, watcher launches keep the safe defaults: governed
+ * execution, strict gates, hifi human approval, fail-closed helpers.
+ */
+export const EVOLUTION_PROJECT_POLICY_RELATIVE_PATH = '.imc/evolution/policy.json' as const;
+export const EVOLUTION_PROJECT_POLICY_VERSION = 1 as const;
 export const EVOLUTION_SCORE_MAX = 10 as const;
 
 export const EVOLUTION_STAGES = [

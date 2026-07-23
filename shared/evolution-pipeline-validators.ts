@@ -15,6 +15,7 @@ import {
   EVOLUTION_DEVELOPMENT_MODES,
   EVOLUTION_EXECUTION_POLICIES,
   EVOLUTION_GREENFIELD_TOPOLOGIES,
+  EVOLUTION_PROJECT_POLICY_VERSION,
   EVOLUTION_ATTEMPT_KINDS,
   EVOLUTION_ATTEMPT_STATUSES,
   EVOLUTION_GATE_ACTIONS,
@@ -59,6 +60,7 @@ import type {
   EvolutionArtifactRef,
   EvolutionArtifactPreview,
   EvolutionAutoDeliveryPolicy,
+  EvolutionProjectPolicy,
   EvolutionBlockingQuestion,
   EvolutionDiscussionMessage,
   EvolutionEvidence,
@@ -1204,6 +1206,51 @@ export function validateEvolutionProjection(input: unknown): EvolutionValidation
       ...(typeof input.terminalReason === 'string' ? { terminalReason: input.terminalReason } : {}),
       elapsedMs: input.elapsedMs as number,
       updatedAt: input.updatedAt as number,
+    },
+    issues: [],
+  };
+}
+
+export function validateEvolutionProjectPolicy(value: unknown): EvolutionValidationResult<EvolutionProjectPolicy> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return { ok: false, issues: [issue('invalid_project_policy', 'Project policy must be a JSON object.')] };
+  }
+  const input = value as Record<string, unknown>;
+  const issues: EvolutionValidationIssue[] = [];
+  if (input.version !== EVOLUTION_PROJECT_POLICY_VERSION) {
+    issues.push(issue('unsupported_project_policy_version', `Project policy version must be ${EVOLUTION_PROJECT_POLICY_VERSION}.`, 'version'));
+  }
+  if (input.executionPolicy !== undefined && !isOneOf(input.executionPolicy, EVOLUTION_EXECUTION_POLICIES)) {
+    issues.push(issue('invalid_execution_policy', 'executionPolicy is not canonical.', 'executionPolicy'));
+  }
+  if (input.roundtableGateMode !== undefined && !isOneOf(input.roundtableGateMode, EVOLUTION_ROUNDTABLE_GATE_MODES)) {
+    issues.push(issue('invalid_roundtable_gate_mode', 'roundtableGateMode is not canonical.', 'roundtableGateMode'));
+  }
+  if (input.developmentMode !== undefined && !isOneOf(input.developmentMode, EVOLUTION_DEVELOPMENT_MODES)) {
+    issues.push(issue('invalid_development_mode', 'developmentMode is not canonical.', 'developmentMode'));
+  }
+  if (input.developmentTargetRelativeDir !== undefined) {
+    if (typeof input.developmentTargetRelativeDir !== 'string' || !isEvolutionSafeRelativePath(input.developmentTargetRelativeDir)) {
+      issues.push(issue('invalid_development_target', 'developmentTargetRelativeDir must be a safe project-relative path.', 'developmentTargetRelativeDir'));
+    }
+  }
+  if (input.autoStartImplementation !== undefined && typeof input.autoStartImplementation !== 'boolean') {
+    issues.push(issue('invalid_auto_start_implementation', 'autoStartImplementation must be a boolean.', 'autoStartImplementation'));
+  }
+  if (input.requireHifiHumanApproval !== undefined && typeof input.requireHifiHumanApproval !== 'boolean') {
+    issues.push(issue('invalid_require_hifi_human_approval', 'requireHifiHumanApproval must be a boolean.', 'requireHifiHumanApproval'));
+  }
+  if (issues.length > 0) return { ok: false, issues };
+  return {
+    ok: true,
+    value: {
+      version: EVOLUTION_PROJECT_POLICY_VERSION,
+      ...(input.executionPolicy !== undefined ? { executionPolicy: input.executionPolicy as EvolutionProjectPolicy['executionPolicy'] } : {}),
+      ...(input.roundtableGateMode !== undefined ? { roundtableGateMode: input.roundtableGateMode as EvolutionProjectPolicy['roundtableGateMode'] } : {}),
+      ...(input.developmentMode !== undefined ? { developmentMode: input.developmentMode as EvolutionProjectPolicy['developmentMode'] } : {}),
+      ...(input.developmentTargetRelativeDir !== undefined ? { developmentTargetRelativeDir: input.developmentTargetRelativeDir as string } : {}),
+      ...(input.autoStartImplementation !== undefined ? { autoStartImplementation: input.autoStartImplementation as boolean } : {}),
+      ...(input.requireHifiHumanApproval !== undefined ? { requireHifiHumanApproval: input.requireHifiHumanApproval as boolean } : {}),
     },
     issues: [],
   };

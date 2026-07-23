@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   EVOLUTION_DESIGN_MAKER_ROUNDTABLE_ID,
+  EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID,
   EVOLUTION_REQUIREMENT_INBOX_DIR,
 } from '../../shared/evolution-pipeline-constants.js';
 import {
@@ -18,7 +19,10 @@ import {
   type UiSpecDocument,
 } from '../../shared/ui-spec.js';
 import { createEvolutionRunFromRequirement } from '../../src/daemon/evolution-artifact-store.js';
-import { registerDesignMakerOutputArtifacts } from '../../src/daemon/evolution-stage-runner.js';
+import {
+  PRODUCT_MAKER_PRD_RELATIVE_PATH,
+  registerDesignMakerOutputArtifacts,
+} from '../../src/daemon/evolution-stage-runner.js';
 import { runEvolutionUiScreenshots } from '../../src/daemon/evolution-design-runner.js';
 import {
   getEvolutionRun,
@@ -267,11 +271,38 @@ describe('Design Maker governed dispatch — end-to-end vertical slice', () => {
 
     await runEvolutionAutopilot(runId, null, { nowMs: 11_000 });
     // Complete every pre-design roundtable with PASS until the maker launches.
+    // Maker roundtables (e.g. the Product Maker at intake_normalized) require
+    // real output files for their PASS to survive promotion.
     for (let guard = 0; guard < 6; guard += 1) {
       const makerLaunch = captured.find((entry) => entry.roundtableSpecId === EVOLUTION_DESIGN_MAKER_ROUNDTABLE_ID);
       if (makerLaunch) break;
       const latest = captured[captured.length - 1];
       if (!latest) break;
+      if (latest.roundtableSpecId === EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID) {
+        await mkdir(join(runDir, 'artifacts'), { recursive: true });
+        await writeFile(join(runDir, PRODUCT_MAKER_PRD_RELATIVE_PATH), [
+          '# PRD：商品管理仪表盘',
+          '',
+          '## 业务目标',
+          '为运营团队提供订单与 GMV 的实时可视化，减少人工汇总时间 80%。',
+          '',
+          '## 目标用户',
+          '- 运营专员：日常查看订单状态与异常；运营主管：周期性复盘 GMV 趋势。',
+          '',
+          '## 范围 / 非目标',
+          '- 范围：订单列表、GMV 统计卡、状态筛选、CSV 导出。非目标：财务对账、退款流程。',
+          '',
+          '## 用户故事',
+          '- 作为运营专员，我可以按状态筛选订单，以便快速定位异常单。',
+          '- 作为运营主管，我可以查看近 30 天 GMV 趋势图，以便复盘运营策略效果。',
+          '',
+          '- 作为运营专员，我可以导出当前筛选结果为 CSV，以便离线分析与汇报。',
+          '',
+          '## 验收标准',
+          '- 订单列表首屏加载 < 2s；筛选结果与后端一致；GMV 统计与后端聚合一致。',
+          '- CSV 导出包含当前筛选条件下的全部行，编码 UTF-8 带 BOM。',
+        ].join('\n'), 'utf8');
+      }
       await completeRoundtable(latest.p2pRunId, `PASS: ok\n<!-- EVOLUTION_VERDICT: PASS -->`, 12_000 + guard * 500);
     }
     const makerLaunch = captured.find((entry) => entry.roundtableSpecId === EVOLUTION_DESIGN_MAKER_ROUNDTABLE_ID);
@@ -286,12 +317,12 @@ describe('Design Maker governed dispatch — end-to-end vertical slice', () => {
     await completeRoundtable(makerLaunch.p2pRunId, `PASS: 已完成设计\n<!-- EVOLUTION_VERDICT: PASS -->`, 15_000);
     const run = getEvolutionRun(runId);
     expect(run?.value?.artifacts.some((artifact) => artifact.kind === 'ui_spec')).toBe(false);
-    const makerAttempt = run?.value?.attempts?.find((attempt) => attempt.kind === 'maker');
+    const makerAttempt = run?.value?.attempts?.find((attempt) => attempt.kind === 'maker' && attempt.stage === 'design_lofi');
     expect(makerAttempt?.status).toBe('rework');
     // The fabricated PASS never cleared the gate: the run is blocked, not advanced.
     expect(run?.value?.stage).toBe('needs_human');
     const makerRoundtable = run?.value?.roundtables?.find((entry) => entry.id === EVOLUTION_DESIGN_MAKER_ROUNDTABLE_ID);
-    expect(makerRoundtable?.summary).toContain('REWORK: design maker outputs failed promotion');
+    expect(makerRoundtable?.summary).toContain('REWORK: maker outputs failed promotion');
     expect(makerRoundtable?.summary).not.toMatch(/<!--\s*EVOLUTION_VERDICT:\s*PASS\s*-->/i);
     // (b) The happy path — schema-valid files promoting as agent_attested —
     // is covered by the direct promotion unit tests above; re-completing a

@@ -223,7 +223,8 @@ describe('A1 — requirement classification gate (watcher-triggered runs only)',
     expect(run?.value?.roundtableGateMode).toBe('strict');
     expect(run?.value?.requireHifiHumanApproval).toBe(true);
     expect(run?.value?.roundtables).toContainEqual(expect.objectContaining({
-      id: 'product-review',
+      // The first governed roundtable at intake_normalized is the Product Maker.
+      id: 'product-maker',
       status: 'failed',
       error: 'roundtable_launcher_unavailable',
     }));

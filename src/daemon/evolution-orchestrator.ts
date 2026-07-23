@@ -12,6 +12,8 @@ import {
   EVOLUTION_GREENFIELD_TOPOLOGIES,
   EVOLUTION_PIPELINE_MSG,
   EVOLUTION_DESIGN_MAKER_ROUNDTABLE_ID,
+  EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID,
+  EVOLUTION_PROJECT_POLICY_RELATIVE_PATH,
   EVOLUTION_VISUAL_FIDELITY_ROUNDTABLE_ID,
   type EvolutionAttemptKind,
   EVOLUTION_REQUIREMENT_INBOX_DIR,
@@ -45,6 +47,7 @@ import type {
   EvolutionLoopControlSignal,
   EvolutionLoopControlSignalStatus,
   EvolutionProjection,
+  EvolutionProjectPolicy,
   EvolutionReferenceAttachmentInput,
   EvolutionReferenceBriefImportResult,
   EvolutionRun,
@@ -56,6 +59,7 @@ import type { OpenSpecAutoDeliverProjection } from '../../shared/openspec-auto-d
 import type { P2pRunUpdatePayload, P2pRunStatus } from '../../shared/p2p-status.js';
 import {
   validateEvolutionLaunchRequest,
+  validateEvolutionProjectPolicy,
   validateEvolutionRunId,
   validateEvolutionStageTransition,
 } from '../../shared/evolution-pipeline-validators.js';
@@ -73,7 +77,11 @@ import { checkEvolutionStagingDeliveryConfig, runEvolutionStagingDelivery } from
 import { runEvolutionTasteHifiGeneration } from './evolution-design-runner.js';
 import {
   EvolutionPlanningPausedError,
+  PRODUCT_MAKER_ACCEPTANCE_RELATIVE_PATH,
+  PRODUCT_MAKER_PRD_RELATIVE_PATH,
+  PRODUCT_MAKER_USER_STORIES_RELATIVE_PATH,
   registerDesignMakerOutputArtifacts,
+  registerProductMakerOutputArtifacts,
   registerVisualReportArtifact,
   runEvolutionPlanningStages,
 } from './evolution-stage-runner.js';
@@ -2011,6 +2019,22 @@ export async function importEvolutionReferenceBrief(
   });
 }
 
+/**
+ * Read the versioned per-project policy for unattended launches. Absent or
+ * invalid policy → null, and watcher launches keep the safe defaults
+ * (governed + strict + hifi human approval + fail-closed). A policy can only
+ * relax behavior by being explicitly present and valid — never by accident.
+ */
+export async function readEvolutionProjectPolicy(projectRoot: string): Promise<EvolutionProjectPolicy | null> {
+  try {
+    const raw = await readFile(safeProjectRelativePath(safeProjectRoot(projectRoot), EVOLUTION_PROJECT_POLICY_RELATIVE_PATH), 'utf8');
+    const validated = validateEvolutionProjectPolicy(JSON.parse(raw));
+    return validated.ok ? validated.value : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function launchEvolutionRunFromInboxCandidate(options: {
   projectRoot: string;
   sessionName: string;
@@ -2021,6 +2045,7 @@ export async function launchEvolutionRunFromInboxCandidate(options: {
   nowMs?: number;
 }): Promise<EvolutionOrchestratorResult<EvolutionProjection>> {
   const nowMs = options.nowMs ?? Date.now();
+  const policy = await readEvolutionProjectPolicy(options.projectRoot);
   return launchEvolutionRun({
     projectRoot: options.projectRoot,
     nowMs,
@@ -2031,12 +2056,14 @@ export async function launchEvolutionRunFromInboxCandidate(options: {
       sourceRelativePath: options.candidate.sourceRelativePath,
       sourceSizeBytes: options.candidate.sizeBytes,
       requestedBy: 'watcher',
-      executionPolicy: 'governed',
+      executionPolicy: policy?.executionPolicy ?? 'governed',
       autoStart: true,
-      autoStartImplementation: options.autoStartImplementation ?? true,
+      autoStartImplementation: options.autoStartImplementation ?? policy?.autoStartImplementation ?? true,
       autoDeliverPresetId: 'standard',
-      roundtableGateMode: 'strict',
-      requireHifiHumanApproval: true,
+      roundtableGateMode: policy?.roundtableGateMode ?? 'strict',
+      requireHifiHumanApproval: policy?.requireHifiHumanApproval ?? true,
+      ...(policy?.developmentMode ? { developmentMode: policy.developmentMode } : {}),
+      ...(policy?.developmentTargetRelativeDir ? { developmentTargetRelativeDir: policy.developmentTargetRelativeDir } : {}),
     },
   });
 }
@@ -2138,6 +2165,7 @@ export async function launchEvolutionRunFromInboxCandidateGroup(options: {
   await recordEvolutionInboxSeenFiles(projectRoot, [briefRelativePath]);
 
   const briefStat = await stat(briefPath);
+  const policy = await readEvolutionProjectPolicy(projectRoot);
   return launchEvolutionRun({
     projectRoot,
     nowMs,
@@ -2148,12 +2176,14 @@ export async function launchEvolutionRunFromInboxCandidateGroup(options: {
       sourceRelativePath: briefRelativePath,
       sourceSizeBytes: briefStat.size,
       requestedBy: 'watcher',
-      executionPolicy: 'governed',
+      executionPolicy: policy?.executionPolicy ?? 'governed',
       autoStart: true,
-      autoStartImplementation: options.autoStartImplementation ?? true,
+      autoStartImplementation: options.autoStartImplementation ?? policy?.autoStartImplementation ?? true,
       autoDeliverPresetId: 'standard',
-      roundtableGateMode: 'strict',
-      requireHifiHumanApproval: true,
+      roundtableGateMode: policy?.roundtableGateMode ?? 'strict',
+      requireHifiHumanApproval: policy?.requireHifiHumanApproval ?? true,
+      ...(policy?.developmentMode ? { developmentMode: policy.developmentMode } : {}),
+      ...(policy?.developmentTargetRelativeDir ? { developmentTargetRelativeDir: policy.developmentTargetRelativeDir } : {}),
     },
   });
 }
@@ -4445,8 +4475,17 @@ async function finalizeRoundtableAttemptOutputs(
   let effectiveSummary = summary;
   const outputRevisionIds: string[] = [];
 
-  if (roundtable.id === EVOLUTION_DESIGN_MAKER_ROUNDTABLE_ID && machineVerdict === 'pass') {
-    const promotion = await registerDesignMakerOutputArtifacts({
+  const isMakerRoundtable = roundtable.id === EVOLUTION_DESIGN_MAKER_ROUNDTABLE_ID
+    || roundtable.id === EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID;
+  if (isMakerRoundtable && machineVerdict === 'pass') {
+    const promotion = roundtable.id === EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID
+      ? await registerProductMakerOutputArtifacts({
+          projectRoot: entry.projectRoot,
+          run,
+          producerAttemptId: attemptId,
+          nowMs,
+        })
+      : await registerDesignMakerOutputArtifacts({
       projectRoot: entry.projectRoot,
       run,
       producerAttemptId: attemptId,
@@ -4454,19 +4493,23 @@ async function finalizeRoundtableAttemptOutputs(
     });
     if (promotion.ok) {
       outputRevisionIds.push(...promotion.revisionIds);
+      const makerLabel = roundtable.id === EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID ? 'Product Maker' : 'Design Maker';
+      const makerRoleId = roundtable.id === EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID ? 'product_manager' as const : 'visual_designer' as const;
       appendEvidence(run, {
-        source: 'design_maker_promotion',
-        summary: `Design maker outputs promoted (${promotion.revisionIds.length} revision(s)): ${UI_SPEC_RELATIVE_PATH}, ${UI_PREVIEW_HTML_RELATIVE_PATH}.`,
+        source: 'maker_promotion',
+        summary: `${makerLabel} outputs promoted (${promotion.revisionIds.length} revision(s)).`,
         createdAt: nowMs,
       });
       appendLiveEvent(run, {
         source: 'p2p_roundtable',
         kind: 'artifact',
         severity: 'success',
-        roleId: 'visual_designer',
+        roleId: makerRoleId,
         stage: roundtable.stage,
-        title: 'Design Maker · outputs promoted',
-        detail: `ui-spec + preview promoted as agent_attested candidates (${promotion.uiSpec?.screens.length ?? 0} screen(s)).`,
+        title: `${makerLabel} · outputs promoted`,
+        detail: roundtable.id === EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID
+          ? `agent-authored PRD promoted as agent_attested candidate (${promotion.revisionIds.length} revision(s)).`
+          : `ui-spec + preview promoted as agent_attested candidates (${promotion.uiSpec?.screens.length ?? 0} screen(s)).`,
         createdAt: nowMs,
       });
     } else {
@@ -4474,10 +4517,10 @@ async function finalizeRoundtableAttemptOutputs(
       // Rewrite the machine marker too — downstream gate decisions parse the
       // tail marker, so prepended prose alone would leave a live PASS claim.
       const neutralized = summary.replace(/<!--\s*EVOLUTION_VERDICT:\s*PASS\s*-->/gi, '<!-- EVOLUTION_VERDICT: REWORK -->');
-      effectiveSummary = `REWORK: design maker outputs failed promotion — ${promotion.reason ?? 'unknown'}\n${neutralized}`;
+      effectiveSummary = `REWORK: maker outputs failed promotion — ${promotion.reason ?? 'unknown'}\n${neutralized}`;
       appendEvidence(run, {
-        source: 'design_maker_promotion',
-        summary: `Design maker PASS claim rejected: ${promotion.reason ?? 'unknown'}.`,
+        source: 'maker_promotion',
+        summary: `Maker PASS claim rejected: ${promotion.reason ?? 'unknown'}.`,
         createdAt: nowMs,
       });
     }
@@ -4991,6 +5034,34 @@ function renderVisualFidelityRoundtablePrompt(run: EvolutionRun): string {
   ].join('\n');
 }
 
+function renderProductMakerPrompt(run: EvolutionRun): string {
+  const runDirRelative = `${EVOLUTION_RUN_ROOT_DIR}/${run.runId}`;
+  const referenceImagePaths = run.artifacts
+    .filter((artifact) => artifact.kind === 'design_reference_image')
+    .map((artifact) => `${runDirRelative}/${artifact.path}`);
+  const normalizedPath = run.artifacts.find((artifact) => artifact.kind === 'normalized_requirement')?.path;
+  return [
+    `你是本次自我进化 run ${run.runId} 的产品经理 Maker。你的任务不是讨论，而是真实撰写可交付的 PRD 文档。`,
+    '',
+    '## 第一步：真实阅读输入',
+    `- 原始需求：\`${run.source.relativePath}\`（用 Read 工具打开）`,
+    ...(normalizedPath ? [`- 标准化需求：\`${runDirRelative}/${normalizedPath}\``] : []),
+    ...(referenceImagePaths.length > 0
+      ? ['- 参考图（必须逐张用 Read 工具真实查看）：', ...referenceImagePaths.map((path) => `  - ${path}`)]
+      : []),
+    '',
+    '## 第二步：写出以下文件（路径相对项目根目录）',
+    `1. \`${runDirRelative}/${PRODUCT_MAKER_PRD_RELATIVE_PATH}\`（必需）— 完整 PRD：业务目标、目标用户与分层、范围/非目标、用户故事、可度量的成功指标、显式假设与开放问题、验收标准。必须基于真实输入，不得输出通用模板。`,
+    `2. \`${runDirRelative}/${PRODUCT_MAKER_USER_STORIES_RELATIVE_PATH}\`（可选）— 展开的用户故事清单。`,
+    `3. \`${runDirRelative}/${PRODUCT_MAKER_ACCEPTANCE_RELATIVE_PATH}\`（可选）— 可测试的验收标准清单。`,
+    '',
+    '## 输出要求',
+    '完成写入后，最后一条消息列出写入的文件与关键产品决策/假设，并以下面一行结束：',
+    '<!-- EVOLUTION_VERDICT: PASS -->',
+    '如因输入缺失无法完成，说明缺什么并以 <!-- EVOLUTION_VERDICT: BLOCKED --> 结束；绝不允许在未写文件的情况下输出 PASS。',
+  ].join('\n');
+}
+
 function renderDesignMakerPrompt(run: EvolutionRun): string {
   const runDirRelative = `${EVOLUTION_RUN_ROOT_DIR}/${run.runId}`;
   const referenceImagePaths = run.artifacts
@@ -5029,6 +5100,17 @@ function renderDesignMakerPrompt(run: EvolutionRun): string {
 }
 
 const EVOLUTION_ROUNDTABLE_SPECS: EvolutionRoundtableSpec[] = [
+  {
+    id: EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID,
+    stage: 'intake_normalized',
+    topic: '产品 PRD Maker',
+    roles: ['product_manager'],
+    artifactKinds: ['normalized_requirement', 'requirement_classification', 'design_reference_manifest', 'role_skill'],
+    prompt: renderProductMakerPrompt,
+    alwaysGate: true,
+    attemptKind: 'maker',
+    shouldRun: (run) => (run.executionPolicy ?? 'draft_preview') === 'governed',
+  },
   {
     id: 'product-review',
     stage: 'product_discussion',

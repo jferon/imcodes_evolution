@@ -117,7 +117,8 @@ describe('evolution inbox watch manager', () => {
     expect(projection.roundtableGateMode).toBe('strict');
     expect(projection.requireHifiHumanApproval).toBe(true);
     expect(projection.roundtables).toContainEqual(expect.objectContaining({
-      id: 'product-review',
+      // The first governed roundtable at intake_normalized is the Product Maker.
+      id: 'product-maker',
       status: 'failed',
       error: 'roundtable_launcher_unavailable',
     }));

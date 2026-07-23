@@ -1003,6 +1003,69 @@ export async function registerDesignMakerOutputArtifacts(options: {
   return { ok: true, uiSpec: validated.value, revisionIds };
 }
 
+export const PRODUCT_MAKER_PRD_RELATIVE_PATH = 'artifacts/prd.md' as const;
+export const PRODUCT_MAKER_USER_STORIES_RELATIVE_PATH = 'artifacts/user-stories.md' as const;
+export const PRODUCT_MAKER_ACCEPTANCE_RELATIVE_PATH = 'artifacts/acceptance-criteria.md' as const;
+const PRODUCT_MAKER_PRD_MIN_CHARS = 300;
+
+/**
+ * UI Evolution Engine — validate and promote the Product Maker attempt's
+ * outputs. The maker agent authors `artifacts/prd.md` (required — a real
+ * PRD, not the deterministic template) plus optional user-stories and
+ * acceptance-criteria documents. Promotion registers them as
+ * `agent_attested` candidates bound to the producer attempt; a PASS claim
+ * without a substantive PRD fails promotion.
+ */
+export async function registerProductMakerOutputArtifacts(options: {
+  projectRoot: string;
+  run: EvolutionRun;
+  producerAttemptId?: string;
+  nowMs: number;
+}): Promise<DesignMakerPromotionResult> {
+  const paths = getEvolutionRunPaths(options.projectRoot, options.run.runId);
+  let prd: string;
+  try {
+    prd = await readFile(safeJoin(paths.runDir, PRODUCT_MAKER_PRD_RELATIVE_PATH), 'utf8');
+  } catch {
+    return { ok: false, reason: `missing required output: ${PRODUCT_MAKER_PRD_RELATIVE_PATH}`, revisionIds: [] };
+  }
+  const trimmed = prd.trim();
+  if (trimmed.length < PRODUCT_MAKER_PRD_MIN_CHARS || !trimmed.startsWith('#')) {
+    return { ok: false, reason: `${PRODUCT_MAKER_PRD_RELATIVE_PATH} is not a substantive PRD (needs a heading and >= ${PRODUCT_MAKER_PRD_MIN_CHARS} chars)`, revisionIds: [] };
+  }
+
+  const revisionIds: string[] = [];
+  const outputs: Array<{ kind: EvolutionArtifactKind; path: string; title: string; required: boolean }> = [
+    { kind: 'prd', path: PRODUCT_MAKER_PRD_RELATIVE_PATH, title: 'PRD (Product Maker)', required: true },
+    { kind: 'user_stories', path: PRODUCT_MAKER_USER_STORIES_RELATIVE_PATH, title: 'User Stories (Product Maker)', required: false },
+    { kind: 'acceptance_criteria', path: PRODUCT_MAKER_ACCEPTANCE_RELATIVE_PATH, title: 'Acceptance Criteria (Product Maker)', required: false },
+  ];
+  for (const output of outputs) {
+    try {
+      const revisionId = await registerExistingRunArtifact({
+        projectRoot: options.projectRoot,
+        run: options.run,
+        kind: output.kind,
+        path: output.path,
+        title: output.title,
+        roleId: 'product_manager',
+        stage: 'product_discussion',
+        status: 'candidate',
+        assurance: 'agent_attested',
+        ...(options.producerAttemptId ? { producerAttemptId: options.producerAttemptId } : {}),
+        nowMs: options.nowMs,
+      });
+      if (revisionId) revisionIds.push(revisionId);
+    } catch (error) {
+      if (output.required) {
+        return { ok: false, reason: `failed to register ${output.path}: ${error instanceof Error ? error.message : String(error)}`, revisionIds };
+      }
+    }
+  }
+  await writeEvolutionRun(options.projectRoot, options.run);
+  return { ok: true, revisionIds };
+}
+
 /**
  * Persist a structured Visual QA report as a governed run artifact so the
  * score/errors survive outside capped feeds and the retry loop can consume
@@ -2407,7 +2470,12 @@ export async function runEvolutionPlanningStages(options: RunEvolutionPlanningSt
     // product checker. The previous order launched the roundtable first and
     // generated the PRD only after PASS, so the PASS could not authorize the
     // document consumed by design.
-    await writeRunArtifact({
+    //
+    // When the Product Maker attempt already promoted an agent-authored PRD
+    // (governed policy), the deterministic template must NOT overwrite it —
+    // the template is the draft fallback, never a replacement for real work.
+    const agentPrd = run.artifacts.find((artifact) => artifact.kind === 'prd' && artifact.assurance === 'agent_attested');
+    if (!agentPrd) await writeRunArtifact({
       projectRoot,
       run,
       kind: 'prd',
