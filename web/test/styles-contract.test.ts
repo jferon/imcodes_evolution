@@ -443,4 +443,16 @@ describe('styles.css regression contracts', () => {
       expect(source).toMatch(/type=['"]checkbox['"][\s\S]{0,600}?width:\s*['"]auto['"]/);
     }
   });
+
+  it('Evolution operator guidance keeps long paths inside their own grid card', () => {
+    const cardRule = cssWithoutComments.match(/\.evolution-operator-guide\s*>\s*div\s*\{[^}]*\}/);
+    expect(cardRule).not.toBeNull();
+    expect(cardRule![0]).toMatch(/min-width:\s*0/);
+
+    const contentRule = cssWithoutComments.match(/\.evolution-operator-guide\s+strong\s*\{[^}]*\}/);
+    expect(contentRule).not.toBeNull();
+    expect(contentRule![0]).toMatch(/min-width:\s*0/);
+    expect(contentRule![0]).toMatch(/overflow-wrap:\s*anywhere/);
+    expect(contentRule![0]).toMatch(/word-break:\s*break-word/);
+  });
 });
