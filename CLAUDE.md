@@ -6,25 +6,43 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 # Build & typecheck
-npm run build                              # daemon (src/ → dist/)
-npx tsc --noEmit                           # daemon typecheck only
+npm run build                              # daemon (src/ → dist/), runs postbuild (worker bootstraps, bin perms, build manifest)
+npm run typecheck                          # daemon: tsc --noEmit
+npx tsc --noEmit                           # same, daemon typecheck only
 npx tsc -p server/tsconfig.json --noEmit   # server (stricter: noUnusedLocals, noImplicitReturns)
+cd server && npm run typecheck             # equivalent, run from server/
+cd web && npx tsc --noEmit                 # web typecheck (also stricter: noUnusedLocals) — REQUIRED before pushing, see below
+npm run lint                               # eslint src/ only (server/, web/, test/ are NOT covered by this lint config)
 
-# Tests (vitest workspace)
-npm test                               # all projects
-npm run test:unit                      # daemon only (src/**/*.test.ts, test/**/*.test.ts, excludes e2e)
-npm run test:server                    # server only (server/test/**/*.test.ts)
+# Tests (vitest workspace — root config wires daemon + web + most server tests together)
+npm test                               # all projects (daemon, web, most of server, excludes e2e)
+npm run test:unit                      # daemon only (src/**/*.test.ts, test/**/*.test.ts, excludes e2e + *.integration.test.ts)
+npm run test:server                    # server project via root workspace (some server tests are EXCLUDED here, see below)
 npm run test:web                       # web only (web/test/**/*.test.ts, jsdom environment)
-npm run test:e2e                       # e2e only (test/e2e/**/*.test.ts, 30s timeout, requires tmux)
-npx vitest run path/to/file.test.ts    # single file
+npm run test:e2e                       # e2e only (test/e2e/**/*.test.ts, 90s timeout, requires tmux, fileParallelism disabled, retry: 2)
+npm run test:integration               # daemon/root integration tests (vitest.integration.config.ts)
+npm run test:coverage                  # coverage across daemon+web+server, then writes summary + checks thresholds
+npx vitest run path/to/file.test.ts    # single file (works for any workspace project)
+
+# Server has its own auth/proxy tests EXCLUDED from the root workspace (need server/node_modules,
+# e.g. @hono/node-server, proxy-addr) — run these from inside server/, not from root:
+cd server && npm test                  # includes auth-flow, bind-rebind, auth-security, proxy-addr,
+                                        # password-auth, admin, cron-api, job-dispatch tests
+cd server && npm run test:integration  # server/vitest.integration.config.ts
 
 # Server (self-hosted backend)
-cd server && npm run dev               # run server via tsx
+cd server && npm run dev               # run server via tsx watch
 cd server && npm run migrate           # apply PostgreSQL migrations
+
+# Web
+cd web && npm run dev                  # vite dev server
+cd web && npm run build                # tsc --noEmit && vite build
 
 # Dev
 npm run dev                            # run daemon via tsx
 ```
+
+A `husky` pre-commit hook runs `lint-staged`, which greps staged content for `API_KEY|SECRET|PASSWORD|TOKEN|PRIVATE_KEY` and blocks the commit if found — don't rely on `--no-verify` to work around this; fix the leak.
 
 ## Architecture
 
@@ -54,6 +72,12 @@ Node.js process that manages AI agent sessions via tmux. Entry point: `src/index
 - **Routing** (`src/router/`): `message-router.ts` routes inbound messages to the correct session. `command-parser.ts` handles `/bind`, `/status`, `/send`, etc.
 - **Server link** (`src/daemon/server-link.ts`): WebSocket client connecting to the server at `/api/server/:id/ws`. Sends `{ type: 'auth', serverId, token }` on open. Credentials stored in `~/.imcodes/server.json` after `imcodes bind`.
 - **Session store** (`src/store/session-store.ts`): JSON file at `~/.imcodes/sessions.json`, debounced writes.
+- **Shared context & memory** (`src/context/`): The largest daemon subsystem — embedding generation/fallback, memory recall (`memory-recall-*.ts`), memory search/write MCP tools, skill registry/resolution, live context ingestion, summary compression, and startup memory bootstrap. Backs the "Shared Agent Context & Memory" and Managed MCP Tools features described in the README. CPU-heavy work (embedding, markdown ingest, skill review) runs in worker threads (`*-worker.ts` + matching `*-worker-bootstrap.mjs`), not on the main event loop.
+- **OpenSpec Auto Deliver engine** (`src/autofix/`): `state-machine.ts` drives the delivery run through stages, `audit-engine.ts` / `decision-engine.ts` produce the PASS/REWORK/BLOCKED verdicts, `branch-manager.ts` and `prompt-builder.ts`/`report-parser.ts` handle branch state and structured audit I/O. Orchestrated from the daemon side by `src/daemon/openspec-auto-deliver-orchestrator.ts`.
+- **P2P / Team discussions and evolution pipeline** (`src/daemon/p2p-*.ts`, `src/daemon/evolution-*.ts`): Multi-agent discussion rounds, workflow compilation/materialization (mirrored in `shared/p2p-workflow-*.ts`), and the self-evolution factory pipeline (design → delivery runners, artifact store, inbox watcher).
+- **Repo & issue tracking** (`src/repo/`, `src/tracker/`): Git provider abstraction (local git, GitHub, GitLab) for the Repository Dashboard feature; `src/tracker/` talks to GitHub/GitLab issue APIs.
+- **CLI/bind/setup** (`src/bind/`, `src/setup/`, `src/cli/`): `bind-flow.ts` implements `imcodes bind`, `setup-flow.ts` implements `imcodes setup` (one-command self-host), `src/cli/send-output.ts` formats `imcodes send` CLI output.
+- **Worker-pool pattern**: several daemon subsystems offload blocking work to `worker_threads` behind a pool (`fs-list-pool.ts`, `fs-git-status-pool.ts`, `jsonl-parse-pool.ts`, `timeline-history-pool.ts`, `file-preview-read-pool.ts`). Each has a `*-worker.ts` (worker logic), a `*-worker-bootstrap.mjs` (entry point copied to `dist/` by the `postbuild`/`copy-worker-bootstraps.mjs` script), and `*-worker-types.ts` (message contracts). Follow this pattern for new CPU-heavy daemon work rather than blocking the main loop.
 
 ### Server (`server/`)
 
@@ -64,9 +88,9 @@ Self-hosted Node.js backend (Hono). Has its own `tsconfig.json` and `node_module
 - **DB schema**: PostgreSQL migrations in `server/src/db/migrations/`. Key tables: `users`, `servers`, `sessions`, `sub_sessions`, `passkey_credentials`, `passkey_challenges`, `api_keys`, `scheduled_tasks`, `orchestration_runs`.
 - **Logger** (`server/src/util/logger.ts`) recursively redacts keys matching `/_token$/i`, `/_key$/i`, `/_secret$/i` before output.
 
-### Web (`web/`) and Mobile (`mobile/`)
+### Web (`web/`)
 
-Web terminal viewer (`web/src/ws-client.ts` — WebSocket client with reconnect). Mobile app with biometric auth and push notifications.
+Vite + React web terminal viewer (`web/src/ws-client.ts` — WebSocket client with reconnect). There is no separate `mobile/` project — the iOS/Android apps are this same `web/` app wrapped with Capacitor (`web/capacitor.config.ts`, `web/ios/`, `web/android/`), adding biometric auth (`web/src/biometric-auth.ts`) and push notifications (`web/src/push-notifications.ts`) as native bridges. `web/src/pages/` holds top-level routed pages (Dashboard, Repo, Discussions, Cron, Admin, Settings, etc.); most feature logic lives in flat `web/src/*.ts(x)` modules and `web/src/components/`.
 
 ### i18n Development (`web/`)
 
