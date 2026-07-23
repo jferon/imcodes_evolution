@@ -94,6 +94,8 @@ import {
   renderUiVisualReportFeedback,
 } from '../../shared/ui-spec.js';
 import { appendDiscussion, appendEvidence, appendLiveEvent, shortSha256, upsertArtifact, upsertScore } from './evolution-run-helpers.js';
+import { bootstrapGreenfieldFoundation, probeFoundationCapabilities } from './evolution-foundation.js';
+import type { FoundationProbeResult } from './evolution-foundation.js';
 import { lookupAttachmentById } from './file-transfer-handler.js';
 import { recordEvolutionInboxSeenFiles } from './evolution-inbox-watcher.js';
 import type { EvolutionInboxCandidate, EvolutionInboxCandidateFile, EvolutionInboxCandidateGroup } from './evolution-inbox-watcher.js';
@@ -4012,6 +4014,97 @@ function shouldPauseForStrictRoundtableGate(run: EvolutionRun): boolean {
   return strictRoundtableGateDecisionForStage(run, run.stage).disposition === 'defer';
 }
 
+/**
+ * Real foundation verification for greenfield runs at QA completion: run the
+ * deterministic capability probes over the isolated target and upgrade
+ * foundation evidence ONLY for observed markers. Returns true when the
+ * required capabilities (repository, runtime) are verified; otherwise records
+ * a blocking question, moves the run to needs_human, and returns false so the
+ * caller skips staging delivery — a greenfield run must never complete while
+ * its foundation is unproven.
+ */
+async function verifyGreenfieldFoundationOnPass(entry: RuntimeEntry, nowMs: number): Promise<boolean> {
+  const run = entry.run;
+  const targetRelativeDir = run.writePolicy?.targetRelativeDir ?? run.developmentTargetRelativeDir;
+  const blockWithQuestion = (reason: string): false => {
+    run.stage = 'needs_human';
+    applyRoleStatesForStage(run, 'needs_human', nowMs);
+    run.latestMessage = `Greenfield foundation verification failed: ${reason}`;
+    const questionId = `greenfield-foundation-${run.runId}`;
+    if (!run.blockingQuestions.some((question) => question.id === questionId)) {
+      run.blockingQuestions.push({
+        id: questionId,
+        stage: 'needs_human',
+        roleId: 'tech_director',
+        question: `Greenfield foundation is unproven at QA completion: ${reason}. Verify the isolated workspace before completing the run.`,
+        createdAt: nowMs,
+      });
+    }
+    appendDiscussion(run, {
+      kind: 'gate',
+      stage: 'needs_human',
+      roleId: 'tech_director',
+      author: '技术总监',
+      text: run.latestMessage,
+      createdAt: nowMs,
+    });
+    appendEvidence(run, {
+      source: 'greenfield_foundation',
+      summary: run.latestMessage,
+      createdAt: nowMs,
+    });
+    return false;
+  };
+  if (!targetRelativeDir) {
+    return blockWithQuestion('greenfield target directory is unresolved');
+  }
+  const probes = await probeFoundationCapabilities({ projectRoot: entry.projectRoot, targetRelativeDir });
+  for (const probe of probes) {
+    const existing = (run.foundationEvidence ?? []).find((item) => item.capability === probe.capability);
+    if (probe.status === 'verified') {
+      upsertFoundationEvidenceStatus(
+        run,
+        probe.capability,
+        'verified',
+        `${probe.capability} foundation verified in \`${targetRelativeDir}\`: ${probe.proof ?? 'marker observed'}.`,
+        nowMs,
+      );
+    } else if (existing?.status === 'verified') {
+      // Honest re-observation: a previously verified marker has disappeared.
+      upsertFoundationEvidenceStatus(
+        run,
+        probe.capability,
+        'planned',
+        `${probe.capability} foundation marker is no longer observable in \`${targetRelativeDir}\`; downgraded from verified.`,
+        nowMs,
+      );
+    }
+  }
+  const verified = probes.filter((probe) => probe.status === 'verified');
+  const unverified = probes.filter((probe) => probe.status !== 'verified');
+  appendEvidence(run, {
+    source: 'greenfield_foundation',
+    summary: `Foundation probes over ${targetRelativeDir}: verified=[${verified.map((probe) => probe.capability).join(', ') || 'none'}]; planned=[${unverified.map((probe) => probe.capability).join(', ') || 'none'}].`,
+    createdAt: nowMs,
+  });
+  appendLiveEvent(run, {
+    source: 'system',
+    kind: 'status',
+    severity: verified.length >= 2 ? 'success' : 'warning',
+    roleId: 'tech_director',
+    stage: run.stage,
+    title: 'Greenfield foundation probes',
+    detail: `verified: ${verified.map((probe) => `${probe.capability} (${probe.proof ?? 'observed'})`).join('; ') || 'none'}`,
+    createdAt: nowMs,
+  });
+  const required: Array<FoundationProbeResult['capability']> = ['repository', 'runtime'];
+  const missing = required.filter((capability) => !verified.some((probe) => probe.capability === capability));
+  if (missing.length > 0) {
+    return blockWithQuestion(`required capabilities not observed: ${missing.join(', ')}`);
+  }
+  return true;
+}
+
 export async function recordEvolutionOpenSpecProjection(options: RecordEvolutionOpenSpecProjectionOptions): Promise<EvolutionProjection[]> {
   const nowMs = options.nowMs ?? Date.now();
   const projection = options.projection;
@@ -4095,8 +4188,12 @@ export async function recordEvolutionOpenSpecProjection(options: RecordEvolution
       });
     }
 
+    let foundationOk = true;
+    if (projection.status === 'passed' && run.developmentMode === 'greenfield_new_system') {
+      foundationOk = await verifyGreenfieldFoundationOnPass(entry, nowMs);
+    }
     let next = await persistAndProject(entry, nowMs);
-    if (projection.status === 'passed') {
+    if (projection.status === 'passed' && foundationOk) {
       next = await maybeRunStagingDelivery(entry, options.serverLink, nowMs) ?? next;
     }
     updated.push(next);
@@ -5492,6 +5589,40 @@ async function maybeStartRoundtablesForStage(
   return projections;
 }
 
+/**
+ * Record a foundation capability observation on the run. Verified status is
+ * only ever written here with a concrete proof string; a re-observation that
+ * no longer finds the marker keeps the record honest by downgrading the
+ * summary while the caller decides whether that is a hard block.
+ */
+function upsertFoundationEvidenceStatus(
+  run: EvolutionRun,
+  capability: FoundationProbeResult['capability'],
+  status: 'planned' | 'verified',
+  summary: string,
+  nowMs: number,
+): void {
+  run.foundationEvidence ??= [];
+  const existing = run.foundationEvidence.find((item) => item.capability === capability);
+  if (existing) {
+    existing.status = status;
+    existing.summary = summary;
+    return;
+  }
+  run.foundationEvidence.push({
+    id: `foundation:${run.runId}:${capability}`,
+    capability,
+    status,
+    ownerRoleId: capability === 'ci' || capability === 'deployment' || capability === 'observability'
+      ? 'ops_release_manager'
+      : 'tech_director',
+    artifactRevisionIds: [],
+    externalActionClass: 'sandbox_write',
+    summary,
+    createdAt: nowMs,
+  });
+}
+
 async function maybeStartAutoDelivery(
   entry: RuntimeEntry,
   serverLink: EvolutionServerLink | null | undefined,
@@ -5517,12 +5648,59 @@ async function maybeStartAutoDelivery(
     if (!targetRelativeDir || !expectedInventorySha256) {
       return markAutoDeliveryLaunchBlocked(entry, 'greenfield_write_policy_inventory_missing', nowMs, serverLink);
     }
-    const inspection = await inspectGreenfieldTarget(entry.projectRoot, targetRelativeDir);
-    if (!inspection.ok) {
-      return markAutoDeliveryLaunchBlocked(entry, `${inspection.code}: ${inspection.message}`, nowMs, serverLink);
-    }
-    if (inspection.inventorySha256 !== expectedInventorySha256) {
-      return markAutoDeliveryLaunchBlocked(entry, 'greenfield_target_inventory_changed', nowMs, serverLink);
+    const repositoryEvidence = (run.foundationEvidence ?? []).find((item) => item.capability === 'repository');
+    if (repositoryEvidence?.status === 'verified') {
+      // A prior launch attempt already bootstrapped the isolated workspace, so
+      // the target is intentionally non-empty. Re-verify the repository is
+      // still intact instead of demanding emptiness; fail closed otherwise.
+      const probes = await probeFoundationCapabilities({ projectRoot: entry.projectRoot, targetRelativeDir });
+      if (probes.find((probe) => probe.capability === 'repository')?.status !== 'verified') {
+        return markAutoDeliveryLaunchBlocked(entry, 'greenfield_foundation_repository_missing', nowMs, serverLink);
+      }
+    } else {
+      const inspection = await inspectGreenfieldTarget(entry.projectRoot, targetRelativeDir);
+      if (!inspection.ok) {
+        return markAutoDeliveryLaunchBlocked(entry, `${inspection.code}: ${inspection.message}`, nowMs, serverLink);
+      }
+      if (inspection.inventorySha256 !== expectedInventorySha256) {
+        return markAutoDeliveryLaunchBlocked(entry, 'greenfield_target_inventory_changed', nowMs, serverLink);
+      }
+      const bootstrap = await bootstrapGreenfieldFoundation({
+        projectRoot: entry.projectRoot,
+        targetRelativeDir,
+        runId: run.runId,
+        topology: run.greenfieldTopology,
+        nowMs,
+      });
+      if (!bootstrap.ok || !bootstrap.headSha) {
+        return markAutoDeliveryLaunchBlocked(entry, `greenfield_foundation_bootstrap_failed: ${bootstrap.reason ?? 'unknown'}`, nowMs, serverLink);
+      }
+      upsertFoundationEvidenceStatus(
+        run,
+        'repository',
+        'verified',
+        `Isolated git repository initialized at \`${targetRelativeDir}\`; observed HEAD ${bootstrap.headSha.slice(0, 12)} via git rev-parse.`,
+        nowMs,
+      );
+      appendEvidence(run, {
+        source: 'greenfield_foundation',
+        summary: `Greenfield foundation bootstrap: isolated git repository with initial commit ${bootstrap.headSha.slice(0, 12)} in ${targetRelativeDir}.`,
+        command: 'git init && git add -A && git commit && git rev-parse HEAD',
+        exitCode: 0,
+        createdAt: nowMs,
+      });
+      appendLiveEvent(run, {
+        source: 'system',
+        kind: 'command',
+        severity: 'success',
+        roleId: 'tech_director',
+        stage: 'tasks_ready',
+        title: 'Greenfield foundation bootstrapped',
+        detail: `Isolated repository at ${targetRelativeDir}; HEAD ${bootstrap.headSha.slice(0, 12)}.`,
+        command: 'git init && git commit',
+        exitCode: 0,
+        createdAt: nowMs,
+      });
     }
   }
   if ((run.executionPolicy ?? 'draft_preview') === 'governed') {
