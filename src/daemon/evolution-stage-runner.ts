@@ -7,6 +7,8 @@ import {
   canTransitionEvolutionStage,
   isEvolutionTerminalStage,
   type EvolutionArtifactKind,
+  type EvolutionArtifactStatus,
+  type EvolutionAssuranceLevel,
   type EvolutionDesignTargetSurface,
   type EvolutionRoleId,
   type EvolutionRoleStatus,
@@ -16,8 +18,17 @@ import type {
   EvolutionArtifactPreview,
   EvolutionRun,
 } from '../../shared/evolution-pipeline-types.js';
+import {
+  DESIGN_SYSTEM_TOKENS_RELATIVE_PATH,
+  UI_PREVIEW_HTML_RELATIVE_PATH,
+  UI_SPEC_RELATIVE_PATH,
+  UI_VISUAL_REPORT_RELATIVE_PATH,
+  validateUiSpecDocument,
+  type UiSpecDocument,
+  type UiVisualReport,
+} from '../../shared/ui-spec.js';
 import { getEvolutionRunPaths, writeEvolutionRun } from './evolution-artifact-store.js';
-import { runEvolutionTasteHifiGeneration } from './evolution-design-runner.js';
+import { runEvolutionTasteHifiGeneration, runEvolutionUiScreenshots } from './evolution-design-runner.js';
 import { appendDiscussion, appendEvidence, appendLiveEvent, upsertArtifact, upsertScore } from './evolution-run-helpers.js';
 import {
   persistEvolutionGate,
@@ -875,8 +886,11 @@ async function registerExistingRunArtifact(options: {
   title: string;
   roleId?: EvolutionRoleId;
   stage?: EvolutionStage;
+  status?: EvolutionArtifactStatus;
+  assurance?: EvolutionAssuranceLevel;
+  producerAttemptId?: string;
   nowMs: number;
-}): Promise<void> {
+}): Promise<string | undefined> {
   const paths = getEvolutionRunPaths(options.projectRoot, options.run.runId);
   const fullPath = safeJoin(paths.runDir, options.path);
   const content = await readFile(fullPath);
@@ -900,11 +914,131 @@ async function registerExistingRunArtifact(options: {
     run: options.run,
     artifact,
     content,
-    status: observedInput ? 'approved' : 'candidate',
-    assurance: observedInput ? 'observed' : 'pipeline_draft',
+    status: options.status ?? (observedInput ? 'approved' : 'candidate'),
+    assurance: options.assurance ?? (observedInput ? 'observed' : 'pipeline_draft'),
+    ...(options.producerAttemptId ? { producerAttemptId: options.producerAttemptId } : {}),
     ...(previousRevisionId ? { supersedesRevisionId: previousRevisionId } : {}),
   });
   upsertArtifact(options.run, artifact);
+  return (artifact as { revisionId?: string }).revisionId;
+}
+
+export interface DesignMakerPromotionResult {
+  ok: boolean;
+  reason?: string;
+  uiSpec?: UiSpecDocument;
+  revisionIds: string[];
+}
+
+/**
+ * UI Evolution Engine — validate and promote the Design Maker attempt's
+ * outputs from the run directory into governed artifacts.
+ *
+ * The maker agent writes `design/ui-spec.json` (required, schema-validated),
+ * `design/preview.html` (required — the real visual deliverable), and
+ * optionally `design/design-system/tokens.json`. Promotion hashes each file,
+ * snapshots an immutable revision with `assurance: 'agent_attested'`, and
+ * binds `producerAttemptId`. Missing/invalid required outputs fail promotion —
+ * the caller records REWORK instead of a fabricated success.
+ */
+export async function registerDesignMakerOutputArtifacts(options: {
+  projectRoot: string;
+  run: EvolutionRun;
+  producerAttemptId?: string;
+  nowMs: number;
+}): Promise<DesignMakerPromotionResult> {
+  const paths = getEvolutionRunPaths(options.projectRoot, options.run.runId);
+  let rawSpec: string;
+  try {
+    rawSpec = await readFile(safeJoin(paths.runDir, UI_SPEC_RELATIVE_PATH), 'utf8');
+  } catch {
+    return { ok: false, reason: `missing required output: ${UI_SPEC_RELATIVE_PATH}`, revisionIds: [] };
+  }
+  let parsedSpec: unknown;
+  try {
+    parsedSpec = JSON.parse(rawSpec);
+  } catch {
+    return { ok: false, reason: `${UI_SPEC_RELATIVE_PATH} is not valid JSON`, revisionIds: [] };
+  }
+  const validated = validateUiSpecDocument(parsedSpec);
+  if (!validated.ok) {
+    const detail = validated.issues.slice(0, 5).map((entry) => `${entry.code}${entry.path ? `@${entry.path}` : ''}`).join(', ');
+    return { ok: false, reason: `${UI_SPEC_RELATIVE_PATH} failed schema validation: ${detail}`, revisionIds: [] };
+  }
+  try {
+    await stat(safeJoin(paths.runDir, UI_PREVIEW_HTML_RELATIVE_PATH));
+  } catch {
+    return { ok: false, reason: `missing required output: ${UI_PREVIEW_HTML_RELATIVE_PATH}`, revisionIds: [] };
+  }
+
+  const revisionIds: string[] = [];
+  const outputs: Array<{ kind: EvolutionArtifactKind; path: string; title: string; required: boolean }> = [
+    { kind: 'ui_spec', path: UI_SPEC_RELATIVE_PATH, title: 'UI Spec (Design Maker)', required: true },
+    { kind: 'hifi_preview_html', path: UI_PREVIEW_HTML_RELATIVE_PATH, title: 'High-Fidelity HTML Preview (Design Maker)', required: true },
+    { kind: 'design_system_tokens', path: DESIGN_SYSTEM_TOKENS_RELATIVE_PATH, title: 'Design System Tokens (Design Maker)', required: false },
+  ];
+  for (const output of outputs) {
+    try {
+      const revisionId = await registerExistingRunArtifact({
+        projectRoot: options.projectRoot,
+        run: options.run,
+        kind: output.kind,
+        path: output.path,
+        title: output.title,
+        roleId: 'visual_designer',
+        stage: 'design_hifi',
+        status: 'candidate',
+        assurance: 'agent_attested',
+        ...(options.producerAttemptId ? { producerAttemptId: options.producerAttemptId } : {}),
+        nowMs: options.nowMs,
+      });
+      if (revisionId) revisionIds.push(revisionId);
+    } catch (error) {
+      if (output.required) {
+        return { ok: false, reason: `failed to register ${output.path}: ${error instanceof Error ? error.message : String(error)}`, revisionIds };
+      }
+    }
+  }
+  await writeEvolutionRun(options.projectRoot, options.run);
+  return { ok: true, uiSpec: validated.value, revisionIds };
+}
+
+/**
+ * Persist a structured Visual QA report as a governed run artifact so the
+ * score/errors survive outside capped feeds and the retry loop can consume
+ * them as actionable feedback.
+ */
+export async function registerVisualReportArtifact(options: {
+  projectRoot: string;
+  run: EvolutionRun;
+  report: UiVisualReport;
+  producerAttemptId?: string;
+  nowMs: number;
+}): Promise<void> {
+  await writeRunArtifact({
+    projectRoot: options.projectRoot,
+    run: options.run,
+    kind: 'visual_report',
+    path: UI_VISUAL_REPORT_RELATIVE_PATH,
+    title: 'UI Visual QA Report',
+    roleId: 'visual_fidelity_checker',
+    stage: 'design_hifi',
+    content: `${JSON.stringify(options.report, null, 2)}\n`,
+    nowMs: options.nowMs,
+  });
+  const artifact = options.run.artifacts.find((entry) => entry.path === UI_VISUAL_REPORT_RELATIVE_PATH);
+  if (artifact) {
+    artifact.assurance = 'checker_verified';
+    if (options.producerAttemptId) artifact.producerAttemptId = options.producerAttemptId;
+  }
+  upsertScore(options.run, {
+    module: 'design',
+    score: Math.max(0, Math.min(10, Math.round(options.report.score / 10))),
+    maxScore: 10,
+    summary: `Visual QA score ${options.report.score}/100 (${options.report.basis}); ${options.report.errors.length} issue(s).`,
+    source: 'checker',
+    ...(options.producerAttemptId ? { attemptId: options.producerAttemptId } : {}),
+  });
 }
 
 async function writeProjectArtifact(options: {
@@ -2675,6 +2809,76 @@ export async function runEvolutionPlanningStages(options: RunEvolutionPlanningSt
         upsertScore(run, { module: 'design', score: 5, maxScore: 10, summary: 'Required taste-skill high-fidelity generation failed; human intervention is needed.' });
         await transition(options, 'needs_human', tasteResult.summary);
         return run;
+      }
+    }
+    // UI Evolution Engine — render the Design Maker's HTML preview to PNGs
+    // (opt-in, user-configured command in design.json) so the Visual QA
+    // checker can compare rendered pixels, not just source. Unconfigured →
+    // honest skip; the checker's report basis stays `preview_source`.
+    const uiSpecArtifact = run.artifacts.find((artifact) => artifact.kind === 'ui_spec');
+    const previewArtifact = run.artifacts.find((artifact) => artifact.kind === 'hifi_preview_html');
+    if (uiSpecArtifact && previewArtifact) {
+      let uiSpecScreens: Array<{ name: string; width: number; height: number; anchor?: string }> = [];
+      try {
+        const paths = getEvolutionRunPaths(projectRoot, run.runId);
+        const parsedSpec = validateUiSpecDocument(JSON.parse(await readFile(safeJoin(paths.runDir, uiSpecArtifact.path), 'utf8')));
+        if (parsedSpec.ok) {
+          uiSpecScreens = parsedSpec.value.screens.map((screen) => ({
+            name: screen.name,
+            width: screen.viewport.width,
+            height: screen.viewport.height,
+            ...(screen.path ? { anchor: screen.path } : {}),
+          }));
+        }
+      } catch { /* unreadable spec — screenshots skipped below */ }
+      if (uiSpecScreens.length > 0) {
+        appendLiveEvent(run, {
+          source: 'taste_skill',
+          kind: 'status',
+          severity: 'info',
+          roleId: 'visual_designer',
+          stage: run.stage,
+          title: 'Preview screenshots · started',
+          detail: `Rendering ${uiSpecScreens.length} ui-spec screen(s) from ${previewArtifact.path}.`,
+          createdAt: nowMs,
+        });
+        const shotResult = await runEvolutionUiScreenshots({
+          projectRoot,
+          runId: run.runId,
+          previewRelativePath: previewArtifact.path,
+          screens: uiSpecScreens,
+          nowMs,
+        });
+        for (const shot of shotResult.shots) {
+          await registerExistingRunArtifact({
+            projectRoot,
+            run,
+            kind: 'ui_preview_screenshot',
+            path: shot.relativePath,
+            title: `Preview Screenshot · ${shot.screenName}`,
+            roleId: 'visual_designer',
+            stage: 'design_hifi',
+            status: 'candidate',
+            assurance: 'observed',
+            nowMs: shotResult.completedAt,
+          });
+        }
+        appendLiveEvent(run, {
+          source: 'taste_skill',
+          kind: 'status',
+          severity: shotResult.status === 'passed' ? 'success' : shotResult.status === 'failed' ? 'error' : 'info',
+          roleId: 'visual_designer',
+          stage: run.stage,
+          title: `Preview screenshots · ${shotResult.status}`,
+          detail: shotResult.summary,
+          ...(shotResult.commandLine ? { command: shotResult.commandLine } : {}),
+          createdAt: shotResult.completedAt,
+        });
+        appendEvidence(run, {
+          source: 'ui_preview_screenshots',
+          summary: `${shotResult.status}: ${shotResult.summary}`,
+          createdAt: shotResult.completedAt,
+        });
       }
     }
     upsertScore(run, {

@@ -445,3 +445,160 @@ export async function runEvolutionTasteHifiGeneration(options: {
     ...(success ? {} : { error: outcome.errorMessage ?? (outcome.timedOut ? 'taste-skill generation timed out' : 'taste-skill generation produced no output or failed') }),
   };
 }
+
+// ── UI Evolution Engine — opt-in preview screenshot runner ───────────────────
+//
+// Renders the Design Maker's self-contained `design/preview.html` to one PNG
+// per ui-spec screen via a USER-CONFIGURED command in design.json (typically a
+// small Playwright/Chromium script the project provides). Playwright is never
+// bundled with the imcodes CLI — this mirrors the tasteSkill opt-in contract.
+// When unconfigured, callers get an honest `not_configured` result and the
+// Visual QA basis stays `preview_source`; it is never silently faked.
+
+const DEFAULT_SCREENSHOT_TIMEOUT_MS = 60 * 1000;
+const MAX_SCREENSHOT_SCREENS = 24;
+
+export interface EvolutionUiScreenshotShot {
+  screenName: string;
+  relativePath: string;
+}
+
+export interface EvolutionUiScreenshotResult {
+  status: 'not_configured' | 'disabled' | 'passed' | 'failed';
+  summary: string;
+  shots: EvolutionUiScreenshotShot[];
+  commandLine?: string;
+  error?: string;
+  startedAt: number;
+  completedAt: number;
+}
+
+interface ScreenshotConfig {
+  enabled: boolean;
+  command: string;
+  args: string[];
+  cwd: string;
+  timeoutMs: number;
+}
+
+function parseScreenshotConfig(projectRoot: string, raw: unknown): ScreenshotConfig | null {
+  if (!isRecord(raw)) return null;
+  const screenshot = raw.screenshot;
+  if (!isRecord(screenshot)) return null;
+  if (screenshot.enabled !== true) return { enabled: false, command: '', args: [], cwd: resolve(projectRoot), timeoutMs: DEFAULT_SCREENSHOT_TIMEOUT_MS };
+  if (typeof screenshot.command !== 'string') throw new Error('screenshot.command is required when screenshot.enabled is true');
+  return {
+    enabled: true,
+    command: resolveCommand(projectRoot, screenshot.command),
+    args: normalizeArgs(screenshot.args),
+    cwd: normalizeCwd(projectRoot, screenshot.cwd),
+    timeoutMs: screenshot.timeoutMs === undefined ? DEFAULT_SCREENSHOT_TIMEOUT_MS : normalizeTimeoutMs(screenshot.timeoutMs),
+  };
+}
+
+function expandScreenshotPlaceholders(value: string, replacements: Record<string, string>): string {
+  let expanded = value;
+  for (const [key, replacement] of Object.entries(replacements)) {
+    expanded = expanded.replaceAll(`{${key}}`, replacement);
+  }
+  return expanded;
+}
+
+export async function runEvolutionUiScreenshots(options: {
+  projectRoot: string;
+  runId: string;
+  previewRelativePath: string;
+  screens: Array<{ name: string; width: number; height: number; anchor?: string }>;
+  nowMs?: number;
+}): Promise<EvolutionUiScreenshotResult> {
+  const startedAt = options.nowMs ?? Date.now();
+  const projectRoot = resolve(options.projectRoot);
+  const config = await readConfig(projectRoot);
+  const base = { shots: [] as EvolutionUiScreenshotShot[], startedAt };
+  if (!config) {
+    return { ...base, status: 'not_configured', summary: 'No design.json — preview screenshots skipped; Visual QA reviews the HTML source instead.', completedAt: startedAt };
+  }
+  let parsed: ScreenshotConfig | null;
+  try {
+    parsed = parseScreenshotConfig(projectRoot, config.raw);
+  } catch (error) {
+    return { ...base, status: 'failed', summary: 'screenshot config is invalid.', error: error instanceof Error ? error.message : String(error), completedAt: startedAt };
+  }
+  if (!parsed) {
+    return { ...base, status: 'not_configured', summary: 'design.json has no screenshot config — preview screenshots skipped.', completedAt: startedAt };
+  }
+  if (!parsed.enabled) {
+    return { ...base, status: 'disabled', summary: 'screenshot.enabled is false — preview screenshots skipped.', completedAt: startedAt };
+  }
+
+  const runDir = safeJoin(projectRoot, `.imc/evolution/${options.runId}`);
+  const previewPath = safeJoin(runDir, options.previewRelativePath);
+  const screens = options.screens.slice(0, MAX_SCREENSHOT_SCREENS);
+  const shots: EvolutionUiScreenshotShot[] = [];
+  let display = '';
+  for (const [index, screen] of screens.entries()) {
+    const relativePath = `design/screenshots/screen-${String(index + 1).padStart(2, '0')}.png`;
+    const outputPath = safeJoin(runDir, relativePath);
+    await mkdir(dirname(outputPath), { recursive: true });
+    const replacements: Record<string, string> = {
+      projectRoot,
+      runDir,
+      previewPath,
+      outputPath,
+      width: String(screen.width),
+      height: String(screen.height),
+      screenAnchor: screen.anchor ?? `#screen-${index + 1}`,
+      screenName: screen.name,
+    };
+    const args = parsed.args.map((arg) => expandScreenshotPlaceholders(arg, replacements));
+    display = commandLine(parsed.command, args);
+    const outcome = await new Promise<ExecOutcome>((resolveOutcome) => {
+      execFile(parsed!.command, args, {
+        cwd: parsed!.cwd,
+        timeout: parsed!.timeoutMs,
+        maxBuffer: MAX_OUTPUT_BYTES,
+        shell: false,
+        windowsHide: true,
+        env: {
+          ...process.env,
+          IMCODES_EVOLUTION_PROJECT_ROOT: projectRoot,
+          IMCODES_EVOLUTION_RUN_DIR: runDir,
+          IMCODES_EVOLUTION_PREVIEW_PATH: previewPath,
+          IMCODES_EVOLUTION_SCREENSHOT_OUTPUT: outputPath,
+        },
+      }, (error, stdout, stderr) => {
+        const err = error as (NodeJS.ErrnoException & { code?: number | string; signal?: NodeJS.Signals; killed?: boolean }) | null;
+        const numericCode = typeof err?.code === 'number' ? err.code : 0;
+        resolveOutcome({
+          exitCode: err ? numericCode || 1 : 0,
+          stdout: String(stdout ?? ''),
+          stderr: String(stderr ?? ''),
+          timedOut: err?.killed === true && err?.signal === 'SIGTERM',
+          ...(err?.signal ? { signal: err.signal } : {}),
+          ...(err?.message ? { errorMessage: err.message } : {}),
+        });
+      });
+    });
+    const produced = outcome.exitCode === 0 && !outcome.timedOut && (await readOptionalBuffer(outputPath))?.byteLength;
+    if (!produced) {
+      return {
+        ...base,
+        shots,
+        status: 'failed',
+        commandLine: display,
+        summary: `screenshot command failed for screen "${screen.name}" (${shots.length}/${screens.length} captured).`,
+        error: outcome.errorMessage ?? (outcome.timedOut ? 'screenshot command timed out' : `exit=${outcome.exitCode}; no output file produced`),
+        completedAt: Date.now(),
+      };
+    }
+    shots.push({ screenName: screen.name, relativePath });
+  }
+  return {
+    ...base,
+    shots,
+    status: 'passed',
+    commandLine: display,
+    summary: `captured ${shots.length}/${screens.length} preview screenshot(s).`,
+    completedAt: Date.now(),
+  };
+}

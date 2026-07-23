@@ -11,7 +11,9 @@ import {
   EVOLUTION_GATE_ACTIONS,
   EVOLUTION_GREENFIELD_TOPOLOGIES,
   EVOLUTION_PIPELINE_MSG,
+  EVOLUTION_DESIGN_MAKER_ROUNDTABLE_ID,
   EVOLUTION_VISUAL_FIDELITY_ROUNDTABLE_ID,
+  type EvolutionAttemptKind,
   EVOLUTION_REQUIREMENT_INBOX_DIR,
   EVOLUTION_RUN_ROOT_DIR,
   EVOLUTION_ROLE_IDS,
@@ -69,7 +71,20 @@ import {
 } from './evolution-artifact-store.js';
 import { checkEvolutionStagingDeliveryConfig, runEvolutionStagingDelivery } from './evolution-delivery-runner.js';
 import { runEvolutionTasteHifiGeneration } from './evolution-design-runner.js';
-import { EvolutionPlanningPausedError, runEvolutionPlanningStages } from './evolution-stage-runner.js';
+import {
+  EvolutionPlanningPausedError,
+  registerDesignMakerOutputArtifacts,
+  registerVisualReportArtifact,
+  runEvolutionPlanningStages,
+} from './evolution-stage-runner.js';
+import {
+  DESIGN_SYSTEM_TOKENS_RELATIVE_PATH,
+  UI_PREVIEW_HTML_RELATIVE_PATH,
+  UI_SPEC_RELATIVE_PATH,
+  UI_VISUAL_REPORT_PASS_THRESHOLD,
+  parseUiVisualReportMarker,
+  renderUiVisualReportFeedback,
+} from '../../shared/ui-spec.js';
 import { appendDiscussion, appendEvidence, appendLiveEvent, shortSha256, upsertArtifact, upsertScore } from './evolution-run-helpers.js';
 import { lookupAttachmentById } from './file-transfer-handler.js';
 import { recordEvolutionInboxSeenFiles } from './evolution-inbox-watcher.js';
@@ -341,6 +356,12 @@ interface EvolutionRoundtableSpec {
   alwaysGate?: boolean;
   /** When present and false for a run, the roundtable is not started at all. */
   shouldRun?: (run: EvolutionRun) => boolean;
+  /**
+   * Attempt kind recorded for this dispatch. Defaults to 'checker' (review
+   * roundtables); 'maker' marks a production dispatch whose PASS additionally
+   * requires output promotion (validated files, not just a verdict token).
+   */
+  attemptKind?: EvolutionAttemptKind;
 }
 
 export function setEvolutionAutoDeliverLauncher(launcher: EvolutionAutoDeliverLauncher | null): void {
@@ -4140,29 +4161,35 @@ async function reconcileRuntimeRoundtableContextFiles(
     delete next.currentTargetSession;
     delete next.error;
     if (next.attemptId) {
-      const machineVerdict = planningRoundtableVerdict(summary, (run.executionPolicy ?? 'draft_preview') !== 'governed');
+      const rawMachineVerdict = planningRoundtableVerdict(summary, (run.executionPolicy ?? 'draft_preview') !== 'governed');
+      const finalized = await finalizeRoundtableAttemptOutputs(entry, next, next.attemptId, rawMachineVerdict, summary, nowMs);
+      const machineVerdict = finalized.machineVerdict;
+      if (finalized.summary !== summary) next.summary = finalized.summary;
       const attempt = await completeEvolutionAttempt({
         projectRoot: entry.projectRoot,
         run,
         attemptId: next.attemptId,
         status: machineVerdict === 'pass' ? 'passed' : 'rework',
         allowRecovery: true,
+        ...(finalized.outputRevisionIds.length > 0 ? { outputRevisionIds: finalized.outputRevisionIds } : {}),
         ...(next.p2pRunId ? { p2pRunId: next.p2pRunId } : {}),
         nowMs,
       });
-      const verdict = await recordEvolutionVerdict({
-        projectRoot: entry.projectRoot,
-        run,
-        attempt,
-        checkerRoleId: attempt.checkerRoleId ?? next.roles[next.roles.length - 1] ?? next.roles[0]!,
-        verdict: machineVerdict === 'pass' ? 'PASS' : 'REWORK',
-        machineReadable: /<!--\s*EVOLUTION_VERDICT:/i.test(summary),
-        summary,
-        approvedRevisionIds: machineVerdict === 'pass' ? attempt.inputRevisionIds : [],
-        ...(next.p2pRunId ? { p2pRunId: next.p2pRunId } : {}),
-        nowMs,
-      });
-      next.verdictId = verdict.id;
+      if (attempt.kind !== 'maker') {
+        const verdict = await recordEvolutionVerdict({
+          projectRoot: entry.projectRoot,
+          run,
+          attempt,
+          checkerRoleId: attempt.checkerRoleId ?? next.roles[next.roles.length - 1] ?? next.roles[0]!,
+          verdict: machineVerdict === 'pass' ? 'PASS' : 'REWORK',
+          machineReadable: /<!--\s*EVOLUTION_VERDICT:/i.test(finalized.summary),
+          summary: finalized.summary,
+          approvedRevisionIds: machineVerdict === 'pass' ? attempt.inputRevisionIds : [],
+          ...(next.p2pRunId ? { p2pRunId: next.p2pRunId } : {}),
+          nowMs,
+        });
+        next.verdictId = verdict.id;
+      }
     }
     upsertRoundtable(run, next);
     const staleBlockerIds = new Set([`strict-roundtable-${run.runId}-${roundtable.id}-blocked`]);
@@ -4314,7 +4341,12 @@ async function runVisualFidelityMakerRetry(
     return null;
   }
   const attempt = priorAttempts + 1;
-  const feedback = roundtable.summary ?? 'REWORK（复核未提供具体反馈）';
+  // Prefer the checker's structured visual report (score + actionable
+  // errors) over raw prose — the maker's next attempt gets data, not vibes.
+  const structuredReport = parseUiVisualReportMarker(roundtable.summary);
+  const feedback = structuredReport
+    ? renderUiVisualReportFeedback(structuredReport)
+    : roundtable.summary ?? 'REWORK（复核未提供具体反馈）';
 
   appendEvidence(run, {
     source: DESIGN_HIFI_FIDELITY_ATTEMPT_EVIDENCE_SOURCE,
@@ -4385,6 +4417,97 @@ async function runVisualFidelityMakerRetry(
   const projection = projections[projections.length - 1] ?? await persistAndProject(entry, nowMs);
   if (serverLink) send(serverLink, { type: EVOLUTION_PIPELINE_MSG.PROJECTION, projection });
   return projection;
+}
+
+type RoundtableMachineVerdict = 'pass' | 'rework' | 'unknown';
+
+/**
+ * UI Evolution Engine — post-verdict output handling shared by both
+ * roundtable completion paths (live P2P projection and context reconcile).
+ *
+ * - Design Maker PASS additionally requires promotion of its real outputs
+ *   (schema-valid ui-spec.json + preview.html). A PASS claim without valid
+ *   files downgrades to REWORK — a verdict token alone never promotes.
+ * - Visual fidelity completions persist the structured UI_VISUAL_REPORT
+ *   marker (score + actionable errors) as a governed artifact so the retry
+ *   loop and War Room consume data, not prose.
+ */
+async function finalizeRoundtableAttemptOutputs(
+  entry: RuntimeEntry,
+  roundtable: EvolutionRoundtableRef,
+  attemptId: string,
+  machineVerdict: RoundtableMachineVerdict,
+  summary: string,
+  nowMs: number,
+): Promise<{ machineVerdict: RoundtableMachineVerdict; summary: string; outputRevisionIds: string[] }> {
+  const run = entry.run;
+  let effectiveVerdict = machineVerdict;
+  let effectiveSummary = summary;
+  const outputRevisionIds: string[] = [];
+
+  if (roundtable.id === EVOLUTION_DESIGN_MAKER_ROUNDTABLE_ID && machineVerdict === 'pass') {
+    const promotion = await registerDesignMakerOutputArtifacts({
+      projectRoot: entry.projectRoot,
+      run,
+      producerAttemptId: attemptId,
+      nowMs,
+    });
+    if (promotion.ok) {
+      outputRevisionIds.push(...promotion.revisionIds);
+      appendEvidence(run, {
+        source: 'design_maker_promotion',
+        summary: `Design maker outputs promoted (${promotion.revisionIds.length} revision(s)): ${UI_SPEC_RELATIVE_PATH}, ${UI_PREVIEW_HTML_RELATIVE_PATH}.`,
+        createdAt: nowMs,
+      });
+      appendLiveEvent(run, {
+        source: 'p2p_roundtable',
+        kind: 'artifact',
+        severity: 'success',
+        roleId: 'visual_designer',
+        stage: roundtable.stage,
+        title: 'Design Maker · outputs promoted',
+        detail: `ui-spec + preview promoted as agent_attested candidates (${promotion.uiSpec?.screens.length ?? 0} screen(s)).`,
+        createdAt: nowMs,
+      });
+    } else {
+      effectiveVerdict = 'rework';
+      // Rewrite the machine marker too — downstream gate decisions parse the
+      // tail marker, so prepended prose alone would leave a live PASS claim.
+      const neutralized = summary.replace(/<!--\s*EVOLUTION_VERDICT:\s*PASS\s*-->/gi, '<!-- EVOLUTION_VERDICT: REWORK -->');
+      effectiveSummary = `REWORK: design maker outputs failed promotion — ${promotion.reason ?? 'unknown'}\n${neutralized}`;
+      appendEvidence(run, {
+        source: 'design_maker_promotion',
+        summary: `Design maker PASS claim rejected: ${promotion.reason ?? 'unknown'}.`,
+        createdAt: nowMs,
+      });
+    }
+  }
+
+  if (roundtable.id === EVOLUTION_VISUAL_FIDELITY_ROUNDTABLE_ID && machineVerdict !== 'unknown') {
+    const report = parseUiVisualReportMarker(summary);
+    if (report) {
+      await registerVisualReportArtifact({
+        projectRoot: entry.projectRoot,
+        run,
+        report,
+        producerAttemptId: attemptId,
+        nowMs,
+      });
+      appendLiveEvent(run, {
+        source: 'p2p_roundtable',
+        kind: 'score',
+        severity: report.score >= UI_VISUAL_REPORT_PASS_THRESHOLD ? 'success' : 'warning',
+        roleId: 'visual_fidelity_checker',
+        stage: roundtable.stage,
+        title: `Visual QA · ${report.score}/100`,
+        detail: `${report.errors.length} issue(s), basis: ${report.basis}.`,
+        progress: { current: Math.round(report.score), total: 100, label: `${report.score}/100` },
+        createdAt: nowMs,
+      });
+    }
+  }
+
+  return { machineVerdict: effectiveVerdict, summary: effectiveSummary, outputRevisionIds };
 }
 
 export async function recordEvolutionP2pRunProjection(options: RecordEvolutionP2pRunProjectionOptions): Promise<EvolutionProjection[]> {
@@ -4470,9 +4593,17 @@ export async function recordEvolutionP2pRunProjection(options: RecordEvolutionP2
       });
     }
     if ((nextStatus === 'complete' || nextStatus === 'failed') && next.attemptId) {
-      const machineVerdict = nextStatus === 'complete'
+      const rawMachineVerdict = nextStatus === 'complete'
         ? planningRoundtableVerdict(summary, (run.executionPolicy ?? 'draft_preview') !== 'governed')
         : 'unknown';
+      const finalized = nextStatus === 'complete'
+        ? await finalizeRoundtableAttemptOutputs(entry, next, next.attemptId, rawMachineVerdict, summary ?? '', nowMs)
+        : { machineVerdict: rawMachineVerdict, summary: summary ?? '', outputRevisionIds: [] };
+      const machineVerdict = finalized.machineVerdict;
+      const finalSummary = finalized.summary;
+      if (finalSummary !== (summary ?? '')) {
+        next.summary = finalSummary;
+      }
       const attemptStatus = nextStatus === 'failed'
         ? 'failed'
         : machineVerdict === 'pass'
@@ -4486,10 +4617,14 @@ export async function recordEvolutionP2pRunProjection(options: RecordEvolutionP2
         attemptId: next.attemptId,
         status: attemptStatus,
         p2pRunId: p2pRun.id,
+        ...(finalized.outputRevisionIds.length > 0 ? { outputRevisionIds: finalized.outputRevisionIds } : {}),
         ...(machineVerdict === 'unknown' ? { error: 'machine_readable_evolution_verdict_missing' } : {}),
         nowMs,
       });
-      if (machineVerdict !== 'unknown') {
+      // Maker attempts record no self-verdict: their durable record is the
+      // attempt itself plus the validated output promotion; the independent
+      // check happens downstream (visual-fidelity review of the outputs).
+      if (machineVerdict !== 'unknown' && attempt.kind !== 'maker') {
         const checkerRoleId = attempt.checkerRoleId ?? next.roles[next.roles.length - 1] ?? next.roles[0]!;
         const verdict = await recordEvolutionVerdict({
           projectRoot: entry.projectRoot,
@@ -4497,8 +4632,8 @@ export async function recordEvolutionP2pRunProjection(options: RecordEvolutionP2
           attempt,
           checkerRoleId,
           verdict: machineVerdict === 'pass' ? 'PASS' : 'REWORK',
-          machineReadable: /<!--\s*EVOLUTION_VERDICT:/i.test(summary),
-          summary,
+          machineReadable: /<!--\s*EVOLUTION_VERDICT:/i.test(finalSummary),
+          summary: finalSummary,
           approvedRevisionIds: machineVerdict === 'pass' ? attempt.inputRevisionIds : [],
           p2pRunId: p2pRun.id,
           nowMs,
@@ -4816,6 +4951,13 @@ function renderVisualFidelityRoundtablePrompt(run: EvolutionRun): string {
   const generatedOutputPaths = run.artifacts
     .filter((artifact) => artifact.kind === 'hifi_mockup' || artifact.kind === 'taste_hifi_output' || artifact.kind === 'taste_hifi_reference')
     .map((artifact) => `${runDirRelative}/${artifact.path}`);
+  const makerOutputPaths = run.artifacts
+    .filter((artifact) => artifact.kind === 'ui_spec' || artifact.kind === 'hifi_preview_html' || artifact.kind === 'design_system_tokens')
+    .map((artifact) => `${runDirRelative}/${artifact.path}`);
+  const screenshotPaths = run.artifacts
+    .filter((artifact) => artifact.kind === 'ui_preview_screenshot')
+    .map((artifact) => `${runDirRelative}/${artifact.path}`);
+  const reportBasis = screenshotPaths.length > 0 ? 'rendered_screenshot' : makerOutputPaths.length > 0 ? 'preview_source' : 'spec_only';
   return [
     `请以 IM.codes Evolution Factory 视觉保真复核方式审查 run ${run.runId}。这是硬性质量门禁：结论必须基于对参考图像素的真实查看，不允许仅凭文字描述推断。`,
     '',
@@ -4826,6 +4968,12 @@ function renderVisualFidelityRoundtablePrompt(run: EvolutionRun): string {
       : ['- （未登记参考图产物 — 如确实没有参考图，请在结论中说明无法执行保真对比，并给出 REWORK）']),
     '',
     '## 第二步：查看生成的高保真产物',
+    ...(makerOutputPaths.length > 0
+      ? ['Design Maker 真实产出（优先审查这些）：', ...makerOutputPaths.map((path) => `- ${path}`)]
+      : []),
+    ...(screenshotPaths.length > 0
+      ? ['渲染截图（与参考图逐张对比）：', ...screenshotPaths.map((path) => `- ${path}`)]
+      : []),
     ...(generatedOutputPaths.length > 0
       ? generatedOutputPaths.map((path) => `- ${path}`)
       : ['- （未找到生成产物 — 请给出 REWORK 并说明缺失）']),
@@ -4837,6 +4985,46 @@ function renderVisualFidelityRoundtablePrompt(run: EvolutionRun): string {
     '- 组件：参考图中的关键组件是否全部出现且状态完整。',
     '',
     '输出要求：第一行必须是 PASS 或 REWORK；REWORK 时逐条列出具体的、可执行的修改点（供下一轮重生成使用）。',
+    '同时必须在结论末尾输出一行结构化视觉报告（0-100 分 + 具体问题，JSON 单行）：',
+    `<!-- UI_VISUAL_REPORT: {"score":<0-100>,"basis":"${reportBasis}","errors":[{"type":"layout|color|typography|spacing|component|content|interaction","issue":"...","fix":"...","screen":"..."}],"summary":"..."} -->`,
+    `score >= ${UI_VISUAL_REPORT_PASS_THRESHOLD} 才应给 PASS；分数必须与你实际观察到的差异一致，不允许无依据打高分。`,
+  ].join('\n');
+}
+
+function renderDesignMakerPrompt(run: EvolutionRun): string {
+  const runDirRelative = `${EVOLUTION_RUN_ROOT_DIR}/${run.runId}`;
+  const referenceImagePaths = run.artifacts
+    .filter((artifact) => artifact.kind === 'design_reference_image')
+    .map((artifact) => `${runDirRelative}/${artifact.path}`);
+  const sourceDir = dirname(run.source.relativePath);
+  const inputPaths = run.artifacts
+    .filter((artifact) => artifact.kind === 'prd' || artifact.kind === 'normalized_requirement' || artifact.kind === 'ux_flow')
+    .map((artifact) => `${runDirRelative}/${artifact.path}`);
+  return [
+    `你是本次自我进化 run ${run.runId} 的高保真设计 Maker（视觉设计师）。你的任务不是讨论，而是真实产出可交付的设计文件。`,
+    '',
+    '## 第一步：真实查看输入',
+    '- 需求与 PRD（用 Read 工具打开）：',
+    ...(inputPaths.length > 0 ? inputPaths.map((path) => `  - ${path}`) : [`  - ${run.source.relativePath}`]),
+    referenceImagePaths.length > 0
+      ? '- 参考图（必须逐张用 Read 工具真实查看像素，设计必须与其可追溯对应）：'
+      : `- 参考图：先在 \`${sourceDir}\` 与 \`${runDirRelative}/design/reference-images/\` 下查找图片文件，找到则必须逐张真实查看。`,
+    ...referenceImagePaths.map((path) => `  - ${path}`),
+    '',
+    '## 第二步：写出以下三个文件（路径相对项目根目录）',
+    `1. \`${runDirRelative}/${UI_SPEC_RELATIVE_PATH}\` — UI Spec（JSON），必须符合此结构：`,
+    '   `{"version":1,"page":{"name":"…","type":"…"},"design":{"style":"…","tokensRef":"design/design-system/tokens.json"},"layout":{…},"screens":[{"name":"…","viewport":{"width":1440,"height":900},"path":"#screen-1","components":[{"type":"…","title":"…","props":{…},"children":[…]}]}]}`',
+    '   screens 至少 1 个；每个 screen 的 viewport 为整数像素；components 描述真实信息层级，不要占位。',
+    `2. \`${runDirRelative}/${UI_PREVIEW_HTML_RELATIVE_PATH}\` — 自包含单文件 HTML+CSS 高保真预览：`,
+    '   - 不引用任何外部资源（无外链 CSS/JS/字体/图片；图标用内联 SVG）。',
+    '   - 每个 screen 一个 `<section id="screen-N">`，与 ui-spec 的 screens 一一对应。',
+    '   - 布局、配色、字体、间距必须与参考图可追溯对应；不得输出通用模板。',
+    `3. \`${runDirRelative}/${DESIGN_SYSTEM_TOKENS_RELATIVE_PATH}\` — 设计 token JSON（colors/typography/spacing/radius/shadow），色值必须来自参考图或现有项目风格审计。`,
+    '',
+    '## 输出要求',
+    '完成写入后，最后一条消息必须：列出你写入的文件清单与每个文件的核心设计决策，并以下面一行结束：',
+    '<!-- EVOLUTION_VERDICT: PASS -->',
+    '如果因输入缺失无法完成，说明缺什么并以 <!-- EVOLUTION_VERDICT: BLOCKED --> 结束；绝不允许在未写文件的情况下输出 PASS。',
   ].join('\n');
 }
 
@@ -4848,6 +5036,19 @@ const EVOLUTION_ROUNDTABLE_SPECS: EvolutionRoundtableSpec[] = [
     roles: ['product_manager', 'product_critic', 'loop_supervisor'],
     artifactKinds: ['normalized_requirement', 'discussion', 'prd', 'prd_review', 'role_skill'],
     prompt: renderProductRoundtablePrompt,
+  },
+  {
+    id: EVOLUTION_DESIGN_MAKER_ROUNDTABLE_ID,
+    stage: 'design_lofi',
+    topic: '高保真设计 Maker',
+    roles: ['visual_designer'],
+    artifactKinds: ['prd', 'normalized_requirement', 'ux_flow', 'design_reference_manifest', 'project_style_audit', 'role_skill'],
+    prompt: renderDesignMakerPrompt,
+    alwaysGate: true,
+    attemptKind: 'maker',
+    // A real production dispatch only makes sense under the governed policy;
+    // draft_preview keeps the fast deterministic templates, honestly labeled.
+    shouldRun: (run) => (run.executionPolicy ?? 'draft_preview') === 'governed',
   },
   {
     id: 'design-review',
@@ -4862,7 +5063,7 @@ const EVOLUTION_ROUNDTABLE_SPECS: EvolutionRoundtableSpec[] = [
     stage: 'design_hifi',
     topic: '视觉保真复核圆桌',
     roles: ['visual_fidelity_checker', 'visual_designer'],
-    artifactKinds: ['design_reference_manifest', 'hifi_spec', 'hifi_mockup', 'taste_hifi_output', 'taste_hifi_reference', 'design_handoff', 'role_skill'],
+    artifactKinds: ['design_reference_manifest', 'hifi_spec', 'hifi_mockup', 'taste_hifi_output', 'taste_hifi_reference', 'design_handoff', 'ui_spec', 'hifi_preview_html', 'design_system_tokens', 'ui_preview_screenshot', 'visual_report', 'role_skill'],
     prompt: renderVisualFidelityRoundtablePrompt,
     alwaysGate: true,
     // Fidelity-vs-reference is undefined without reference images — skip
@@ -5060,7 +5261,7 @@ async function maybeStartRoundtable(
     ? await createEvolutionAttempt({
         projectRoot: entry.projectRoot,
         run,
-        kind: 'checker',
+        kind: spec.attemptKind ?? 'checker',
         stage: spec.stage,
         roleId: primaryRoleId,
         checkerRoleId,

@@ -72,6 +72,13 @@ export const EVOLUTION_LIVE_EVENTS_MAX = 160 as const;
  * (helper-eligibility + dedicated-spawn fallback) must reference the same id.
  */
 export const EVOLUTION_VISUAL_FIDELITY_ROUNDTABLE_ID = 'visual-fidelity-review' as const;
+/**
+ * Roundtable spec id for the real Design Maker attempt at design_lofi: a
+ * governed-mode agent turn that produces ui-spec.json, a self-contained HTML
+ * preview, and design-system tokens — replacing "deterministic template with
+ * a role label" as the source of high-fidelity design artifacts.
+ */
+export const EVOLUTION_DESIGN_MAKER_ROUNDTABLE_ID = 'design-maker' as const;
 export const EVOLUTION_SCORE_MAX = 10 as const;
 
 export const EVOLUTION_STAGES = [
@@ -214,6 +221,11 @@ export const EVOLUTION_ARTIFACT_KINDS = [
   'taste_hifi_reference',
   'taste_hifi_log',
   'visual_fidelity_report',
+  'ui_spec',
+  'design_system_tokens',
+  'hifi_preview_html',
+  'ui_preview_screenshot',
+  'visual_report',
   'project_style_audit',
   'design_reference_manifest',
   'design_reference_image',
