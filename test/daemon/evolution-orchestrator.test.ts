@@ -768,7 +768,7 @@ describe('evolution orchestrator', () => {
       'role_skill',
       'roundtable_review',
     ]));
-    expect(autopilot.value.artifacts.filter((artifact) => artifact.kind === 'role_skill')).toHaveLength(11);
+    expect(autopilot.value.artifacts.filter((artifact) => artifact.kind === 'role_skill')).toHaveLength(12);
     expect(autopilot.value.artifacts.find((artifact) => artifact.kind === 'role_skill' && artifact.roleId === 'visual_designer')?.preview).toEqual(expect.objectContaining({
       previewType: 'markdown',
       language: 'markdown',
@@ -1071,11 +1071,36 @@ describe('evolution orchestrator', () => {
     expect(launched.ok).toBe(true);
     if (!launched.ok) return;
 
+    // Reference images engage the alwaysGate visual-fidelity roundtable at
+    // design_hifi — provide a live launcher and a PASS verdict so the run
+    // can advance to tasks_ready (a silent local fallback is forbidden).
+    setEvolutionRoundtableLauncher(async (request) => ({
+      ok: true,
+      p2pRunId: `p2p_ref_${request.roundtableSpecId}`,
+      discussionId: `dsc_ref_${request.roundtableSpecId}`,
+      contextPath: `.imc/discussions/p2p_ref_${request.roundtableSpecId}.md`,
+    }));
     const autopilot = await runEvolutionAutopilot(launched.value.runId, null, { nowMs: 10_150 });
     expect(autopilot.ok).toBe(true);
     if (!autopilot.ok) return;
-    expect(autopilot.value.stage).toBe('tasks_ready');
-    expect(autopilot.value.artifacts.map((artifact) => artifact.kind)).toEqual(expect.arrayContaining([
+    expect(autopilot.value.stage).toBe('design_hifi');
+    await recordEvolutionP2pRunProjection({
+      run: {
+        id: 'p2p_ref_visual-fidelity-review',
+        discussion_id: 'dsc_ref_visual-fidelity-review',
+        status: 'completed',
+        mode_key: 'review',
+        current_round: 2,
+        total_rounds: 2,
+        result_summary: 'PASS: 高保真与参考图布局一致。',
+        completed_at: '2026-07-08T00:00:00.000Z',
+      },
+      serverLink: { send() { /* ignore */ } },
+      nowMs: 10_160,
+    });
+    const resumed = await getEvolutionRun(launched.value.runId);
+    expect(resumed?.value?.stage).toBe('tasks_ready');
+    expect(resumed?.value?.artifacts.map((artifact) => artifact.kind)).toEqual(expect.arrayContaining([
       'design_reference_manifest',
       'design_reference_image',
       'hifi_mockup',

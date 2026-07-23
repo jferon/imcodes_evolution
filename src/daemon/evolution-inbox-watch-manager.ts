@@ -3,6 +3,7 @@ import { EVOLUTION_PIPELINE_MSG, EVOLUTION_REQUIREMENT_INBOX_DIR } from '../../s
 import { EvolutionInboxPoller, type EvolutionInboxCandidate } from './evolution-inbox-watcher.js';
 import {
   launchEvolutionRunFromInboxCandidate,
+  launchEvolutionRunFromInboxCandidateGroup,
   resumePendingEvolutionAutoDeliveries,
   runEvolutionAutopilot,
   type EvolutionServerLink,
@@ -80,6 +81,25 @@ function createWatchEntry(session: EvolutionWatchSession): WatchEntry | null {
         void runEvolutionAutopilot(result.value.runId, currentServerLink);
       } else {
         sendIssues(currentServerLink, result.issues, candidate, session.name);
+      }
+    },
+    async onCandidateGroup(group) {
+      const result = await launchEvolutionRunFromInboxCandidateGroup({
+        projectRoot: session.projectDir!,
+        sessionName: session.name,
+        ...(session.projectName ? { projectName: session.projectName } : {}),
+        group,
+      });
+      if (result.ok) {
+        sendProjection(currentServerLink, result.value);
+        void runEvolutionAutopilot(result.value.runId, currentServerLink);
+      } else {
+        const primary = group.files[0];
+        sendIssues(currentServerLink, result.issues, primary ? {
+          sourceRelativePath: primary.relativePath,
+          sizeBytes: primary.sizeBytes,
+          mtimeMs: primary.mtimeMs,
+        } : { sourceRelativePath: group.groupRelativeDir, sizeBytes: 0, mtimeMs: 0 }, session.name);
       }
     },
   });

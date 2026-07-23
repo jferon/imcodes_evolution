@@ -37,7 +37,10 @@ async function waitForProjection(
 
 afterEach(async () => {
   stopAllEvolutionInboxWatchers();
-  if (tempRoot) await rm(tempRoot, { recursive: true, force: true });
+  // The watch manager fires `void runEvolutionAutopilot(...)` in the
+  // background; retry the temp-dir removal so a still-in-flight run-file
+  // write cannot race the teardown into ENOTEMPTY.
+  if (tempRoot) await rm(tempRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   tempRoot = null;
 });
 
@@ -125,7 +128,7 @@ describe('evolution inbox watch manager', () => {
 
     const sourceRelativePath = `${EVOLUTION_REQUIREMENT_INBOX_DIR}/manual-scan.md`;
     await mkdir(join(root, EVOLUTION_REQUIREMENT_INBOX_DIR), { recursive: true });
-    await writeFile(join(root, sourceRelativePath), '# Manual Scan\n\nTrigger immediately.\n', 'utf8');
+    await writeFile(join(root, sourceRelativePath), '# Manual Scan\n\n需要实现一个手动触发扫描的功能，用户可以立即触发 inbox 扫描而不等待轮询间隔。\n', 'utf8');
     const stableTime = new Date(Date.now() - 5_000);
     await utimes(join(root, sourceRelativePath), stableTime, stableTime);
 

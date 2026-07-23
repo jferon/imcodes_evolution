@@ -3,6 +3,11 @@ import { isAbsolute, join, relative, resolve } from 'node:path';
 import type { ServerLink } from './server-link.js';
 import { listSessions, getSession, type SessionRecord } from '../store/session-store.js';
 import { appendP2pRunUserIntervention, startP2pRun, type P2pTarget } from './p2p-orchestrator.js';
+import { EVOLUTION_VISUAL_FIDELITY_ROUNDTABLE_ID } from '../../shared/evolution-pipeline-constants.js';
+import { isClaudeCodeFamily } from '../../shared/agent-types.js';
+import { defaultDedicatedExecutionRoutingPreference } from '../../shared/execution-clone.js';
+import { createExecutionClone } from './execution-clone.js';
+import logger from '../util/logger.js';
 import { P2P_RUN_STATUS_VALUES, type P2pRunUpdatePayload } from '../../shared/p2p-status.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import {
@@ -28,23 +33,74 @@ function sameProjectRoot(left: string, right: string): boolean {
   try { return resolve(left) === resolve(right); } catch { return false; }
 }
 
-function isEligibleHelper(session: SessionRecord, request: EvolutionRoundtableLaunchRequest): boolean {
+function isVisualFidelityRequest(request: EvolutionRoundtableLaunchRequest): boolean {
+  return request.roundtableSpecId === EVOLUTION_VISUAL_FIDELITY_ROUNDTABLE_ID;
+}
+
+export function isEligibleHelper(session: SessionRecord, request: EvolutionRoundtableLaunchRequest): boolean {
   if (!session.name || session.name === request.sessionName) return false;
   if (session.state === 'stopped') return false;
   if (session.role === 'brain') return false;
   if (!session.projectDir || !sameProjectRoot(session.projectDir, request.projectRoot)) return false;
+  // The visual-fidelity gate depends on Read-tool image comprehension. A
+  // shell/codex/other helper would still emit a PASS/REWORK-shaped verdict
+  // without ever seeing the reference image — a fabricated review is worse
+  // than no review, so restrict this spec to the Claude Code family.
+  if (isVisualFidelityRequest(request) && !isClaudeCodeFamily(session.agentType)) return false;
   return mainDomain(session.name) === mainDomain(request.sessionName);
 }
 
-function resolveTargets(request: EvolutionRoundtableLaunchRequest): P2pTarget[] {
+/**
+ * Dedicated-spawn fallback for the visual-fidelity gate: when no eligible
+ * idle helper exists, clone a capable session's configuration into a fresh
+ * ephemeral sub-session (templates may be `idle` OR `running` — cloning
+ * copies config, never live state). Returns null when no valid template
+ * exists at all or the clone fails — the caller then hard-blocks; it must
+ * never silently downgrade to the deterministic text-only review.
+ * Clone lifecycle/GC is handled by the existing execution-clone sweeper.
+ */
+async function spawnFidelityCloneTarget(request: EvolutionRoundtableLaunchRequest): Promise<P2pTarget | null> {
+  const candidates = listSessions().filter((session) =>
+    session.name !== request.sessionName
+    && session.state !== 'stopped'
+    && isClaudeCodeFamily(session.agentType)
+    && !!session.projectDir
+    && sameProjectRoot(session.projectDir, request.projectRoot));
+  // Prefer an SDK template over a tmux/process one: both are equally capable
+  // of Read-tool image review, but the SDK event stream signals completion of
+  // a large structured report more reliably than tmux output scraping.
+  const template = candidates.find((session) => session.agentType === 'claude-code-sdk') ?? candidates[0];
+  if (!template) return null;
+  try {
+    const clone = await createExecutionClone({
+      templateSessionName: template.name,
+      parentRunId: request.runId,
+      parentStage: 'generic_execution',
+      ownerSessionName: request.sessionName,
+      owningMainSessionName: request.sessionName,
+      pref: defaultDedicatedExecutionRoutingPreference(),
+    });
+    return { session: clone.sessionName, mode: modeForRole(request.roles[0]) };
+  } catch (error) {
+    logger.warn({ err: error, runId: request.runId, template: template.name }, 'visual-fidelity clone spawn failed — gate will hard-block');
+    return null;
+  }
+}
+
+async function resolveTargets(request: EvolutionRoundtableLaunchRequest): Promise<P2pTarget[]> {
   const helperLimit = Math.min(4, Math.max(2, request.roleInstructions.length || request.roles.length || 2));
-  return listSessions()
+  const targets = listSessions()
     .filter((session) => isEligibleHelper(session, request))
     .slice(0, helperLimit)
     .map((session, index) => ({
       session: session.name,
       mode: modeForRole(request.roleInstructions[index]?.roleId ?? request.roles[index]),
     }));
+  if (targets.length === 0 && isVisualFidelityRequest(request)) {
+    const clone = await spawnFidelityCloneTarget(request);
+    if (clone) return [clone];
+  }
+  return targets;
 }
 
 function modeForRole(roleId: string | undefined): string {
@@ -202,7 +258,7 @@ setEvolutionRoundtableLauncher(async (
   request,
   serverLink,
 ): Promise<EvolutionRoundtableLaunchResult> => {
-  const targets = resolveTargets(request);
+  const targets = await resolveTargets(request);
   if (targets.length === 0) {
     return { ok: false, skippedReason: 'no_eligible_p2p_helper_sessions' };
   }

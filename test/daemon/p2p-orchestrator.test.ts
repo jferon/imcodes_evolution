@@ -3501,3 +3501,74 @@ describe('P2P orchestrator — parallel rounds', () => {
     await waitForNoRoundHopArtifacts(tempProjectDir, done.id);
   }, 25_000);
 });
+
+describe('P2P orchestrator — cancel routes by session runtime type (B4)', () => {
+  async function startStalledRun(userText: string) {
+    // No file writes and no idle notifications: the run quickly stalls with a
+    // dispatched hop (the summary target) still in flight — a stable state to
+    // land a cancel in. Raise the suite's fast stuck-timers (40ms) so the
+    // stall is not auto-cancelled before the explicit cancel under test.
+    sendKeysDelayedEnterMock.mockResolvedValue(undefined);
+    detectStatusMock.mockReturnValue('processing');
+    detectStatusAsyncMock.mockResolvedValue('processing');
+    _setQueueStuckStopAfterMs(120_000);
+    _setQueuedPromptStopAfterMs(120_000);
+    _setGracePeriodMs(45_000);
+    const run = await startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText,
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+    });
+    const start = Date.now();
+    while (!getP2pRun(run.id)?.currentTargetSession && Date.now() - start < 5_000) {
+      await new Promise((resolveFn) => setTimeout(resolveFn, 10));
+    }
+    const target = getP2pRun(run.id)?.currentTargetSession;
+    expect(target).toBeTruthy();
+    return { run, target: target! };
+  }
+
+  it('sends tmux Ctrl+C to process sessions on cancel', async () => {
+    const { run, target } = await startStalledRun('cancel routing — process session');
+    sendKeyMock.mockClear();
+
+    const cancelled = await cancelP2pRun(run.id, serverLinkMock as any, { source: 'test', reason: 'b4-tmux' });
+    expect(cancelled).toBe(true);
+    expect(sendKeyMock.mock.calls.some((call) => call[0] === target && call[1] === 'C-c')).toBe(true);
+  });
+
+  it('calls TransportSessionRuntime.cancel() for transport sessions and never tmux, tolerating a rejecting cancel', async () => {
+    // Every session in this test is a transport (SDK) session — a tmux
+    // keystroke would silently no-op against them.
+    getSessionMock.mockImplementation((name: string) => {
+      if (name === 'deck_proj_brain') return { agentType: 'claude-code-sdk', runtimeType: 'transport', projectDir: tempProjectDir, parentSession: undefined, label: 'brain' };
+      if (name === 'deck_proj_w1') return { agentType: 'claude-code-sdk', runtimeType: 'transport', projectDir: tempProjectDir, parentSession: undefined, label: 'w1' };
+      return null;
+    });
+    // cancel() REJECTS (the not-yet-bound state) — must be tolerated, not an
+    // unhandled throw.
+    const cancelSpy = vi.fn().mockRejectedValue(new Error('TransportSessionRuntime not initialized — call initialize() first'));
+    vi.mocked(getTransportRuntime).mockReturnValue({
+      send: vi.fn().mockResolvedValue(undefined),
+      cancel: cancelSpy,
+      drainPendingIfIdle: vi.fn().mockReturnValue(false),
+      getDiagnosticSnapshot: vi.fn().mockReturnValue({ status: 'idle', pendingCount: 0, busyReasons: [] }),
+      cancelStaleActiveTurnWithPending: vi.fn().mockReturnValue(false),
+      removePendingMessage: vi.fn().mockReturnValue(false),
+      pendingEntries: [],
+      pendingCount: 0,
+      pendingVersion: 0,
+    } as any);
+
+    const { run, target } = await startStalledRun('cancel routing — transport session');
+    sendKeyMock.mockClear();
+
+    const cancelled = await cancelP2pRun(run.id, serverLinkMock as any, { source: 'test', reason: 'b4-transport' });
+    expect(cancelled).toBe(true);
+    expect(cancelSpy).toHaveBeenCalled();
+    // The transport branch must not fall through to the tmux keystroke.
+    expect(sendKeyMock.mock.calls.some((call) => call[0] === target && call[1] === 'C-c')).toBe(false);
+  });
+});

@@ -130,10 +130,16 @@ function deliveryConfigPath(projectRoot?: string): string {
   return projectRoot ? `${projectRoot}/.imc/evolution/delivery.json` : '.imc/evolution/delivery.json';
 }
 
+function isPausing(projection: EvolutionProjection | null | undefined): boolean {
+  return projection?.userPauseState === 'pausing';
+}
+
 function projectionStatusDetail(projection: EvolutionProjection, projectRoot?: string): string {
   const pauseQuestion = userPauseQuestion(projection);
   if (pauseQuestion && projection.stage === 'needs_human') {
-    return `任务已暂停，暂停前阶段：${stageLabel(pauseQuestion.stage)}。稍后点击“继续执行”会从该阶段恢复。`;
+    return isPausing(projection)
+      ? `暂停请求已受理，正在等待当前执行中的步骤到达检查点后停止；暂停前阶段：${stageLabel(pauseQuestion.stage)}。`
+      : `任务已暂停，暂停前阶段：${stageLabel(pauseQuestion.stage)}。稍后点击“继续执行”会从该阶段恢复。`;
   }
   if (projection.stage === 'stopped') {
     const reason = projection.terminalReason ?? '当前 Run 已停止。';
@@ -332,7 +338,9 @@ function buildProgressOverview(projection: EvolutionProjection | null): {
     percent,
     currentStep: `${clampedIndex + 1}/${total}`,
     currentLabel: pauseQuestion
-      ? `已暂停（原阶段 ${stageLabel(pauseQuestion.stage)}）`
+      ? isPausing(projection)
+        ? `暂停中——等待当前步骤停止（原阶段 ${stageLabel(pauseQuestion.stage)}）`
+        : `已暂停（原阶段 ${stageLabel(pauseQuestion.stage)}）`
       : projection.stage === 'needs_human'
       ? `等待人工处理（卡在 ${stageLabel(effectiveStage)}）`
       : stageLabel(projection.stage),
@@ -413,6 +421,14 @@ function operatorGuidance(options: {
   }
   const pauseQuestion = userPauseQuestion(projection);
   if (projection.stage === 'needs_human' && pauseQuestion) {
+    if (isPausing(projection)) {
+      return {
+        phase: '暂停中',
+        system: `暂停请求已受理；当前执行中的步骤会运行到下一个检查点后停止，不会再推进后续阶段或自动交付。暂停前阶段是 ${stageLabel(pauseQuestion.stage)}。`,
+        action: '无需操作；稍候片刻状态会变为“已暂停”。也可以直接点击“继续执行”撤销暂停。',
+        next: `完全停止后，点击“继续执行”会回到 ${stageLabel(pauseQuestion.stage)} 并重新触发后续自我进化流程。`,
+      };
+    }
     return {
       phase: '已暂停',
       system: `任务已按你的要求暂停；暂停前阶段是 ${stageLabel(pauseQuestion.stage)}，不会继续推进后续阶段或自动交付。`,

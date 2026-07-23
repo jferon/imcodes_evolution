@@ -92,6 +92,7 @@ import { enqueueResend, removeResendEntries } from './transport-resend-queue.js'
 import type { ExecutionCloneParentStage } from '../../shared/execution-clone.js';
 import {
   recordEvolutionOpenSpecProjection,
+  setEvolutionAutoDeliverCanceller,
   setEvolutionAutoDeliverLauncher,
   type EvolutionAutoDeliverLaunchResult,
 } from './evolution-orchestrator.js';
@@ -3831,6 +3832,20 @@ setEvolutionAutoDeliverLauncher(async (request, serverLink): Promise<EvolutionAu
   return result.ok
     ? { ok: true, projection: result.projection }
     : { ok: false, error: result.error, ...(result.projection ? { projection: result.projection } : {}) };
+});
+
+// Evolution STOP/pause → cancel the linked Auto Deliver run. Reuses the same
+// stop() flow as the wire-protocol STOP command: terminalize() already clears
+// all five poll timers and cancels any active P2P audit turn. `sessionName`
+// is the Evolution run's own launch session, which stop() accepts because it
+// matches `launchedFromSessionName`/`targetImplementationSessionName`.
+setEvolutionAutoDeliverCanceller(async (runId, sessionName): Promise<boolean> => {
+  const run = runsById.get(runId);
+  const result = await stop({ requestId: `evolution-stop-${runId}`, sessionName, runId });
+  if (result.ok && result.terminal !== false && result.projection && run?.serverLink) {
+    send(run.serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, projection: { ...result.projection, terminal: true } });
+  }
+  return result.ok;
 });
 
 export function handleOpenSpecAutoDeliverDaemonRestartCleanup(serverLink?: ServerLink): void {

@@ -1651,6 +1651,17 @@ export async function cancelP2pRun(runId: string, serverLink: ServerLink | null,
     const targets = new Set(run.activeTargetSessions);
     if (run.currentTargetSession) targets.add(run.currentTargetSession);
     for (const target of targets) {
+      if (getSession(target)?.runtimeType === 'transport') {
+        // Transport (SDK) sessions have no tmux pane — a Ctrl+C keystroke
+        // would silently no-op while the in-flight generation keeps running.
+        // TransportSessionRuntime.cancel() resolves the provider internally;
+        // it throws (rejects) when the provider session isn't bound yet, so
+        // guard it like command-handler.ts's cancelTransportTurnNow does.
+        try {
+          await getTransportRuntime(target)?.cancel();
+        } catch { /* not yet bound / already idle — nothing to cancel */ }
+        continue;
+      }
       try {
         const { sendKey } = await import('../agent/tmux.js');
         await sendKey(target, 'C-c');

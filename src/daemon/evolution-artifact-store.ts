@@ -124,6 +124,16 @@ export const EVOLUTION_ROLE_SKILL_DEFINITIONS: EvolutionRoleSkillDefinition[] = 
     handoff: '把高保真规格和 taste-skill 提示词交给技术总监和前端开发；Figma 仅作为后续可选导出。',
   },
   {
+    roleId: 'visual_fidelity_checker',
+    label: '视觉保真审查',
+    skillName: 'visual-fidelity-check',
+    skillSummary: '用 Read 工具逐张查看参考图与生成的高保真产物，按布局/配色/字体/间距逐项对比并给出 PASS/REWORK 结论。',
+    responsibilities: ['参考图对比', '保真度评审', '具体差异清单', 'PASS/REWORK 结论'],
+    outputs: ['design/visual-fidelity-report.md'],
+    checklist: ['先用 Read 工具真实查看每张参考图', '逐项列出布局/配色/字体/间距差异', 'REWORK 时给出可执行的具体修改点', '结论以 PASS 或 REWORK 开头'],
+    handoff: '把保真度报告和具体差异清单交回视觉设计师用于下一轮重生成；PASS 后交给技术总监进入架构基线。',
+  },
+  {
     roleId: 'tech_director',
     label: '技术总监',
     skillName: 'tech-baseline-adr',

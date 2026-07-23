@@ -104,7 +104,7 @@ describe('evolution artifact store and inbox scanner', () => {
     expect(run.stage).toBe('detected');
     expect(run.roundtableGateMode).toBe('planning');
     expect(run.artifacts[0]?.path).toBe('input/checkout.md');
-    expect(run.artifacts.filter((artifact) => artifact.kind === 'role_skill')).toHaveLength(11);
+    expect(run.artifacts.filter((artifact) => artifact.kind === 'role_skill')).toHaveLength(12);
     const productSkillArtifact = run.artifacts.find((artifact) => artifact.roleId === 'product_manager' && artifact.kind === 'role_skill');
     expect(productSkillArtifact?.path).toBe('.imc/skills/evolution/product-prd.md');
     expect(productSkillArtifact?.preview).toEqual(expect.objectContaining({

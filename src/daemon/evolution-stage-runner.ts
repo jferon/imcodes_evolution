@@ -2,10 +2,7 @@ import { createHash } from 'node:crypto';
 import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import {
-  EVOLUTION_ARTIFACTS_MAX,
   EVOLUTION_ARTIFACT_PREVIEW_MAX_CHARS,
-  EVOLUTION_DISCUSSION_ITEMS_MAX,
-  EVOLUTION_EVIDENCE_ITEMS_MAX,
   EVOLUTION_ROLE_IDS,
   canTransitionEvolutionStage,
   isEvolutionTerminalStage,
@@ -16,15 +13,12 @@ import {
   type EvolutionStage,
 } from '../../shared/evolution-pipeline-constants.js';
 import type {
-  EvolutionArtifactRef,
   EvolutionArtifactPreview,
-  EvolutionDiscussionMessage,
-  EvolutionEvidence,
   EvolutionRun,
-  EvolutionScore,
 } from '../../shared/evolution-pipeline-types.js';
 import { getEvolutionRunPaths, writeEvolutionRun } from './evolution-artifact-store.js';
 import { runEvolutionTasteHifiGeneration } from './evolution-design-runner.js';
+import { appendDiscussion, appendEvidence, appendLiveEvent, upsertArtifact, upsertScore } from './evolution-run-helpers.js';
 
 export interface RunEvolutionPlanningStagesOptions {
   projectRoot: string;
@@ -728,30 +722,6 @@ function warRoomInstructionObjects(instructions: WarRoomInstruction[]): Array<Re
     text: instruction.text,
     createdAt: instruction.createdAt,
   }));
-}
-
-function upsertArtifact(run: EvolutionRun, artifact: EvolutionArtifactRef): void {
-  const index = run.artifacts.findIndex((entry) => entry.id === artifact.id || entry.path === artifact.path);
-  if (index >= 0) run.artifacts[index] = artifact;
-  else run.artifacts.push(artifact);
-  run.artifacts = run.artifacts.slice(-EVOLUTION_ARTIFACTS_MAX);
-}
-
-function appendEvidence(run: EvolutionRun, evidence: EvolutionEvidence): void {
-  run.evidence = [...run.evidence, evidence].slice(-EVOLUTION_EVIDENCE_ITEMS_MAX);
-}
-
-function appendDiscussion(run: EvolutionRun, message: Omit<EvolutionDiscussionMessage, 'id'>): void {
-  const id = `discussion-${sha256(`${message.kind}:${message.stage}:${message.roleId ?? 'system'}:${message.text}:${message.createdAt}`).slice(0, 16)}`;
-  const existing = new Set((run.discussion ?? []).map((entry) => entry.id));
-  if (existing.has(id)) return;
-  run.discussion = [...(run.discussion ?? []), { id, ...message }].slice(-EVOLUTION_DISCUSSION_ITEMS_MAX);
-}
-
-function upsertScore(run: EvolutionRun, score: EvolutionScore): void {
-  const index = run.scores.findIndex((entry) => entry.module === score.module);
-  if (index >= 0) run.scores[index] = score;
-  else run.scores.push(score);
 }
 
 function roleStatusForStage(roleId: EvolutionRoleId, stage: EvolutionStage): EvolutionRoleStatus {
@@ -2044,6 +2014,57 @@ function renderStagingSetup(digest: RequirementDigest, run: EvolutionRun, change
   ].join('\n');
 }
 
+// ── A1: requirement classification gate (watcher-triggered runs only) ────────
+//
+// A presence-only inbox trigger cannot distinguish "please build this" from
+// "unrelated notes dropped near the inbox". This cheap, deterministic
+// heuristic runs before the full role cascade spends real agent turns.
+// v1 bias: proceed when uncertain — only a clearly-non-actionable document
+// blocks (a false block costs user trust more than one extra run costs).
+
+interface RequirementClassification {
+  verdict: 'actionable' | 'not_actionable';
+  signals: string[];
+}
+
+const REQUIREMENT_POSITIVE_NAME_RE = /(prd|requirement|req\b|brief|feature|spec|story|proposal|需求|方案|设计|功能)/i;
+const REQUIREMENT_NEGATIVE_NAME_RE = /(changelog|readme|license|notes?\b|meeting|minutes|log\b|draft|archive|草稿|随笔|笔记|日志|会议)/i;
+const REQUIREMENT_LANGUAGE_RE = /(实现|开发|新增|支持|优化|修复|需要|要求|希望|用户可以|作为用户|implement|build |create |add |support |fix |feature|should |must |i want|as a user|user can)/i;
+const REQUIREMENT_MIN_CONTENT_CHARS = 40;
+
+function classifyRequirementCandidate(raw: string, fileName: string): RequirementClassification {
+  const signals: string[] = [];
+  const compact = raw.replace(/\s+/g, '');
+  const positiveName = REQUIREMENT_POSITIVE_NAME_RE.test(fileName);
+  const negativeName = REQUIREMENT_NEGATIVE_NAME_RE.test(fileName);
+  const tooShort = compact.length < REQUIREMENT_MIN_CONTENT_CHARS;
+  const requirementLanguage = REQUIREMENT_LANGUAGE_RE.test(raw);
+  if (positiveName) signals.push(`file name "${fileName}" is requirement-shaped`);
+  if (negativeName) signals.push(`file name "${fileName}" looks like notes/archive material, not a build request`);
+  if (tooShort) signals.push(`content is shorter than ${REQUIREMENT_MIN_CONTENT_CHARS} meaningful characters`);
+  if (requirementLanguage) signals.push('content contains requirement/imperative language');
+  if (!requirementLanguage) signals.push('no requirement/imperative language detected');
+  const notActionable = !positiveName && !requirementLanguage && (negativeName || tooShort);
+  return { verdict: notActionable ? 'not_actionable' : 'actionable', signals };
+}
+
+function renderRequirementClassification(classification: RequirementClassification, run: EvolutionRun, bypassed: boolean): string {
+  return [
+    '# Requirement Classification',
+    '',
+    `- Source: \`${run.source.relativePath}\``,
+    `- Requested by: \`${run.source.requestedBy ?? 'unknown'}\``,
+    `- Verdict: **${bypassed ? 'bypassed (explicit launch)' : classification.verdict}**`,
+    '',
+    '## Signals',
+    ...classification.signals.map((signal) => `- ${signal}`),
+    '',
+    bypassed
+      ? '_Classification applies only to passive watcher-triggered runs; explicit launches proceed unconditionally._'
+      : '_v1 heuristic is biased toward proceeding when uncertain; only clearly-non-actionable documents pause for human confirmation._',
+  ].join('\n');
+}
+
 async function readRequirement(projectRoot: string, run: EvolutionRun): Promise<string> {
   const sourcePath = safeJoin(projectRoot, run.source.relativePath);
   const sourceStat = await stat(sourcePath);
@@ -2066,6 +2087,44 @@ export async function runEvolutionPlanningStages(options: RunEvolutionPlanningSt
   const instructions = collectWarRoomInstructions(run);
 
   if (run.stage === 'detected') {
+    const classificationApplies = run.source.requestedBy === 'watcher';
+    const classification = classifyRequirementCandidate(raw, run.source.fileName);
+    const classificationQuestionId = `requirement-classification-${run.runId}`;
+    const previouslyBlocked = run.blockingQuestions.some((question) => question.id === classificationQuestionId);
+    await writeRunArtifact({
+      projectRoot,
+      run,
+      kind: 'requirement_classification',
+      path: 'artifacts/requirement-classification.md',
+      title: 'Requirement Classification',
+      roleId: 'loop_supervisor',
+      stage: 'detected',
+      content: renderRequirementClassification(classification, run, !classificationApplies),
+      nowMs,
+    });
+    if (classificationApplies && classification.verdict === 'not_actionable' && !previouslyBlocked) {
+      // First-time block only: if a human already reviewed this question and
+      // chose to continue, the retained question id acts as the override and
+      // the run proceeds instead of re-blocking forever.
+      run.blockingQuestions.push({
+        id: classificationQuestionId,
+        stage: 'needs_human',
+        roleId: 'loop_supervisor',
+        question: `自动分类认为 \`${run.source.relativePath}\` 不像一个可执行的需求文档（${classification.signals.join('；')}）。请确认是否要为它启动完整的自我进化流程；点击“继续执行”将忽略此判断并继续。`,
+        createdAt: nowMs,
+      });
+      appendDiscussion(run, {
+        kind: 'gate',
+        stage: 'needs_human',
+        roleId: 'loop_supervisor',
+        author: 'Loop Supervisor / 总控',
+        text: '入口分类判定该文件不像可执行需求，已暂停等待人工确认，避免为无关文件消耗完整多角色流程。',
+        artifactIds: [artifactId('requirement_classification', 'artifacts/requirement-classification.md')],
+        createdAt: nowMs,
+      });
+      await transition(options, 'needs_human', '入口分类不确定该文件是否为需求文档，已暂停等待人工确认。');
+      return run;
+    }
     await writeRunArtifact({
       projectRoot,
       run,
@@ -2337,7 +2396,33 @@ export async function runEvolutionPlanningStages(options: RunEvolutionPlanningSt
       content: renderDesignHandoffPackage(digest, run, instructions, uiModel, designReferenceImages),
       nowMs,
     });
+    // B5b — the taste-skill generation subprocess can run for up to 10 minutes
+    // (DEFAULT_TASTE_TIMEOUT_MS) with no intermediate output. Emit explicit
+    // start/end live events so the War Room timeline shows the window opening
+    // and closing instead of appearing frozen for the whole duration.
+    appendLiveEvent(run, {
+      source: 'taste_skill',
+      kind: 'status',
+      severity: 'info',
+      roleId: 'visual_designer',
+      stage: run.stage,
+      title: 'Taste-skill generation · started',
+      detail: 'Running run-taste-skill.mjs (up to 10 min).',
+      createdAt: nowMs,
+    });
     const tasteResult = await runEvolutionTasteHifiGeneration({ projectRoot, runId: run.runId, nowMs });
+    appendLiveEvent(run, {
+      source: 'taste_skill',
+      kind: 'status',
+      severity: tasteResult.status === 'passed' ? 'success' : tasteResult.status === 'failed' ? 'error' : 'info',
+      roleId: 'visual_designer',
+      stage: run.stage,
+      title: `Taste-skill generation · ${tasteResult.status}`,
+      detail: tasteResult.summary,
+      ...(tasteResult.commandLine ? { command: tasteResult.commandLine } : {}),
+      ...(typeof tasteResult.exitCode === 'number' ? { exitCode: tasteResult.exitCode } : {}),
+      createdAt: tasteResult.completedAt,
+    });
     let hifiOutputAvailable = false;
     if (tasteResult.logRelativePath && tasteResult.logContent) {
       await writeRunArtifact({

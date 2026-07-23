@@ -11,6 +11,7 @@ import {
   EVOLUTION_AUTO_DELIVER_PRESET_IDS,
   EVOLUTION_DESIGN_TARGET_SURFACES,
   EVOLUTION_REQUIREMENT_FILE_EXTENSIONS,
+  EVOLUTION_REQUIREMENT_IMAGE_EXTENSIONS,
   EVOLUTION_REQUIREMENT_FILE_MAX_BYTES,
   EVOLUTION_REQUIREMENT_INBOX_DIR,
   EVOLUTION_REQUEST_ID_MAX_BYTES,
@@ -133,7 +134,10 @@ export function isEvolutionSafeRelativePath(value: string): boolean {
   return value.split('/').every((segment) => segment !== '' && segment !== '.' && segment !== '..');
 }
 
-export function validateEvolutionRequirementSourcePath(value: unknown): EvolutionValidationResult<string> {
+export function validateEvolutionRequirementSourcePath(
+  value: unknown,
+  options: { allowImages?: boolean } = {},
+): EvolutionValidationResult<string> {
   if (typeof value !== 'string') {
     return { ok: false, issues: [issue('invalid_source_path', 'Requirement source path must be a string.')] };
   }
@@ -147,11 +151,20 @@ export function validateEvolutionRequirementSourcePath(value: unknown): Evolutio
     issues.push(issue('source_path_outside_inbox', `Requirement source path must live under ${EVOLUTION_REQUIREMENT_INBOX_DIR}/.`));
   }
   const ext = extensionOf(sourcePath);
-  if (!isOneOf(ext, EVOLUTION_REQUIREMENT_FILE_EXTENSIONS)) {
+  // `allowImages` widens acceptance for the passive inbox *watcher* only — a
+  // run's actual source document (the launch path) stays text-only; an
+  // images-only drop gets a synthesized text brief as its source instead.
+  const allowedExtension = isOneOf(ext, EVOLUTION_REQUIREMENT_FILE_EXTENSIONS)
+    || (options.allowImages === true && isOneOf(ext, EVOLUTION_REQUIREMENT_IMAGE_EXTENSIONS));
+  if (!allowedExtension) {
     issues.push(issue('unsupported_requirement_extension', `Requirement source file must use one of: ${EVOLUTION_REQUIREMENT_FILE_EXTENSIONS.join(', ')}.`));
   }
   if (issues.length > 0) return { ok: false, issues };
   return { ok: true, value: sourcePath, issues: [] };
+}
+
+export function isEvolutionRequirementImagePath(value: string): boolean {
+  return isOneOf(extensionOf(value), EVOLUTION_REQUIREMENT_IMAGE_EXTENSIONS);
 }
 
 export function validateEvolutionArtifactRelativePath(value: unknown, path = 'artifact.path'): EvolutionValidationResult<string> {

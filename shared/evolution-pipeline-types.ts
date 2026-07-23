@@ -362,6 +362,13 @@ export interface EvolutionProjection {
   linkedAutoDeliverRunId?: string;
   latestMessage?: string;
   terminalReason?: string;
+  /**
+   * Present only while a user-initiated pause is in effect. `pausing` means
+   * the pause was requested but in-flight stage work is still running until
+   * its next checkpoint; `paused` means nothing is executing anymore. Lets
+   * the UI avoid implying an instantaneous stop that hasn't happened yet.
+   */
+  userPauseState?: 'pausing' | 'paused';
   elapsedMs: number;
   updatedAt: number;
 }

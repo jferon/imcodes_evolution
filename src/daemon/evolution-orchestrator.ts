@@ -1,13 +1,12 @@
 import { createHash } from 'node:crypto';
-import { copyFile, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
-import { basename, dirname, extname, isAbsolute, relative, resolve } from 'node:path';
+import { copyFile, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import {
   EVOLUTION_ARTIFACT_PREVIEW_MAX_CHARS,
-  EVOLUTION_ARTIFACTS_MAX,
   EVOLUTION_AUTO_DELIVER_PRESET_IDS,
   EVOLUTION_DESIGN_TARGET_SURFACES,
-  EVOLUTION_DISCUSSION_ITEMS_MAX,
   EVOLUTION_PIPELINE_MSG,
+  EVOLUTION_VISUAL_FIDELITY_ROUNDTABLE_ID,
   EVOLUTION_REQUIREMENT_INBOX_DIR,
   EVOLUTION_RUN_ROOT_DIR,
   EVOLUTION_ROLE_IDS,
@@ -29,9 +28,7 @@ import type {
   EvolutionArtifactPreview,
   EvolutionEvidence,
   EvolutionExecutionTimelineItem,
-  EvolutionDiscussionMessage,
   EvolutionLaunchRequest,
-  EvolutionLiveEvent,
   EvolutionLoopControl,
   EvolutionLoopControlMode,
   EvolutionLoopControlSignal,
@@ -41,7 +38,6 @@ import type {
   EvolutionReferenceBriefImportResult,
   EvolutionRun,
   EvolutionRoundtableRef,
-  EvolutionScore,
   EvolutionValidationIssue,
   EvolutionValidationResult,
 } from '../../shared/evolution-pipeline-types.js';
@@ -63,9 +59,12 @@ import {
   writeEvolutionRun,
 } from './evolution-artifact-store.js';
 import { checkEvolutionStagingDeliveryConfig, runEvolutionStagingDelivery } from './evolution-delivery-runner.js';
+import { runEvolutionTasteHifiGeneration } from './evolution-design-runner.js';
 import { EvolutionPlanningPausedError, runEvolutionPlanningStages } from './evolution-stage-runner.js';
+import { appendDiscussion, appendEvidence, appendLiveEvent, shortSha256, upsertArtifact, upsertScore } from './evolution-run-helpers.js';
 import { lookupAttachmentById } from './file-transfer-handler.js';
-import type { EvolutionInboxCandidate } from './evolution-inbox-watcher.js';
+import { recordEvolutionInboxSeenFiles } from './evolution-inbox-watcher.js';
+import type { EvolutionInboxCandidate, EvolutionInboxCandidateFile, EvolutionInboxCandidateGroup } from './evolution-inbox-watcher.js';
 import { parseSkillMarkdown } from '../../shared/skill-store.js';
 import { getSession } from '../store/session-store.js';
 
@@ -235,6 +234,12 @@ export interface EvolutionRoundtableLaunchRequest {
   roleInstructions: EvolutionRoundtableRoleInstruction[];
   prompt: string;
   artifactPaths: string[];
+  /**
+   * Identifies which EvolutionRoundtableSpec produced this request. `stage`
+   * alone cannot disambiguate — design_hifi hosts both `design-review` and
+   * `visual-fidelity-review`, which need different helper-eligibility rules.
+   */
+  roundtableSpecId: string;
 }
 
 export interface EvolutionRoundtableRoleInstruction {
@@ -260,10 +265,19 @@ export type EvolutionRoundtableLauncher = (
   serverLink: EvolutionServerLink | null,
 ) => Promise<EvolutionRoundtableLaunchResult>;
 
+/**
+ * Cancels a linked OpenSpec Auto Deliver run on behalf of Evolution's own
+ * STOP/pause path. Registered by openspec-auto-deliver-orchestrator.ts (same
+ * one-way registration pattern as EvolutionAutoDeliverLauncher — a direct
+ * import the other way would create a module cycle).
+ */
+export type EvolutionAutoDeliverCanceller = (runId: string, sessionName: string) => Promise<boolean>;
+
 const runsById = new Map<string, RuntimeEntry>();
 const requestProjectionByFingerprint = new Map<string, EvolutionProjection>();
 const activeAutopilotRuns = new Map<string, Promise<EvolutionOrchestratorResult<EvolutionProjection>>>();
 let autoDeliverLauncher: EvolutionAutoDeliverLauncher | null = null;
+let autoDeliverCanceller: EvolutionAutoDeliverCanceller | null = null;
 let roundtableLauncher: EvolutionRoundtableLauncher | null = null;
 let roundtableUserMessageSink: EvolutionRoundtableUserMessageSink | null = null;
 const PLANNING_ROUNDTABLE_ID = 'planning-review' as const;
@@ -276,10 +290,37 @@ interface EvolutionRoundtableSpec {
   artifactKinds: EvolutionArtifactKind[];
   prompt: (run: EvolutionRun) => string;
   gatesAutoDelivery?: boolean;
+  /**
+   * Enforced regardless of `roundtableGateMode`. The strict/planning toggle
+   * modulates subjective planning-agreement reviews; an `alwaysGate` spec is
+   * an evidence-checkable hard bar (e.g. visual fidelity against a reference
+   * image) that must never silently degrade to advisory-only under the
+   * default non-strict mode — and must never take the deterministic local
+   * text-only fallback, which cannot check what this gate exists to check.
+   */
+  alwaysGate?: boolean;
+  /** When present and false for a run, the roundtable is not started at all. */
+  shouldRun?: (run: EvolutionRun) => boolean;
 }
 
 export function setEvolutionAutoDeliverLauncher(launcher: EvolutionAutoDeliverLauncher | null): void {
   autoDeliverLauncher = launcher;
+}
+
+export function setEvolutionAutoDeliverCanceller(canceller: EvolutionAutoDeliverCanceller | null): void {
+  autoDeliverCanceller = canceller;
+}
+
+/**
+ * Best-effort cancellation of the nested Auto Deliver run when the user stops
+ * or pauses the parent Evolution run. Without this, STOP only detaches the
+ * parent while the nested run keeps executing (and spending) to completion.
+ */
+async function cancelLinkedAutoDelivery(run: EvolutionRun): Promise<void> {
+  if (!run.linkedAutoDeliverRunId || !autoDeliverCanceller) return;
+  try {
+    await autoDeliverCanceller(run.linkedAutoDeliverRunId, run.sessionName);
+  } catch { /* best effort — the linked run may already be terminal or gone */ }
 }
 
 export function setEvolutionRoundtableLauncher(launcher: EvolutionRoundtableLauncher | null): void {
@@ -307,10 +348,6 @@ function describeUnknownError(error: unknown): string {
   return String(error);
 }
 
-function cloneEvidence(evidence: EvolutionEvidence): EvolutionEvidence {
-  return { ...evidence };
-}
-
 function launchFingerprint(request: EvolutionLaunchRequest): string {
   return JSON.stringify({
     requestId: request.requestId,
@@ -324,10 +361,6 @@ function launchFingerprint(request: EvolutionLaunchRequest): string {
     roundtableGateMode: request.roundtableGateMode ?? 'planning',
     designTargetSurface: request.designTargetSurface ?? 'auto',
   });
-}
-
-function shortSha256(value: string): string {
-  return createHash('sha256').update(value).digest('hex').slice(0, 16);
 }
 
 function sha256(value: Buffer | string): string {
@@ -904,31 +937,6 @@ function applyRoleStatesForStage(run: EvolutionRun, stage: EvolutionStage, nowMs
   });
 }
 
-function appendEvidence(run: EvolutionRun, evidence: EvolutionEvidence): void {
-  const next = [...run.evidence.map(cloneEvidence), cloneEvidence(evidence)];
-  run.evidence = next.slice(-200);
-}
-
-function appendLiveEvent(run: EvolutionRun, event: Omit<EvolutionLiveEvent, 'id'>): void {
-  const id = `live-${shortSha256(`${event.source}:${event.kind}:${event.stage}:${event.roleId ?? 'system'}:${event.title}:${event.detail}:${event.createdAt}`)}`;
-  const existing = run.liveEvents ?? [];
-  if (existing.some((entry) => entry.id === id)) return;
-  run.liveEvents = [...existing, { id, ...event }].slice(-160);
-}
-
-function upsertArtifact(run: EvolutionRun, artifact: EvolutionArtifactRef): void {
-  const index = run.artifacts.findIndex((entry) => entry.id === artifact.id || entry.path === artifact.path);
-  if (index >= 0) run.artifacts[index] = artifact;
-  else run.artifacts.push(artifact);
-  run.artifacts = run.artifacts.slice(-EVOLUTION_ARTIFACTS_MAX);
-}
-
-function appendDiscussion(run: EvolutionRun, message: Omit<EvolutionDiscussionMessage, 'id'>): void {
-  const id = `discussion-${shortSha256(`${message.kind}:${message.stage}:${message.roleId ?? 'system'}:${message.text}:${message.createdAt}`)}`;
-  if ((run.discussion ?? []).some((entry) => entry.id === id)) return;
-  run.discussion = [...(run.discussion ?? []), { id, ...message }].slice(-EVOLUTION_DISCUSSION_ITEMS_MAX);
-}
-
 function upsertRoundtable(run: EvolutionRun, roundtable: EvolutionRoundtableRef): void {
   const existing = run.roundtables ?? [];
   const index = existing.findIndex((entry) => entry.id === roundtable.id);
@@ -948,12 +956,6 @@ function runningRoundtablesForUserMessage(run: EvolutionRun, roleId: EvolutionRo
     .filter((roundtable) => roundtable.status === 'running' && !!roundtable.p2pRunId && roundtableMatchesRole(roundtable, roleId));
   const currentStage = running.filter((roundtable) => roundtable.stage === run.stage);
   return currentStage.length > 0 ? currentStage : running;
-}
-
-function upsertScore(run: EvolutionRun, score: EvolutionScore): void {
-  const index = run.scores.findIndex((entry) => entry.module === score.module);
-  if (index >= 0) run.scores[index] = score;
-  else run.scores.push(score);
 }
 
 function pauseQuestionId(runId: string, stage: EvolutionStage): string {
@@ -1543,6 +1545,13 @@ export function buildEvolutionProjection(run: EvolutionRun, nowMs = Date.now()):
     ...(run.linkedAutoDeliverRunId ? { linkedAutoDeliverRunId: run.linkedAutoDeliverRunId } : {}),
     ...(run.latestMessage ? { latestMessage: run.latestMessage } : {}),
     ...(run.terminalReason ? { terminalReason: run.terminalReason } : {}),
+    // B3 — while a user pause is in effect, distinguish "pausing" (the
+    // autopilot task is still in flight until its next checkpoint) from
+    // "paused" (nothing is executing anymore) so the UI never implies an
+    // instantaneous stop that hasn't actually happened.
+    ...(run.stage === 'needs_human' && findUserPauseQuestion(run)
+      ? { userPauseState: activeAutopilotRuns.has(run.runId) ? 'pausing' as const : 'paused' as const }
+      : {}),
     elapsedMs: Math.max(0, nowMs - run.createdAt),
     updatedAt: run.updatedAt,
   };
@@ -1673,6 +1682,16 @@ export async function importEvolutionReferenceBrief(
   await mkdir(dirname(sourcePath), { recursive: true });
   await writeFile(sourcePath, content, 'utf8');
 
+  // A3 — pre-seed the passive watcher's ledger with this deliberate flow's
+  // own files. The watcher accepts image extensions now, so without this it
+  // would see brief.md + the copied references as a brand-new requirement
+  // group and auto-launch a duplicate run for a task the user just started
+  // explicitly via the War Room button.
+  await recordEvolutionInboxSeenFiles(projectRoot, [
+    sourceRelativePath,
+    ...copiedImages.map((image) => image.relativePath),
+  ]);
+
   return ok({
     requestId: options.requestId,
     sourceRelativePath,
@@ -1703,6 +1722,120 @@ export async function launchEvolutionRunFromInboxCandidate(options: {
       ...(options.projectName ? { projectName: options.projectName } : {}),
       sourceRelativePath: options.candidate.sourceRelativePath,
       sourceSizeBytes: options.candidate.sizeBytes,
+      requestedBy: 'watcher',
+      autoStart: true,
+      autoStartImplementation: options.autoStartImplementation ?? true,
+      autoDeliverPresetId: 'standard',
+    },
+  });
+}
+
+function renderWatcherGroupBriefMarkdown(options: {
+  createdAt: number;
+  images: EvolutionInboxCandidateFile[];
+  briefRelativePath: string;
+}): string {
+  const briefDir = dirname(options.briefRelativePath);
+  const linkFor = (relativePath: string): string => relative(briefDir, relativePath).split('\\').join('/');
+  return [
+    '# 手稿/参考图驱动的需求 Brief',
+    '',
+    `Created at: ${new Date(options.createdAt).toISOString()}`,
+    '',
+    '## 输入说明',
+    '',
+    '- 这是自我进化 inbox 监听器根据用户投递的手稿/参考图自动生成的启动文档。',
+    '- 后续产品、设计、架构与开发角色必须先阅读下方参考图，再进入 PRD、低保真、高保真和实现拆解。',
+    '- 高保真设计必须与参考图表达的布局、信息层级、视觉气质和核心业务目标保持可追溯关系；不得输出通用模板化页面。',
+    '- 用户未附文字说明，请以参考图为主要需求来源，并在不确定处列出显式假设。',
+    '',
+    '## 参考图',
+    '',
+    ...options.images.flatMap((image, index) => [
+      `### ${index + 1}. ${basename(image.relativePath)}`,
+      '',
+      `![reference-${index + 1}](${linkFor(image.relativePath)})`,
+      '',
+      `- 文件：\`${image.relativePath}\``,
+      `- 大小：${image.sizeBytes} bytes`,
+      '',
+    ]),
+    '## 期望输出',
+    '',
+    '1. 结合参考图补全可执行 PRD、用户故事和验收标准。',
+    '2. 生成低保真流程/线框，说明每张参考图如何影响信息架构。',
+    '3. 生成高保真 UI 说明与可交付设计产物。',
+    '4. 输出技术架构基线、OpenSpec proposal/design/tasks、实现任务矩阵、测试计划和交付门禁。',
+    '',
+  ].join('\n');
+}
+
+function pickGroupPrimaryTextFile(files: EvolutionInboxCandidateFile[]): EvolutionInboxCandidateFile | null {
+  const textFiles = files.filter((file) => file.kind === 'text');
+  if (textFiles.length === 0) return null;
+  return textFiles.find((file) => /brief/i.test(basename(file.relativePath)))
+    ?? textFiles.find((file) => file.relativePath.toLowerCase().endsWith('.md'))
+    ?? textFiles[0]!;
+}
+
+/**
+ * A2 — one grouped inbox drop (a subdirectory of files, or a lone root-level
+ * manuscript image) maps to exactly ONE Evolution run instead of N. A text
+ * member becomes the run's source directly (sibling images are discovered by
+ * the existing design-reference machinery); an images-only group first gets a
+ * synthesized brief so the pipeline always has a text source document.
+ */
+export async function launchEvolutionRunFromInboxCandidateGroup(options: {
+  projectRoot: string;
+  sessionName: string;
+  group: EvolutionInboxCandidateGroup;
+  requestId?: string;
+  projectName?: string;
+  autoStartImplementation?: boolean;
+  nowMs?: number;
+}): Promise<EvolutionOrchestratorResult<EvolutionProjection>> {
+  const nowMs = options.nowMs ?? Date.now();
+  const projectRoot = safeProjectRoot(options.projectRoot);
+  const { group } = options;
+  if (group.files.length === 0) return fail('empty_inbox_candidate_group', 'Inbox candidate group contains no files.');
+
+  const primary = pickGroupPrimaryTextFile(group.files);
+  if (primary) {
+    return launchEvolutionRunFromInboxCandidate({
+      projectRoot,
+      sessionName: options.sessionName,
+      candidate: { sourceRelativePath: primary.relativePath, sizeBytes: primary.sizeBytes, mtimeMs: primary.mtimeMs },
+      ...(options.requestId ? { requestId: options.requestId } : {}),
+      ...(options.projectName ? { projectName: options.projectName } : {}),
+      ...(typeof options.autoStartImplementation === 'boolean' ? { autoStartImplementation: options.autoStartImplementation } : {}),
+      nowMs,
+    });
+  }
+
+  // Images-only drop — synthesize the text brief the pipeline needs.
+  const images = group.files.filter((file) => file.kind === 'image');
+  if (images.length === 0) return fail('empty_inbox_candidate_group', 'Inbox candidate group has neither text nor image files.');
+  const atInboxRoot = group.groupRelativeDir === EVOLUTION_REQUIREMENT_INBOX_DIR;
+  const briefRelativePath = atInboxRoot
+    ? `${EVOLUTION_REQUIREMENT_INBOX_DIR}/${basename(images[0]!.relativePath).replace(/\.[^.]+$/, '')}-brief.md`
+    : `${group.groupRelativeDir}/brief.md`;
+  const briefPath = safeProjectRelativePath(projectRoot, briefRelativePath);
+  const content = renderWatcherGroupBriefMarkdown({ createdAt: nowMs, images, briefRelativePath });
+  await mkdir(dirname(briefPath), { recursive: true });
+  await writeFile(briefPath, content, 'utf8');
+  // Our own write must never look like a fresh passive drop on the next poll.
+  await recordEvolutionInboxSeenFiles(projectRoot, [briefRelativePath]);
+
+  const briefStat = await stat(briefPath);
+  return launchEvolutionRun({
+    projectRoot,
+    nowMs,
+    request: {
+      requestId: options.requestId ?? `watcher-group-${shortSha256(`${options.sessionName}:${group.groupRelativeDir}:${images.map((image) => image.relativePath).join(',')}`)}`,
+      sessionName: options.sessionName,
+      ...(options.projectName ? { projectName: options.projectName } : {}),
+      sourceRelativePath: briefRelativePath,
+      sourceSizeBytes: briefStat.size,
       requestedBy: 'watcher',
       autoStart: true,
       autoStartImplementation: options.autoStartImplementation ?? true,
@@ -1812,6 +1945,7 @@ export async function stopEvolutionRun(options: StopEvolutionRunOptions): Promis
   const entry = getRuntimeEntry(validRunId.value);
   if (!entry) return fail('evolution_run_not_found', `Evolution run not found: ${validRunId.value}`, 'runId');
   if (isEvolutionTerminalStage(entry.run.stage)) return ok(buildEvolutionProjection(entry.run, options.nowMs ?? Date.now()));
+  await cancelLinkedAutoDelivery(entry.run);
   return advanceEvolutionRunStage({
     runId: validRunId.value,
     nextStage: 'stopped',
@@ -1830,6 +1964,7 @@ export async function pauseEvolutionRun(options: PauseEvolutionRunOptions): Prom
   if (isEvolutionTerminalStage(run.stage)) return ok(buildEvolutionProjection(run, nowMs));
   const existingPause = findUserPauseQuestion(run);
   if (existingPause && run.stage === 'needs_human') return ok(buildEvolutionProjection(run, nowMs));
+  await cancelLinkedAutoDelivery(run);
   const pausedFromStage = run.stage;
   const reason = options.reason ?? `Paused from Evolution War Room at ${pausedFromStage}.`;
   run.stage = 'needs_human';
@@ -3318,29 +3453,32 @@ function isRecoverablePostSummaryRoundtableFailure(roundtable: EvolutionRoundtab
     reason.includes('post_summary_execution_confirmation_timeout');
 }
 
-function strictGateSpecsForStage(stage: EvolutionStage): EvolutionRoundtableSpec[] {
-  return EVOLUTION_ROUNDTABLE_SPECS.filter((spec) => spec.stage === stage && !spec.gatesAutoDelivery);
+/**
+ * Non-auto-delivery gate specs enforced for this run at this stage: every
+ * spec in strict mode, `alwaysGate` specs in every mode.
+ */
+function enforcedGateSpecsForStage(run: EvolutionRun, stage: EvolutionStage): EvolutionRoundtableSpec[] {
+  const strict = (run.roundtableGateMode ?? 'planning') === 'strict';
+  return EVOLUTION_ROUNDTABLE_SPECS.filter((spec) => spec.stage === stage && !spec.gatesAutoDelivery && (strict || spec.alwaysGate === true));
 }
 
 function strictRoundtableGateDecisionForStage(run: EvolutionRun, stage: EvolutionStage): PlanningRoundtableGateDecision {
-  if ((run.roundtableGateMode ?? 'planning') !== 'strict') return { disposition: 'allow', reason: 'strict_roundtable_gate_disabled' };
-  const specs = strictGateSpecsForStage(stage);
-  if (specs.length === 0) return { disposition: 'allow', reason: 'no_strict_roundtable_for_stage' };
+  const specs = enforcedGateSpecsForStage(run, stage);
+  if (specs.length === 0) return { disposition: 'allow', reason: 'no_enforced_roundtable_for_stage' };
   for (const spec of specs) {
     const roundtable = (run.roundtables ?? []).find((entry) => entry.id === spec.id);
     if (!roundtable) return { disposition: 'allow', reason: `${spec.id}_not_started` };
     const decision = roundtableGateDecision(roundtable);
     if (decision.disposition !== 'allow') return decision;
   }
-  return { disposition: 'allow', reason: 'strict_roundtables_passed_or_skipped' };
+  return { disposition: 'allow', reason: 'enforced_roundtables_passed_or_skipped' };
 }
 
 function strictRoundtableGateBlockForStage(
   run: EvolutionRun,
   stage: EvolutionStage,
 ): { roundtable: EvolutionRoundtableRef; reason: string } | null {
-  if ((run.roundtableGateMode ?? 'planning') !== 'strict') return null;
-  for (const spec of strictGateSpecsForStage(stage)) {
+  for (const spec of enforcedGateSpecsForStage(run, stage)) {
     const roundtable = (run.roundtables ?? []).find((entry) => entry.id === spec.id);
     if (!roundtable) continue;
     const decision = roundtableGateDecision(roundtable);
@@ -3573,6 +3711,166 @@ async function reconcileRuntimeRoundtableContextFiles(
   return projection;
 }
 
+// ── C7: visual-fidelity maker/checker retry loop ─────────────────────────────
+//
+// On a REWORK verdict from the fidelity checker, re-run the maker (the taste
+// generation) with the checker's specific feedback, bounded by
+// `run.budget.maxImplementationAttempts` — instead of escalating straight to
+// needs_human on the first REWORK.
+//
+// Two load-bearing constraints (discussion round 9/桑桑):
+// 1. The regeneration is a DIRECT function call — never a stage transition.
+//    `EVOLUTION_STAGE_TRANSITIONS` has no design_hifi → design_lofi edge;
+//    attempting one throws on the very first retry, every time.
+// 2. The checker's REWORK reasoning is appended into taste-hifi-prompt.md
+//    BEFORE re-calling generation (the script reads that exact file), so each
+//    attempt actually refines rather than re-running against stale input.
+
+const DESIGN_HIFI_FIDELITY_ATTEMPT_EVIDENCE_SOURCE = 'design_hifi_fidelity_attempt';
+const FIDELITY_FEEDBACK_SECTION_PREFIX = '## 第 ';
+const FIDELITY_FEEDBACK_SECTION_SUFFIX = ' 轮视觉保真复核反馈（必须修正后重新生成）';
+const FIDELITY_FEEDBACK_SECTION_RE = /^## 第 \d+ 轮视觉保真复核反馈/gm;
+
+function fidelityPromptPath(projectRoot: string, runId: string): string {
+  const { runDir } = getEvolutionRunPaths(projectRoot, runId);
+  return join(runDir, 'design/taste-hifi-prompt.md');
+}
+
+/**
+ * Attempt count = max(evidence tags, feedback sections already written into
+ * taste-hifi-prompt.md). The prompt file is the durable source of truth —
+ * `run.evidence` is a capped rolling buffer, and long roundtable activity
+ * between attempts could evict older attempt tags, which would undercount
+ * and un-bound the retry loop.
+ */
+async function countFidelityAttempts(projectRoot: string, run: EvolutionRun): Promise<number> {
+  const evidenceCount = run.evidence.filter((entry) => entry.source === DESIGN_HIFI_FIDELITY_ATTEMPT_EVIDENCE_SOURCE).length;
+  let sectionCount = 0;
+  try {
+    const prompt = await readFile(fidelityPromptPath(projectRoot, run.runId), 'utf8');
+    sectionCount = prompt.match(FIDELITY_FEEDBACK_SECTION_RE)?.length ?? 0;
+  } catch { /* prompt file missing — evidence count is the best available */ }
+  return Math.max(evidenceCount, sectionCount);
+}
+
+async function appendFidelityFeedbackToTastePrompt(projectRoot: string, runId: string, attempt: number, feedback: string): Promise<boolean> {
+  try {
+    const promptPath = fidelityPromptPath(projectRoot, runId);
+    const existing = await readFile(promptPath, 'utf8');
+    const section = [
+      '',
+      `${FIDELITY_FEEDBACK_SECTION_PREFIX}${attempt}${FIDELITY_FEEDBACK_SECTION_SUFFIX}`,
+      '',
+      feedback.trim(),
+      '',
+    ].join('\n');
+    await writeFile(promptPath, `${existing}${section}`, 'utf8');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Returns a projection when a retry was dispatched (caller should not
+ * hard-block), or null when the loop is exhausted / not applicable (caller
+ * proceeds with the normal enforced-gate block to needs_human).
+ */
+async function runVisualFidelityMakerRetry(
+  entry: RuntimeEntry,
+  roundtable: EvolutionRoundtableRef,
+  nowMs: number,
+  serverLink: EvolutionServerLink | null | undefined,
+): Promise<EvolutionProjection | null> {
+  const run = entry.run;
+  if (run.stage !== 'design_hifi') return null;
+  const maxAttempts = Math.max(1, run.budget.maxImplementationAttempts);
+  const priorAttempts = await countFidelityAttempts(entry.projectRoot, run);
+  if (priorAttempts >= maxAttempts) {
+    // Exhausted: leave a distinct trail (different from the single-failure
+    // message) and let the caller escalate to needs_human.
+    run.latestMessage = `视觉保真复核连续 ${maxAttempts} 轮未通过（REWORK），已停止自动重试并转入人工处理。`;
+    appendEvidence(run, {
+      source: 'roundtable_hard_gate',
+      summary: `Visual fidelity gate still REWORK after ${maxAttempts} maker/checker attempts; escalating to human.`,
+      createdAt: nowMs,
+    });
+    return null;
+  }
+  const attempt = priorAttempts + 1;
+  const feedback = roundtable.summary ?? 'REWORK（复核未提供具体反馈）';
+
+  appendEvidence(run, {
+    source: DESIGN_HIFI_FIDELITY_ATTEMPT_EVIDENCE_SOURCE,
+    summary: `Fidelity maker/checker attempt ${attempt}/${maxAttempts} dispatched after REWORK.`,
+    createdAt: nowMs,
+  });
+  appendLiveEvent(run, {
+    source: 'taste_skill',
+    kind: 'task_progress',
+    severity: 'info',
+    roleId: 'visual_designer',
+    stage: 'design_hifi',
+    title: `Fidelity retry ${attempt}/${maxAttempts} · regeneration`,
+    detail: `Checker returned REWORK; regenerating with feedback. ${feedback.slice(0, 400)}`,
+    progress: { current: attempt, total: maxAttempts, label: `attempt ${attempt}/${maxAttempts}` },
+    createdAt: nowMs,
+  });
+  appendDiscussion(run, {
+    kind: 'role_update',
+    stage: 'design_hifi',
+    roleId: 'visual_designer',
+    author: '视觉设计师',
+    text: `保真复核 REWORK（第 ${attempt}/${maxAttempts} 轮）：已把复核反馈写入 taste-hifi 提示词并重新生成高保真产物。`,
+    createdAt: nowMs,
+  });
+
+  // (2) feedback into the prompt file BEFORE regeneration.
+  await appendFidelityFeedbackToTastePrompt(entry.projectRoot, run.runId, attempt, feedback);
+  // (1) direct function call — never transition().
+  const tasteResult = await runEvolutionTasteHifiGeneration({ projectRoot: entry.projectRoot, runId: run.runId, nowMs });
+  const regenArtifacts: Array<{ kind: EvolutionArtifactKind; path?: string; title: string }> = [
+    { kind: 'taste_hifi_output', path: tasteResult.outputRelativePath, title: 'taste-skill High-Fidelity Output' },
+    { kind: 'taste_hifi_reference', path: tasteResult.referenceRelativePath, title: 'taste-skill High-Fidelity Reference' },
+    { kind: 'project_style_audit', path: tasteResult.styleAuditRelativePath, title: 'Existing Project Style Audit' },
+    { kind: 'taste_hifi_log', path: tasteResult.logRelativePath, title: 'taste-skill High-Fidelity Generation Log' },
+  ];
+  for (const artifact of regenArtifacts) {
+    if (!artifact.path) continue;
+    upsertArtifact(run, {
+      id: `${artifact.kind}:${artifact.path}`,
+      kind: artifact.kind,
+      path: artifact.path,
+      title: artifact.title,
+      roleId: 'visual_designer',
+      stage: 'design_hifi',
+      createdAt: tasteResult.completedAt,
+    });
+  }
+  appendLiveEvent(run, {
+    source: 'taste_skill',
+    kind: 'status',
+    severity: tasteResult.status === 'passed' ? 'success' : tasteResult.status === 'failed' ? 'error' : 'info',
+    roleId: 'visual_designer',
+    stage: 'design_hifi',
+    title: `Fidelity retry ${attempt}/${maxAttempts} · generation ${tasteResult.status}`,
+    detail: tasteResult.summary,
+    progress: { current: attempt, total: maxAttempts, label: `attempt ${attempt}/${maxAttempts}` },
+    createdAt: tasteResult.completedAt,
+  });
+
+  // Reset the checker roundtable so maybeStartRoundtable dispatches a fresh
+  // review of the regenerated output (it skips ids that already exist). The
+  // prior round's verdict stays in evidence/discussion for the audit trail.
+  run.roundtables = (run.roundtables ?? []).filter((item) => item.id !== roundtable.id);
+  run.latestMessage = `视觉保真第 ${attempt}/${maxAttempts} 轮重生成完成，正在重新启动保真复核。`;
+  await persistAndProject(entry, nowMs);
+  const projections = await maybeStartRoundtablesForStage(entry, serverLink, nowMs, 'design_hifi');
+  const projection = projections[projections.length - 1] ?? await persistAndProject(entry, nowMs);
+  if (serverLink) send(serverLink, { type: EVOLUTION_PIPELINE_MSG.PROJECTION, projection });
+  return projection;
+}
+
 export async function recordEvolutionP2pRunProjection(options: RecordEvolutionP2pRunProjectionOptions): Promise<EvolutionProjection[]> {
   const nowMs = options.nowMs ?? Date.now();
   const p2pRun = options.run;
@@ -3601,9 +3899,35 @@ export async function recordEvolutionP2pRunProjection(options: RecordEvolutionP2
     if (!p2pRun.error && nextStatus === 'complete') delete next.error;
     upsertRoundtable(run, next);
     run.latestMessage = `P2P roundtable ${roundtable.topic} is ${next.status}.`;
-    appendEvidence(run, {
+    // This handler fires on the ~200ms pushState cadence for any active
+    // Evolution-launched roundtable (including C3/C5/C7 dispatches). Both
+    // evidence and liveEvents are CAPPED buffers — append only on meaningful
+    // change (status flip, summary/hop progress, terminal) so identical ticks
+    // don't churn them. For evidence this is load-bearing, not cosmetic: the
+    // C7 attempt counter derives from evidence tags, and per-tick appends
+    // could evict attempt entries within a single multi-minute review round.
+    const meaningfulChange = previousStatus !== nextStatus
+      || roundtable.summary !== summary
+      || nextStatus === 'complete'
+      || nextStatus === 'failed';
+    if (meaningfulChange) appendEvidence(run, {
       source: 'p2p_roundtable',
       summary: run.latestMessage,
+      createdAt: nowMs,
+    });
+    if (meaningfulChange) appendLiveEvent(run, {
+      source: 'p2p_roundtable',
+      kind: 'status',
+      severity: nextStatus === 'failed' ? 'error' : nextStatus === 'complete' ? 'success' : 'info',
+      roleId: 'loop_supervisor',
+      stage: roundtable.stage,
+      title: `Roundtable · ${roundtable.topic}`,
+      detail: summary ?? `round ${p2pRun.current_round}/${p2pRun.total_rounds} · ${next.status}`,
+      progress: {
+        current: Math.max(0, Math.min(p2pRun.current_round, p2pRun.total_rounds)),
+        total: Math.max(1, p2pRun.total_rounds),
+        label: `round ${p2pRun.current_round}/${p2pRun.total_rounds}`,
+      },
       createdAt: nowMs,
     });
     if (previousStatus !== nextStatus || nextStatus === 'complete' || nextStatus === 'failed') {
@@ -3628,12 +3952,20 @@ export async function recordEvolutionP2pRunProjection(options: RecordEvolutionP2
       } else if (gate.disposition === 'allow' && nextStatus === 'complete' && run.autoDelivery?.enabled && !run.linkedAutoDeliverRunId) {
         projection = await maybeStartAutoDelivery(entry, options.serverLink, nowMs) ?? projection;
       }
-    } else if ((run.roundtableGateMode ?? 'planning') === 'strict' && (nextStatus === 'complete' || nextStatus === 'failed')) {
-      const spec = EVOLUTION_ROUNDTABLE_SPECS.find((item) => item.id === roundtable.id && !item.gatesAutoDelivery);
+    } else if (nextStatus === 'complete' || nextStatus === 'failed') {
+      // Enforced gate specs: every non-auto-delivery spec in strict mode,
+      // `alwaysGate` specs in every mode.
+      const spec = enforcedGateSpecsForStage(run, roundtable.stage).find((item) => item.id === roundtable.id);
       if (spec) {
         const gate = roundtableGateDecision(next);
         if (gate.disposition === 'block') {
-          projection = await markStrictRoundtableGateBlocked(entry, next, gate.reason, nowMs, options.serverLink);
+          // C7: a completed fidelity review that returned REWORK first goes
+          // through the bounded maker/checker retry loop; only exhaustion
+          // (or a launch failure, which never enters the loop) hard-blocks.
+          const retried = spec.id === EVOLUTION_VISUAL_FIDELITY_ROUNDTABLE_ID && nextStatus === 'complete'
+            ? await runVisualFidelityMakerRetry(entry, next, nowMs, options.serverLink)
+            : null;
+          projection = retried ?? await markStrictRoundtableGateBlocked(entry, next, gate.reason, nowMs, options.serverLink);
         } else if (gate.disposition === 'allow' && nextStatus === 'complete' && run.stage === spec.stage) {
           appendDiscussion(run, {
             kind: 'role_update',
@@ -3913,6 +4245,38 @@ function renderPlanningRoundtablePrompt(run: EvolutionRun): string {
   ].join('\n');
 }
 
+function renderVisualFidelityRoundtablePrompt(run: EvolutionRun): string {
+  const runDirRelative = `${EVOLUTION_RUN_ROOT_DIR}/${run.runId}`;
+  const referenceImagePaths = run.artifacts
+    .filter((artifact) => artifact.kind === 'design_reference_image')
+    .map((artifact) => `${runDirRelative}/${artifact.path}`);
+  const generatedOutputPaths = run.artifacts
+    .filter((artifact) => artifact.kind === 'hifi_mockup' || artifact.kind === 'taste_hifi_output' || artifact.kind === 'taste_hifi_reference')
+    .map((artifact) => `${runDirRelative}/${artifact.path}`);
+  return [
+    `请以 IM.codes Evolution Factory 视觉保真复核方式审查 run ${run.runId}。这是硬性质量门禁：结论必须基于对参考图像素的真实查看，不允许仅凭文字描述推断。`,
+    '',
+    '## 第一步（必须执行）：用 Read 工具真实查看参考图',
+    '以下路径相对于项目根目录，请逐个用你的 Read 工具打开查看：',
+    ...(referenceImagePaths.length > 0
+      ? referenceImagePaths.map((path) => `- ${path}`)
+      : ['- （未登记参考图产物 — 如确实没有参考图，请在结论中说明无法执行保真对比，并给出 REWORK）']),
+    '',
+    '## 第二步：查看生成的高保真产物',
+    ...(generatedOutputPaths.length > 0
+      ? generatedOutputPaths.map((path) => `- ${path}`)
+      : ['- （未找到生成产物 — 请给出 REWORK 并说明缺失）']),
+    '',
+    '## 第三步：逐项对比并输出结论',
+    '- 布局/信息层级：生成产物与参考图的结构是否可追溯对应。',
+    '- 配色：主色/辅色/背景是否来自参考图（列出具体色值差异）。',
+    '- 字体与间距：字号层级、留白节奏是否一致。',
+    '- 组件：参考图中的关键组件是否全部出现且状态完整。',
+    '',
+    '输出要求：第一行必须是 PASS 或 REWORK；REWORK 时逐条列出具体的、可执行的修改点（供下一轮重生成使用）。',
+  ].join('\n');
+}
+
 const EVOLUTION_ROUNDTABLE_SPECS: EvolutionRoundtableSpec[] = [
   {
     id: 'product-review',
@@ -3929,6 +4293,18 @@ const EVOLUTION_ROUNDTABLE_SPECS: EvolutionRoundtableSpec[] = [
     roles: ['ux_designer', 'visual_designer', 'frontend_developer', 'product_manager'],
     artifactKinds: ['prd', 'prd_review', 'ux_flow', 'wireframe', 'lofi_mockup', 'hifi_spec', 'hifi_mockup', 'taste_hifi_prompt', 'taste_hifi_output', 'design_handoff', 'role_skill'],
     prompt: renderDesignRoundtablePrompt,
+  },
+  {
+    id: EVOLUTION_VISUAL_FIDELITY_ROUNDTABLE_ID,
+    stage: 'design_hifi',
+    topic: '视觉保真复核圆桌',
+    roles: ['visual_fidelity_checker', 'visual_designer'],
+    artifactKinds: ['design_reference_manifest', 'hifi_spec', 'hifi_mockup', 'taste_hifi_output', 'taste_hifi_reference', 'design_handoff', 'role_skill'],
+    prompt: renderVisualFidelityRoundtablePrompt,
+    alwaysGate: true,
+    // Fidelity-vs-reference is undefined without reference images — skip
+    // entirely for text-only requirements instead of gating on nothing.
+    shouldRun: (run) => run.artifacts.some((artifact) => artifact.kind === 'design_reference_image'),
   },
   {
     id: 'architecture-review',
@@ -3971,11 +4347,51 @@ function roundtableRoleInstructions(run: EvolutionRun, roles: readonly Evolution
 }
 
 function lightModeRoundtableFallbackReason(run: EvolutionRun, spec: EvolutionRoundtableSpec): string | null {
+  // An alwaysGate spec is an evidence-checkable hard bar — it must run for
+  // real in every mode, never as a deterministic local review.
+  if (spec.alwaysGate) return null;
   if ((run.roundtableGateMode ?? 'planning') === 'strict') return null;
   if (spec.gatesAutoDelivery) {
     return run.autoDelivery?.enabled ? null : 'planning_roundtable_not_needed_without_auto_delivery';
   }
   return 'planning_light_mode_non_gate_roundtable';
+}
+
+/**
+ * C5 hard-block half: an `alwaysGate` roundtable that cannot actually run
+ * (no launcher, no capable helper, clone failed) must never be synthesized
+ * into a local text-only PASS — that would be a fabricated verdict for a
+ * check that is inherently about pixels the fallback never looked at. Record
+ * the roundtable as failed instead; the enforced-gate machinery then blocks
+ * the stage to `needs_human` with an explicit reason.
+ */
+async function failRoundtableWithoutFallback(
+  entry: RuntimeEntry,
+  serverLink: EvolutionServerLink | null | undefined,
+  nowMs: number,
+  spec: EvolutionRoundtableSpec,
+  base: EvolutionRoundtableRef,
+  reason: string,
+): Promise<EvolutionProjection> {
+  const run = entry.run;
+  upsertRoundtable(run, { ...base, status: 'failed', error: reason, updatedAt: nowMs });
+  run.latestMessage = `${spec.topic}无法真实执行（${reason}），已按硬门禁拦截，不使用本地兜底评审。`;
+  appendDiscussion(run, {
+    kind: 'gate',
+    stage: spec.stage,
+    roleId: 'loop_supervisor',
+    author: 'Loop Supervisor / 总控',
+    text: run.latestMessage,
+    createdAt: nowMs,
+  });
+  appendEvidence(run, {
+    source: 'roundtable_hard_gate',
+    summary: `${spec.id} could not run (${reason}); hard-blocked instead of local fallback.`,
+    createdAt: nowMs,
+  });
+  const projection = await persistAndProject(entry, nowMs);
+  if (serverLink) send(serverLink, { type: EVOLUTION_PIPELINE_MSG.PROJECTION, projection });
+  return projection;
 }
 
 async function completeRoundtableWithLocalFallback(
@@ -4037,6 +4453,7 @@ async function maybeStartRoundtable(
 ): Promise<EvolutionProjection | null> {
   const run = entry.run;
   if (run.stage !== spec.stage) return null;
+  if (spec.shouldRun && !spec.shouldRun(run)) return null;
   const roundtableId = spec.id;
   if ((run.roundtables ?? []).some((roundtable) => roundtable.id === roundtableId)) return null;
 
@@ -4065,6 +4482,7 @@ async function maybeStartRoundtable(
 
   if (!roundtableLauncher) {
     const reason = 'roundtable_launcher_unavailable';
+    if (spec.alwaysGate) return failRoundtableWithoutFallback(entry, serverLink, nowMs, spec, base, reason);
     return completeRoundtableWithLocalFallback(
       entry,
       serverLink,
@@ -4087,10 +4505,12 @@ async function maybeStartRoundtable(
     roleInstructions: roundtableRoleInstructions(run, spec.roles),
     prompt: spec.prompt(run),
     artifactPaths: roundtableArtifactPaths(run, spec),
+    roundtableSpecId: spec.id,
   }, serverLink ?? null);
 
   if (!result.ok && result.skippedReason) {
     const reason = result.skippedReason;
+    if (spec.alwaysGate) return failRoundtableWithoutFallback(entry, serverLink, nowMs, spec, base, reason);
     return completeRoundtableWithLocalFallback(
       entry,
       serverLink,
@@ -4281,6 +4701,17 @@ export async function runEvolutionAutopilot(
         }
         const projection = await persistAndProject(entry, nowMs);
         if (serverLink) send(serverLink, { type: EVOLUTION_PIPELINE_MSG.PROJECTION, projection });
+        return ok(projection);
+      }
+      if (isEvolutionTerminalStage(entry.run.stage)) {
+        // Run already reached a terminal stage (e.g. 'stopped' via a concurrent
+        // stopEvolutionRun call) while this task was still in flight — don't
+        // clobber that terminal state with 'failed'.
+        const projection = await persistAndProject(entry, nowMs);
+        if (serverLink) {
+          send(serverLink, { type: EVOLUTION_PIPELINE_MSG.PROJECTION, projection });
+          send(serverLink, { type: EVOLUTION_PIPELINE_MSG.TERMINAL, projection: { ...projection, terminal: true } });
+        }
         return ok(projection);
       }
       entry.run.stage = 'failed';

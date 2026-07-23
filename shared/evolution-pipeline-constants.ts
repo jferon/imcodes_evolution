@@ -35,6 +35,13 @@ export const EVOLUTION_RUN_ROOT_DIR = '.imc/evolution' as const;
 
 export const EVOLUTION_REQUIREMENT_FILE_EXTENSIONS = ['.md', '.txt', '.json'] as const;
 export type EvolutionRequirementFileExtension = (typeof EVOLUTION_REQUIREMENT_FILE_EXTENSIONS)[number];
+/**
+ * Manuscript/reference image extensions accepted by the passive inbox watcher.
+ * Images are watcher inputs only — a run's source document stays text; an
+ * images-only drop gets a synthesized brief as its source.
+ */
+export const EVOLUTION_REQUIREMENT_IMAGE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.webp'] as const;
+export type EvolutionRequirementImageExtension = (typeof EVOLUTION_REQUIREMENT_IMAGE_EXTENSIONS)[number];
 
 export const EVOLUTION_REQUEST_ID_MAX_BYTES = 128 as const;
 export const EVOLUTION_RUN_ID_MAX_BYTES = 128 as const;
@@ -42,10 +49,23 @@ export const EVOLUTION_SOURCE_PATH_MAX_BYTES = 512 as const;
 export const EVOLUTION_ARTIFACT_PATH_MAX_BYTES = 1024 as const;
 export const EVOLUTION_ARTIFACT_PREVIEW_MAX_CHARS = 256 * 1024;
 export const EVOLUTION_REQUIREMENT_FILE_MAX_BYTES = 8 * 1024 * 1024;
+/**
+ * Separate ceiling for requirement images: the 8MB text-document limit was
+ * never an image-size decision, and a modern phone's manuscript photo or a
+ * scanned page can legitimately exceed it.
+ */
+export const EVOLUTION_REQUIREMENT_IMAGE_MAX_BYTES = 16 * 1024 * 1024;
 export const EVOLUTION_BLOCKING_QUESTIONS_MAX = 50 as const;
 export const EVOLUTION_EVIDENCE_ITEMS_MAX = 200 as const;
 export const EVOLUTION_DISCUSSION_ITEMS_MAX = 300 as const;
 export const EVOLUTION_ARTIFACTS_MAX = 200 as const;
+export const EVOLUTION_LIVE_EVENTS_MAX = 160 as const;
+/**
+ * Roundtable spec id for the hard visual-fidelity gate at design_hifi.
+ * Shared because both the orchestrator (spec definition) and the P2P bridge
+ * (helper-eligibility + dedicated-spawn fallback) must reference the same id.
+ */
+export const EVOLUTION_VISUAL_FIDELITY_ROUNDTABLE_ID = 'visual-fidelity-review' as const;
 export const EVOLUTION_SCORE_MAX = 10 as const;
 
 export const EVOLUTION_STAGES = [
@@ -81,6 +101,7 @@ export const EVOLUTION_ROLE_IDS = [
   'product_critic',
   'ux_designer',
   'visual_designer',
+  'visual_fidelity_checker',
   'tech_director',
   'backend_developer',
   'frontend_developer',
@@ -107,6 +128,7 @@ export type EvolutionDesignTargetSurface = (typeof EVOLUTION_DESIGN_TARGET_SURFA
 
 export const EVOLUTION_ARTIFACT_KINDS = [
   'input',
+  'requirement_classification',
   'normalized_requirement',
   'prd',
   'user_stories',
@@ -121,6 +143,7 @@ export const EVOLUTION_ARTIFACT_KINDS = [
   'taste_hifi_output',
   'taste_hifi_reference',
   'taste_hifi_log',
+  'visual_fidelity_report',
   'project_style_audit',
   'design_reference_manifest',
   'design_reference_image',
