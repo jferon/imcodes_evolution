@@ -71,13 +71,13 @@ describe('EvolutionControlConsole requirement directory picker', () => {
 });
 
 describe('EvolutionControlConsole stage breathing light', () => {
-  function renderWithProjection(stage: string) {
+  function renderWithProjection(stage: string, roles: Array<Record<string, string>> = []) {
     render(
       <EvolutionControlConsole
         ws={{} as never}
         projection={{
           stage,
-          roles: [],
+          roles,
           artifacts: [],
           blockingQuestions: [],
           evidence: [],
@@ -111,8 +111,40 @@ describe('EvolutionControlConsole stage breathing light', () => {
     expect(other?.className).not.toContain('subcard-running-pulse');
   });
 
+  it('maps the running intake and product discussion stages to the PRD progress card', () => {
+    for (const stage of ['intake_normalized', 'product_discussion']) {
+      cleanup();
+      renderWithProjection(stage);
+      const card = screen.getByText('PRD 完善').closest('.evolution-control-stage');
+      expect(card?.className).toContain('current');
+      expect(card?.className).toContain('subcard-running-pulse');
+    }
+  });
+
   it('does not breathe while the run waits for a human', () => {
     renderWithProjection('needs_human');
     expect(document.querySelector('.subcard-running-pulse')).toBeNull();
+  });
+
+  it('breathes on running role chat cards without animating standby roles', () => {
+    renderWithProjection('design_lofi', [
+      {
+        roleId: 'visual_designer',
+        label: '高保真设计',
+        status: 'running',
+        currentAction: '正在生成视觉方案。',
+      },
+      {
+        roleId: 'qa_engineer',
+        label: '测试工程师',
+        status: 'standby',
+        currentAction: '等待测试阶段。',
+      },
+    ]);
+
+    const runningRole = document.querySelector('.evolution-role-chip.status-running');
+    const standbyRole = document.querySelector('.evolution-role-chip.status-standby');
+    expect(runningRole?.className).toContain('subcard-running-pulse');
+    expect(standbyRole?.className).not.toContain('subcard-running-pulse');
   });
 });

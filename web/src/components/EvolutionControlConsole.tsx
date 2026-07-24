@@ -66,17 +66,17 @@ const ROLE_SUMMARIES: Record<string, string> = {
   ops_release_manager: 'Staging、回滚、发布说明和人工门禁。',
 };
 
-const CONSOLE_STAGES: Array<{ stage: EvolutionStage; label: string; detail: string }> = [
-  { stage: 'detected', label: '需求入口', detail: '监听 inbox / 手动启动' },
-  { stage: 'prd_ready', label: 'PRD 完善', detail: '产品分析与验收标准' },
-  { stage: 'design_lofi', label: '低保真', detail: '流程与线框' },
-  { stage: 'design_hifi', label: '高保真', detail: 'Taste Skill UI 输出' },
-  { stage: 'architecture_baseline', label: '架构基线', detail: '技术方案与 ADR' },
-  { stage: 'tasks_ready', label: '任务清单', detail: 'OpenSpec / 实现矩阵' },
-  { stage: 'implementation_loop', label: '开发 Loop', detail: '多 agents 迭代实现' },
-  { stage: 'qa_completion', label: '测试补齐', detail: '用例与证据' },
-  { stage: 'deployed_staging', label: 'Staging', detail: '自动交付验证' },
-  { stage: 'human_release_gate', label: '发布门禁', detail: '生产前人工确认' },
+const CONSOLE_STAGES: Array<{ stage: EvolutionStage; stages: EvolutionStage[]; label: string; detail: string }> = [
+  { stage: 'detected', stages: ['detected'], label: '需求入口', detail: '监听 inbox / 手动启动' },
+  { stage: 'prd_ready', stages: ['intake_normalized', 'product_discussion', 'prd_ready'], label: 'PRD 完善', detail: '产品分析与验收标准' },
+  { stage: 'design_lofi', stages: ['design_lofi'], label: '低保真', detail: '流程与线框' },
+  { stage: 'design_hifi', stages: ['design_hifi'], label: '高保真', detail: 'Taste Skill UI 输出' },
+  { stage: 'architecture_baseline', stages: ['architecture_baseline'], label: '架构基线', detail: '技术方案与 ADR' },
+  { stage: 'tasks_ready', stages: ['tasks_ready'], label: '任务清单', detail: 'OpenSpec / 实现矩阵' },
+  { stage: 'implementation_loop', stages: ['implementation_loop'], label: '开发 Loop', detail: '多 agents 迭代实现' },
+  { stage: 'qa_completion', stages: ['qa_completion'], label: '测试补齐', detail: '用例与证据' },
+  { stage: 'deployed_staging', stages: ['delivery_ready', 'deployed_staging'], label: 'Staging', detail: '自动交付验证' },
+  { stage: 'human_release_gate', stages: ['human_release_gate', 'deployed_production'], label: '发布门禁', detail: '生产前人工确认' },
 ];
 
 const DESIGN_ARTIFACT_KINDS = new Set([
@@ -337,7 +337,13 @@ export function EvolutionControlConsole({
           <div class="evolution-control-stage-grid">
             {CONSOLE_STAGES.map((item) => {
               const itemIndex = stageIndex(item.stage);
-              const state = !projection ? 'todo' : itemIndex < currentStageIndex ? 'done' : itemIndex === currentStageIndex ? 'current' : 'todo';
+              const state = !projection
+                ? 'todo'
+                : item.stages.includes(projection.stage)
+                  ? 'current'
+                  : itemIndex < currentStageIndex
+                    ? 'done'
+                    : 'todo';
               // Breathing light (same sci-fi pulse as sub-session cards) only
               // while the run is actively executing this stage — a run parked
               // at needs_human or a terminal stage does not "breathe".
@@ -365,7 +371,10 @@ export function EvolutionControlConsole({
             </div>
             <div class="evolution-role-strip">
               {roles.slice(0, 11).map((role) => (
-                <div key={role.roleId} class={`evolution-role-chip status-${role.status}`}>
+                <div
+                  key={role.roleId}
+                  class={`evolution-role-chip status-${role.status}${role.status === 'running' ? ' subcard-running-pulse' : ''}`}
+                >
                   <strong>{role.label}</strong>
                   <span>{role.currentAction}</span>
                 </div>
