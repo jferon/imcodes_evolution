@@ -1195,12 +1195,87 @@ function releaseUserPauseGateForHumanContinue(
   });
 }
 
-function releaseRoundtableGateForHumanContinue(
-  run: EvolutionRun,
+async function waiveProductReviewForHumanContinue(
+  entry: RuntimeEntry,
+  roundtable: EvolutionRoundtableRef,
+  message: string | undefined,
+  nowMs: number,
+): Promise<void> {
+  const run = entry.run;
+  initializeEvolutionControlState(run);
+  const candidatePaths = ['artifacts/prd.md', 'artifacts/prd-review.md'];
+  const candidateRevisions = candidatePaths.map((logicalPath) => {
+    const artifact = run.artifacts.find((entry) => entry.path === logicalPath);
+    return (run.artifactRevisions ?? []).find((revision) => (
+      revision.logicalPath === logicalPath && revision.id === artifact?.revisionId
+    ));
+  });
+  const missingPath = candidatePaths.find((_, index) => !candidateRevisions[index]);
+  if (missingPath) {
+    throw new Error(`product_review_waiver_revision_missing:${missingPath}`);
+  }
+  const candidateRevisionIds = candidateRevisions.map((revision) => revision!.id);
+  const gateId = `gate:product_review:${shortSha256(JSON.stringify([...candidateRevisionIds].sort()))}`;
+  let gate = (run.gates ?? []).find((entry) => entry.id === gateId);
+  if (!gate) {
+    gate = {
+      id: gateId,
+      kind: 'product_review',
+      stage: 'product_discussion',
+      status: 'open',
+      candidateRevisionIds,
+      requiredAssurance: 'checker_verified',
+      openedAt: roundtable.updatedAt,
+    };
+    run.gates!.push(gate);
+  }
+  const justification = message?.trim()
+    || 'Human chose to accept the recorded Product Critic REWORK risk and continue with the existing PRD.';
+  gate.status = 'waived';
+  gate.resolvedAt = nowMs;
+  gate.decision = {
+    id: `human-waive:${run.runId}:${roundtable.id}:${nowMs}`,
+    action: 'waive',
+    actor: 'human',
+    expectedRunRevision: run.runRevision ?? 0,
+    feedback: justification.slice(0, 2_000),
+    createdAt: nowMs,
+  };
+  for (const revision of candidateRevisions) {
+    revision!.status = 'approved';
+    revision!.assurance = 'waived';
+    delete revision!.authorizedByVerdictId;
+    run.authorizedRevisions![revision!.logicalPath] = revision!.id;
+    const artifact = run.artifacts.find((entry) => entry.revisionId === revision!.id);
+    if (artifact) {
+      artifact.status = 'approved';
+      artifact.assurance = 'waived';
+      delete artifact.authorizedByVerdictId;
+    }
+  }
+  await persistEvolutionGate(entry.projectRoot, run, gate);
+  appendDiscussion(run, {
+    kind: 'gate',
+    stage: 'prd_ready',
+    roleId: 'loop_supervisor',
+    author: 'Loop Supervisor / 总控',
+    text: `用户接受已记录的 Product Critic REWORK 风险，沿用现有 PRD 与审查产物并直接进入 UI 设计；原 REWORK 结论完整保留，不伪造 PASS。说明：${justification}`,
+    createdAt: nowMs,
+  });
+  appendEvidence(run, {
+    source: 'human_roundtable_waiver',
+    summary: `Human waived ${roundtable.id} REWORK and authorized existing PRD revisions for downstream UI design without regenerating them. gate=${gate.id}; revisions=${candidateRevisionIds.join(',')}.`,
+    createdAt: nowMs,
+  });
+}
+
+async function releaseRoundtableGateForHumanContinue(
+  entry: RuntimeEntry,
   targetStage: EvolutionStage,
   message: string | undefined,
   nowMs: number,
-): { released: boolean; resumeStage: EvolutionStage } {
+): Promise<{ released: boolean; resumeStage: EvolutionStage }> {
+  const run = entry.run;
   const releaseTargets = (run.roundtables ?? []).filter((roundtable) => {
     if (roundtable.stage !== targetStage) return false;
     if (roundtable.id === PLANNING_ROUNDTABLE_ID) {
@@ -1212,43 +1287,37 @@ function releaseRoundtableGateForHumanContinue(
   let resumeStage = targetStage;
   for (const roundtable of releaseTargets) {
     // A human asking the pipeline to continue is not an agent/checker PASS.
-    // Preserve the failed verdict as evidence. In governed mode, a Product
-    // Critic REWORK must return to the Product Maker so the PRD changes before
-    // it is reviewed again; directly relaunching the checker only repeats the
-    // same discussion over the same immutable input revision.
-    const retryProductMaker = (run.executionPolicy ?? 'draft_preview') === 'governed'
+    // Preserve the failed verdict as evidence. A governed Product Critic
+    // REWORK is explicitly waivable by a human: Continue authorizes the
+    // existing immutable PRD revisions with `waived` assurance and moves to UI
+    // design instead of silently regenerating the same product artifacts.
+    const waiveProductReview = (run.executionPolicy ?? 'draft_preview') === 'governed'
       && roundtable.id === 'product-review';
-    if (retryProductMaker) {
-      resumeStage = 'intake_normalized';
-      run.roundtables = (run.roundtables ?? []).filter((entry) => (
-        entry.id !== roundtable.id && entry.id !== EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID
-      ));
+    if (waiveProductReview) {
+      resumeStage = 'prd_ready';
+      await waiveProductReviewForHumanContinue(entry, roundtable, message, nowMs);
     } else {
       run.roundtables = (run.roundtables ?? []).filter((entry) => entry.id !== roundtable.id);
+      appendDiscussion(run, {
+        kind: 'gate',
+        stage: resumeStage,
+        roleId: 'loop_supervisor',
+        author: 'Loop Supervisor / 总控',
+        text: `人工要求重新执行 ${roundtable.topic}，恢复到 ${targetStage} 后将启动新的受治理圆桌；原 REWORK/失败结论保持不变。${message ? `说明：${message}` : ''}`,
+        createdAt: nowMs,
+      });
+      appendEvidence(run, {
+        source: 'human_roundtable_retry',
+        summary: [
+          `Human requested a fresh ${roundtable.id} attempt at ${targetStage}.`,
+          `Previous status=${roundtable.status}.`,
+          roundtable.p2pRunId ? `Previous p2pRunId=${roundtable.p2pRunId}.` : '',
+          roundtable.summary ? `Previous verdict=${roundtable.summary.slice(0, 500)}.` : '',
+          roundtable.error ? `Previous error=${roundtable.error.slice(0, 500)}.` : '',
+        ].filter(Boolean).join(' '),
+        createdAt: nowMs,
+      });
     }
-    appendDiscussion(run, {
-      kind: 'gate',
-      stage: resumeStage,
-      roleId: 'loop_supervisor',
-      author: 'Loop Supervisor / 总控',
-      text: retryProductMaker
-        ? `人工确认处理 ${roundtable.topic} 的 REWORK，流程先回到 Product Maker 修订 PRD，再用新 revision 发起产品审查；原 REWORK 结论保持审计。${message ? `说明：${message}` : ''}`
-        : `人工要求重新执行 ${roundtable.topic}，恢复到 ${targetStage} 后将启动新的受治理圆桌；原 REWORK/失败结论保持不变。${message ? `说明：${message}` : ''}`,
-      createdAt: nowMs,
-    });
-    appendEvidence(run, {
-      source: retryProductMaker ? 'human_maker_rework_retry' : 'human_roundtable_retry',
-      summary: [
-        retryProductMaker
-          ? `Human routed ${roundtable.id} REWORK back to ${EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID} at intake_normalized before another checker attempt.`
-          : `Human requested a fresh ${roundtable.id} attempt at ${targetStage}.`,
-        `Previous status=${roundtable.status}.`,
-        roundtable.p2pRunId ? `Previous p2pRunId=${roundtable.p2pRunId}.` : '',
-        roundtable.summary ? `Previous verdict=${roundtable.summary.slice(0, 500)}.` : '',
-        roundtable.error ? `Previous error=${roundtable.error.slice(0, 500)}.` : '',
-      ].filter(Boolean).join(' '),
-      createdAt: nowMs,
-    });
     run.blockingQuestions = run.blockingQuestions.filter((question) => (
       question.id !== `strict-roundtable-${run.runId}-${roundtable.id}-blocked` &&
       question.id !== `planning-roundtable-${run.runId}-blocked`
@@ -2692,7 +2761,7 @@ export async function continueEvolutionRun(options: ContinueEvolutionRunOptions)
     run.blockingQuestions = run.blockingQuestions.filter((question) => question.id !== `design-hifi-approval-${run.runId}`);
   }
   releaseUserPauseGateForHumanContinue(run, targetStage, options.message, nowMs);
-  const roundtableRelease = releaseRoundtableGateForHumanContinue(run, targetStage, options.message, nowMs);
+  const roundtableRelease = await releaseRoundtableGateForHumanContinue(entry, targetStage, options.message, nowMs);
   const resumeStage = roundtableRelease.resumeStage;
   const advanced = await advanceEvolutionRunStage({
     runId: validRunId.value,
