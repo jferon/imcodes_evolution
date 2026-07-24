@@ -264,6 +264,8 @@ export interface EvolutionGateDecision {
   id: string;
   action: EvolutionGateAction;
   actor: 'human' | 'system';
+  /** Optional stable identity of the deciding actor (user id, agent id). */
+  actorId?: string;
   expectedRunRevision: number;
   feedback?: string;
   createdAt: number;

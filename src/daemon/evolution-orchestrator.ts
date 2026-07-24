@@ -29,6 +29,7 @@ import {
   type EvolutionDesignTargetSurface,
   type EvolutionExecutionPolicy,
   type EvolutionGateAction,
+  type EvolutionGateKind,
   type EvolutionGreenfieldTopology,
   type EvolutionRoundtableGateMode,
   type EvolutionScoreModuleId,
@@ -41,6 +42,7 @@ import type {
   EvolutionArtifactPreview,
   EvolutionEvidence,
   EvolutionExecutionTimelineItem,
+  EvolutionGateRecord,
   EvolutionLaunchRequest,
   EvolutionLoopControl,
   EvolutionLoopControlMode,
@@ -94,6 +96,8 @@ import {
   renderUiVisualReportFeedback,
 } from '../../shared/ui-spec.js';
 import { appendDiscussion, appendEvidence, appendLiveEvent, shortSha256, upsertArtifact, upsertScore } from './evolution-run-helpers.js';
+import { EVOLUTION_GATE_KIND_POLICIES, authorizeEvolutionGateAction, evolutionGateApprovalAssurance } from '../../shared/evolution-gate-policies.js';
+import type { EvolutionGateActorType } from '../../shared/evolution-gate-policies.js';
 import { bootstrapGreenfieldFoundation, probeFoundationCapabilities } from './evolution-foundation.js';
 import type { FoundationProbeResult } from './evolution-foundation.js';
 import { lookupAttachmentById } from './file-transfer-handler.js';
@@ -186,12 +190,20 @@ export interface ContinueEvolutionRunOptions {
   nowMs?: number;
 }
 
+export interface EvolutionGateActor {
+  type: EvolutionGateActorType;
+  /** Optional stable identity of the deciding actor (user id, agent id). */
+  id?: string;
+}
+
 export interface ApplyEvolutionGateActionOptions {
   runId: string;
   gateId: string;
   action: EvolutionGateAction;
   mutationId: string;
   expectedRunRevision: number;
+  /** Defaults to a human actor (War Room UI); system actors are policy-gated. */
+  actor?: EvolutionGateActor;
   feedback?: string;
   nowMs?: number;
 }
@@ -2344,6 +2356,79 @@ export async function pauseEvolutionRun(options: PauseEvolutionRunOptions): Prom
   return ok(projection);
 }
 
+export interface OpenEvolutionTypedGateOptions {
+  runId: string;
+  kind: EvolutionGateKind;
+  stage?: EvolutionStage;
+  candidateRevisionIds: string[];
+  nowMs?: number;
+}
+
+/**
+ * Open a typed gate of any policy-known kind over existing artifact revisions.
+ * design_review gates stay owned by the high-fidelity design flow (they need a
+ * review set); every other kind opens here with its required assurance derived
+ * from the kind policy — human-only kinds demand human_approved, kinds that
+ * allow system checkers demand checker_verified.
+ */
+export async function openEvolutionTypedGate(
+  options: OpenEvolutionTypedGateOptions,
+): Promise<EvolutionOrchestratorResult<EvolutionProjection>> {
+  const validRunId = validateEvolutionRunId(options.runId);
+  if (!validRunId.ok) return validRunId as EvolutionOrchestratorResult<EvolutionProjection>;
+  const entry = getRuntimeEntry(validRunId.value);
+  if (!entry) return fail('evolution_run_not_found', `Evolution run not found: ${validRunId.value}`, 'runId');
+  const run = entry.run;
+  const nowMs = options.nowMs ?? Date.now();
+  initializeEvolutionControlState(run);
+  if (!(options.kind in EVOLUTION_GATE_KIND_POLICIES)) {
+    return fail('invalid_evolution_gate_kind', `Unknown gate kind: ${options.kind}`, 'kind');
+  }
+  if (options.kind === 'design_review') {
+    return fail('evolution_gate_kind_managed', 'design_review gates are opened by the high-fidelity design flow.', 'kind');
+  }
+  if (options.stage !== undefined && !isEvolutionStage(options.stage)) {
+    return fail('invalid_evolution_stage', `Unknown stage: ${options.stage}`, 'stage');
+  }
+  if (options.candidateRevisionIds.length === 0) {
+    return fail('evolution_gate_revisions_required', 'A typed gate needs at least one candidate revision.', 'candidateRevisionIds');
+  }
+  const missingRevisionId = options.candidateRevisionIds.find((revisionId) => (
+    !(run.artifactRevisions ?? []).some((revision) => revision.id === revisionId)
+  ));
+  if (missingRevisionId) {
+    return fail('evolution_gate_revision_missing', `Gate candidate revision is missing: ${missingRevisionId}`, 'candidateRevisionIds');
+  }
+  const gateId = `gate:${options.kind}:${shortSha256(JSON.stringify([...options.candidateRevisionIds].sort()))}`;
+  const existing = (run.gates ?? []).find((gate) => gate.id === gateId);
+  if (existing) {
+    if (existing.status === 'open') return ok(buildEvolutionProjection(run, nowMs));
+    return fail('evolution_gate_already_resolved', `Gate ${gateId} is already ${existing.status}.`, 'kind');
+  }
+  const policy = EVOLUTION_GATE_KIND_POLICIES[options.kind];
+  const gate: EvolutionGateRecord = {
+    id: gateId,
+    kind: options.kind,
+    stage: options.stage ?? run.stage,
+    status: 'open',
+    candidateRevisionIds: [...options.candidateRevisionIds],
+    requiredAssurance: policy.allowedActors.includes('system') ? 'checker_verified' : 'human_approved',
+    openedAt: nowMs,
+  };
+  run.gates = [...(run.gates ?? []), gate];
+  await persistEvolutionGate(entry.projectRoot, run, gate);
+  appendDiscussion(run, {
+    kind: 'gate',
+    stage: gate.stage,
+    roleId: 'loop_supervisor',
+    author: 'Loop Supervisor / 总控',
+    text: `类型化门禁 ${gate.kind} 已开启（${gate.candidateRevisionIds.length} 个候选修订），等待 ${policy.allowedActors.join('/')} 决策。`,
+    createdAt: nowMs,
+  });
+  const projection = await persistAndProject(entry, nowMs);
+  return ok(projection);
+}
+
 export async function applyEvolutionGateAction(
   options: ApplyEvolutionGateActionOptions,
 ): Promise<EvolutionOrchestratorResult<EvolutionProjection>> {
@@ -2368,16 +2453,19 @@ export async function applyEvolutionGateAction(
   if (gate.status !== 'open') {
     return fail('evolution_gate_not_open', `Gate ${gate.id} is already ${gate.status}.`, 'gateId');
   }
-  if (gate.kind !== 'design_review') {
-    return fail('unsupported_evolution_gate_action', `Gate ${gate.kind} does not support this action yet.`, 'gateId');
+  const actor: EvolutionGateActor = options.actor ?? { type: 'human' };
+  const authorization = authorizeEvolutionGateAction(gate.kind, options.action, actor.type);
+  if (!authorization.ok) {
+    return fail(authorization.code, authorization.message, 'action');
   }
-  if (options.action === 'waive') {
-    return fail('evolution_gate_waiver_forbidden', 'High-fidelity human review cannot be waived.', 'action');
+  if ((options.action === 'request_changes' || options.action === 'waive') && !options.feedback?.trim()) {
+    return fail(
+      'evolution_gate_feedback_required',
+      options.action === 'waive' ? 'Waiving a gate requires a recorded justification.' : 'Request Changes requires feedback.',
+      'feedback',
+    );
   }
-  if (options.action === 'request_changes' && !options.feedback?.trim()) {
-    return fail('evolution_gate_feedback_required', 'Request Changes requires feedback.', 'feedback');
-  }
-  if (options.action === 'approve') {
+  if (options.action !== 'request_changes') {
     const missingRevisionId = gate.candidateRevisionIds.find((revisionId) => (
       !(run.artifactRevisions ?? []).some((entry) => entry.id === revisionId)
     ));
@@ -2386,12 +2474,13 @@ export async function applyEvolutionGateAction(
     }
   }
 
-  gate.status = options.action === 'approve' ? 'approved' : 'rejected';
+  gate.status = options.action === 'approve' ? 'approved' : options.action === 'waive' ? 'waived' : 'rejected';
   gate.resolvedAt = nowMs;
   gate.decision = {
     id: options.mutationId,
     action: options.action,
-    actor: 'human',
+    actor: actor.type,
+    ...(actor.id ? { actorId: actor.id } : {}),
     expectedRunRevision: options.expectedRunRevision,
     ...(options.feedback?.trim() ? { feedback: options.feedback.trim().slice(0, 2_000) } : {}),
     createdAt: nowMs,
@@ -2400,22 +2489,26 @@ export async function applyEvolutionGateAction(
     ? (run.designReviewSets ?? []).find((entry) => entry.id === gate.reviewSetId)
     : undefined;
   if (reviewSet) {
-    reviewSet.status = options.action === 'approve' ? 'approved' : 'rejected';
+    reviewSet.status = options.action === 'request_changes' ? 'rejected' : 'approved';
     reviewSet.decidedAt = nowMs;
     if (options.feedback?.trim()) reviewSet.feedback = options.feedback.trim().slice(0, 2_000);
     await persistEvolutionReviewSet(entry.projectRoot, run, reviewSet);
   }
-  if (options.action === 'approve') {
+  if (options.action !== 'request_changes') {
+    // Approve grants human_approved (human) or checker_verified (system);
+    // waive honestly grants only `waived` — downstream may proceed but the
+    // record never claims anyone approved the content.
+    const grantedAssurance = evolutionGateApprovalAssurance(options.action, actor.type);
     for (const revisionId of gate.candidateRevisionIds) {
       const revision = (run.artifactRevisions ?? []).find((entry) => entry.id === revisionId);
       if (!revision) continue;
       revision.status = 'approved';
-      revision.assurance = 'human_approved';
+      revision.assurance = grantedAssurance;
       run.authorizedRevisions![revision.logicalPath] = revision.id;
       const artifact = run.artifacts.find((entry) => entry.revisionId === revision.id);
       if (artifact) {
         artifact.status = 'approved';
-        artifact.assurance = 'human_approved';
+        artifact.assurance = grantedAssurance;
       }
     }
   } else {
@@ -2431,15 +2524,35 @@ export async function applyEvolutionGateAction(
   await persistEvolutionGate(entry.projectRoot, run, gate);
   await persistAndProject(entry, nowMs);
 
-  const result = await continueEvolutionRun({
-    runId: run.runId,
-    targetStage: options.action === 'approve' ? 'design_hifi' : 'design_lofi',
-    message: options.action === 'approve'
-      ? 'High-fidelity review set approved through the typed gate.'
-      : `${EVOLUTION_HIFI_REDESIGN_MESSAGE_PREFIX} ${options.feedback?.trim() ?? ''}`,
-    nowMs,
+  if (gate.kind === 'design_review') {
+    return continueEvolutionRun({
+      runId: run.runId,
+      targetStage: options.action === 'approve' ? 'design_hifi' : 'design_lofi',
+      message: options.action === 'approve'
+        ? 'High-fidelity review set approved through the typed gate.'
+        : `${EVOLUTION_HIFI_REDESIGN_MESSAGE_PREFIX} ${options.feedback?.trim() ?? ''}`,
+      nowMs,
+    });
+  }
+
+  // Generic typed gates: record the resolution auditably and return; stage
+  // continuation stays an explicit, separate human/system decision.
+  const actorLabel = actor.type === 'human' ? 'human' : `system${actor.id ? ` (${actor.id})` : ''}`;
+  appendDiscussion(run, {
+    kind: 'gate',
+    stage: gate.stage,
+    roleId: 'loop_supervisor',
+    author: 'Loop Supervisor / 总控',
+    text: `类型化门禁 ${gate.kind} 已由 ${actorLabel} 解决：${options.action}${options.feedback?.trim() ? `；理由：${options.feedback.trim().slice(0, 300)}` : ''}。`,
+    createdAt: nowMs,
   });
-  return result;
+  appendEvidence(run, {
+    source: 'typed_gate',
+    summary: `Gate ${gate.id} (${gate.kind}) resolved as ${gate.status} by ${actorLabel}.`,
+    createdAt: nowMs,
+  });
+  const projection = await persistAndProject(entry, nowMs);
+  return ok(projection);
 }
 
 export async function continueEvolutionRun(options: ContinueEvolutionRunOptions): Promise<EvolutionOrchestratorResult<EvolutionProjection>> {
