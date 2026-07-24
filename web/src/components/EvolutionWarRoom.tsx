@@ -269,6 +269,10 @@ function isReferenceBriefError(error: string | null | undefined): boolean {
   return /reference image brief|reference.*brief|reference.*image|参考图|手稿/i.test(error ?? '');
 }
 
+function isEvolutionContinueTimeout(error: string | null | undefined): boolean {
+  return /Evolution continue timed out/i.test(error ?? '');
+}
+
 function isReferenceImageFile(file: File): boolean {
   return file.type.startsWith('image/') || /\.(png|jpe?g|webp|svg)$/i.test(file.name);
 }
@@ -375,6 +379,14 @@ function operatorGuidance(options: {
 }): { phase: string; system: string; action: string; next: string } {
   const { projection, launchPending, scanPending, lastError, activeWatcher, projectRoot, inboxPath, launchPathExample } = options;
   if (lastError) {
+    if (isEvolutionContinueTimeout(lastError)) {
+      return {
+        phase: '继续执行超时',
+        system: lastError,
+        action: '先刷新当前 Run 状态；如果没有新状态，检查 daemon 与本地 server 是否保持连接后再次点击“继续/解除阻塞”。不要重新启动同一需求。',
+        next: '已生成的 PRD、评审和设计产物会继续复用，只有被明确打回的产物才增量修订。',
+      };
+    }
     if (isReferenceBriefError(lastError)) {
       return {
         phase: '参考图 brief 生成失败',
@@ -667,7 +679,7 @@ export function EvolutionWarRoomPanel({
         ? terminal ? 'complete' : paused ? 'pending' : active ? 'running' : 'ready'
         : lastManualAction ? 'pending' : 'idle';
   const statusTitle = lastError
-    ? '启动或扫描失败'
+    ? isEvolutionContinueTimeout(lastError) ? '继续执行超时' : '启动或扫描失败'
     : launchPending
       ? '启动请求已发送'
         : scanPending
@@ -678,7 +690,9 @@ export function EvolutionWarRoomPanel({
             ? `${lastManualAction.label}已发出，等待状态回传`
             : '等待启动';
   const statusDetail = lastError
-    ? isReferenceBriefError(lastError)
+    ? isEvolutionContinueTimeout(lastError)
+      ? `${lastError}。继续请求没有在时限内收到 daemon ACK，通常是 daemon 与本地 server 连接中断；这不是需求文件缺失，也不会清空已有产物。请先刷新当前 Run 状态，确认连接恢复后再次继续。`
+      : isReferenceBriefError(lastError)
       ? `${lastError}。这是参考图上传/brief 生成链路没有收到 daemon ACK，不是需求文件路径问题。请重新上传参考图再生成；如果刚重启 daemon，旧上传临时句柄会失效。`
       : `${lastError}。请确认文件存在于完整目录 ${inboxPath}/；手动启动可粘贴完整文件路径，例如 ${launchPathExample}。`
     : launchPending

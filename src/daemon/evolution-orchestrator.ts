@@ -5478,6 +5478,7 @@ function renderProductMakerPrompt(run: EvolutionRun): string {
     .filter((artifact) => artifact.kind === 'design_reference_image')
     .map((artifact) => `${runDirRelative}/${artifact.path}`);
   const normalizedPath = run.artifacts.find((artifact) => artifact.kind === 'normalized_requirement')?.path;
+  const existingPrd = run.artifacts.find((artifact) => artifact.kind === 'prd');
   const reworkFeedback = latestProductReviewReworkFeedback(run);
   return [
     `你是本次自我进化 run ${run.runId} 的产品经理 Maker。你的任务不是讨论，而是真实撰写可交付的 PRD 文档。`,
@@ -5485,6 +5486,9 @@ function renderProductMakerPrompt(run: EvolutionRun): string {
     '## 第一步：真实阅读输入',
     `- 原始需求：\`${run.source.relativePath}\`（用 Read 工具打开）`,
     ...(normalizedPath ? [`- 标准化需求：\`${runDirRelative}/${normalizedPath}\``] : []),
+    ...(existingPrd
+      ? [`- 当前 PRD revision \`${existingPrd.revisionId ?? 'unknown'}\`：\`${runDirRelative}/${existingPrd.path}\`（必须先用 Read 工具打开）`]
+      : []),
     ...(referenceImagePaths.length > 0
       ? ['- 参考图（必须逐张用 Read 工具真实查看）：', ...referenceImagePaths.map((path) => `  - ${path}`)]
       : []),
@@ -5492,7 +5496,7 @@ function renderProductMakerPrompt(run: EvolutionRun): string {
       ? [
           '',
           '## 上一轮 Product Critic 的 REWORK（必须逐条落实）',
-          '这是审查结论，不是新一轮空谈。请先修改 PRD，再在最终消息中逐条说明如何关闭这些问题：',
+          '这是审查结论，不是新一轮空谈。请在现有 PRD 上原地增量修订：保留已经成立的章节、决策和验收项，只修改审查明确指出的问题；不要从原始需求重新生成整份 PRD。完成后在最终消息中逐条说明如何关闭这些问题：',
           '',
           reworkFeedback,
         ]

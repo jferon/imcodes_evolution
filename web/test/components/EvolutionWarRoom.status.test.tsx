@@ -160,6 +160,29 @@ describe('EvolutionWarRoomPanel status feedback', () => {
     expect(status.textContent).toContain('先确认需求文件真实存在');
   });
 
+  it('explains continue timeouts as a daemon/server connection problem instead of a missing requirement file', () => {
+    render(<EvolutionWarRoomPanel {...props({
+      projection: makeProjection({
+        stage: 'needs_human',
+        blockingQuestions: [{
+          id: 'strict-roundtable-evo-test-product-review-blocked',
+          stage: 'product_discussion',
+          roleId: 'loop_supervisor',
+          question: '产品评审等待人工处理。',
+          createdAt: Date.now(),
+        }],
+      }),
+      lastError: 'Evolution continue timed out.',
+    })} />);
+
+    const status = screen.getByTestId('evolution-run-status');
+    expect(status.textContent).toContain('继续执行超时');
+    expect(status.textContent).toContain('daemon');
+    expect(status.textContent).toContain('连接');
+    expect(status.textContent).not.toContain('请确认文件存在于完整目录');
+    expect(status.textContent).not.toContain('/Users/mac/tjs/.imcodes/inbox/requirements/');
+  });
+
   it('shows a reference image entry point for generating a launchable brief', () => {
     render(<EvolutionWarRoomPanel {...props()} />);
 

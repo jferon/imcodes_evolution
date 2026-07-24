@@ -166,7 +166,12 @@ describe('Product Maker governed dispatch — the agent PRD survives the determi
       serverLink,
       nowMs: 5_300,
     });
-    expect(getEvolutionRun(launched.value.runId)?.value?.stage).toBe('needs_human');
+    const blockedRun = getEvolutionRun(launched.value.runId)?.value;
+    expect(blockedRun?.stage).toBe('needs_human');
+    const existingPrdRevisionId = blockedRun?.artifacts.find((artifact) => artifact.kind === 'prd')?.revisionId;
+    const existingReviewRevisionId = blockedRun?.artifacts.find((artifact) => artifact.kind === 'prd_review')?.revisionId;
+    expect(existingPrdRevisionId).toBeTruthy();
+    expect(existingReviewRevisionId).toBeTruthy();
 
     const continued = await continueEvolutionRun({
       runId: launched.value.runId,
@@ -183,9 +188,37 @@ describe('Product Maker governed dispatch — the agent PRD survives the determi
     expect(captured[2]?.roundtableSpecId).toBe(EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID);
     expect(captured[2]?.prompt).toContain('上一轮 Product Critic 的 REWORK');
     expect(captured[2]?.prompt).toContain('购买人画像和付款失败验收');
+    expect(captured[2]?.prompt).toContain('在现有 PRD 上原地增量修订');
+    expect(captured[2]?.prompt).toContain(existingPrdRevisionId);
     expect(continued.value.evidence).toContainEqual(expect.objectContaining({
       source: 'human_maker_rework_retry',
     }));
+
+    await writeFile(
+      join(runDir, PRODUCT_MAKER_PRD_RELATIVE_PATH),
+      `${AGENT_PRD}\n\n## REWORK 修订\n- 补齐购买人画像。\n- 增加付款失败的可测试验收标准。\n`,
+      'utf8',
+    );
+    await recordEvolutionP2pRunProjection({
+      run: {
+        id: captured[2]!.p2pRunId,
+        discussion_id: `dsc_${captured[2]!.p2pRunId}`,
+        status: 'completed',
+        mode_key: 'discuss',
+        current_round: 2,
+        total_rounds: 2,
+        result_summary: '已按 REWORK 原地修订 PRD。\n<!-- EVOLUTION_VERDICT: PASS -->',
+        completed_at: '2026-07-24T10:02:00.000Z',
+      },
+      serverLink,
+      nowMs: 5_500,
+    });
+    const revisedRun = getEvolutionRun(launched.value.runId)?.value;
+    expect(captured[3]?.roundtableSpecId).toBe('product-review');
+    expect(revisedRun?.artifacts.find((artifact) => artifact.kind === 'prd')?.revisionId)
+      .not.toBe(existingPrdRevisionId);
+    expect(revisedRun?.artifacts.find((artifact) => artifact.kind === 'prd_review')?.revisionId)
+      .toBe(existingReviewRevisionId);
   });
 
   it('launches the maker first, promotes on PASS, and the intake template never overwrites the agent PRD', async () => {

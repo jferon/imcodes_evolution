@@ -856,10 +856,20 @@ async function writeRunArtifact(options: {
 }): Promise<void> {
   const paths = getEvolutionRunPaths(options.projectRoot, options.run.runId);
   const fullPath = safeJoin(paths.runDir, options.path);
+  const contentSha256 = sha256(options.content);
+  const currentArtifact = options.run.artifacts.find((entry) => entry.path === options.path);
+  if (currentArtifact?.sha256 === contentSha256) {
+    try {
+      const currentContent = await readFile(fullPath);
+      if (sha256(currentContent) === contentSha256) return;
+    } catch {
+      // The ledger points at a missing/unreadable file; rebuild it below.
+    }
+  }
   await mkdir(dirname(fullPath), { recursive: true });
   await writeFile(fullPath, options.content, 'utf8');
   const preview = buildArtifactPreview(options.path, options.content);
-  const previousRevisionId = options.run.artifacts.find((entry) => entry.path === options.path)?.revisionId;
+  const previousRevisionId = currentArtifact?.revisionId;
   const artifact = {
     id: artifactId(options.kind, options.path),
     kind: options.kind,
@@ -868,7 +878,7 @@ async function writeRunArtifact(options: {
     ...(preview ? { preview } : {}),
     ...(options.roleId ? { roleId: options.roleId } : {}),
     ...(options.stage ? { stage: options.stage } : {}),
-    sha256: sha256(options.content),
+    sha256: contentSha256,
     bytes: Buffer.byteLength(options.content),
     createdAt: options.nowMs,
   };
@@ -882,6 +892,17 @@ async function writeRunArtifact(options: {
     ...(previousRevisionId ? { supersedesRevisionId: previousRevisionId } : {}),
   });
   upsertArtifact(options.run, artifact);
+}
+
+async function hasReusableRunArtifact(projectRoot: string, run: EvolutionRun, path: string): Promise<boolean> {
+  const artifact = run.artifacts.find((entry) => entry.path === path);
+  if (!artifact?.sha256) return false;
+  try {
+    const fullPath = safeJoin(getEvolutionRunPaths(projectRoot, run.runId).runDir, path);
+    return sha256(await readFile(fullPath)) === artifact.sha256;
+  } catch {
+    return false;
+  }
 }
 
 async function registerExistingRunArtifact(options: {
@@ -2496,28 +2517,32 @@ export async function runEvolutionPlanningStages(options: RunEvolutionPlanningSt
       content: renderPrd(digest, uiModel, instructions),
       nowMs,
     });
-    await writeRunArtifact({
-      projectRoot,
-      run,
-      kind: 'prd_review',
-      path: 'artifacts/prd-review.md',
-      title: 'Deterministic PRD Preflight',
-      roleId: 'product_critic',
-      stage: 'product_discussion',
-      content: renderPrdReview(),
-      nowMs,
-    });
-    await writeRunArtifact({
-      projectRoot,
-      run,
-      kind: 'discussion',
-      path: 'discussions/product-discussion.md',
-      title: 'Product Discussion',
-      roleId: 'product_manager',
-      stage: 'product_discussion',
-      content: renderProductDiscussion(digest, instructions),
-      nowMs,
-    });
+    if (!(await hasReusableRunArtifact(projectRoot, run, 'artifacts/prd-review.md'))) {
+      await writeRunArtifact({
+        projectRoot,
+        run,
+        kind: 'prd_review',
+        path: 'artifacts/prd-review.md',
+        title: 'Deterministic PRD Preflight',
+        roleId: 'product_critic',
+        stage: 'product_discussion',
+        content: renderPrdReview(),
+        nowMs,
+      });
+    }
+    if (!(await hasReusableRunArtifact(projectRoot, run, 'discussions/product-discussion.md'))) {
+      await writeRunArtifact({
+        projectRoot,
+        run,
+        kind: 'discussion',
+        path: 'discussions/product-discussion.md',
+        title: 'Product Discussion',
+        roleId: 'product_manager',
+        stage: 'product_discussion',
+        content: renderProductDiscussion(digest, instructions),
+        nowMs,
+      });
+    }
     appendDiscussion(run, {
       kind: 'role_update',
       stage: 'product_discussion',
