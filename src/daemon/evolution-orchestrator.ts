@@ -5643,6 +5643,9 @@ async function maybeStartRoundtable(
     );
   }
 
+  // Fault injection hardening: a launcher that THROWS (crash, network fault)
+  // must degrade to the same fail-closed path as an explicit launch failure —
+  // it must never reject the surrounding autopilot/projection pipeline.
   const result = await roundtableLauncher({
     requestId: `evolution-roundtable-${run.runId}-${roundtableId}`,
     runId: run.runId,
@@ -5655,7 +5658,10 @@ async function maybeStartRoundtable(
     prompt: spec.prompt(run),
     artifactPaths,
     roundtableSpecId: spec.id,
-  }, serverLink ?? null);
+  }, serverLink ?? null).catch((error: unknown): EvolutionRoundtableLaunchResult => ({
+    ok: false,
+    error: `roundtable_launcher_crashed: ${describeUnknownError(error)}`,
+  }));
 
   if (!result.ok && result.skippedReason) {
     const reason = result.skippedReason;
@@ -5883,6 +5889,8 @@ async function maybeStartAutoDelivery(
   const before = await persistAndProject(entry, nowMs);
   send(serverLink, { type: EVOLUTION_PIPELINE_MSG.PROJECTION, projection: before });
 
+  // A crashing launcher degrades to the explicit blocked path — never an
+  // unhandled rejection inside projection/autopilot processing.
   const result = await autoDeliverLauncher({
     requestId: `evolution-auto-${run.runId}`,
     sessionName: run.sessionName,
@@ -5890,7 +5898,10 @@ async function maybeStartAutoDelivery(
     changeName: run.linkedOpenSpecChange,
     presetId: run.autoDelivery.presetId,
     autoCommitPush: run.autoDelivery.autoCommitPush,
-  }, serverLink);
+  }, serverLink).catch((error: unknown): EvolutionAutoDeliverLaunchResult => ({
+    ok: false,
+    error: `openspec_auto_deliver_launcher_crashed: ${describeUnknownError(error)}`,
+  }));
 
   if (!result.ok) {
     return markAutoDeliveryLaunchBlocked(entry, result.error ?? 'openspec_auto_deliver_launch_failed', nowMs, serverLink);

@@ -629,6 +629,25 @@ program
   });
 
 program
+  .command('evolution-selftest')
+  .description('Scaffold a real governed Evolution self-test (policy.json, design.json screenshot wiring, sample requirement)')
+  .option('--project-root <path>', 'Target project root (defaults to cwd)')
+  .action(async (opts: { projectRoot?: string }) => {
+    const { runEvolutionSelftestSetup } = await import('./cli/evolution-selftest.js');
+    try {
+      const result = await runEvolutionSelftestSetup(opts.projectRoot ?? process.cwd());
+      for (const file of result.files) {
+        console.log(`${file.status === 'created' ? '\x1b[32mcreated\x1b[0m' : '\x1b[33mskipped (exists)\x1b[0m'}  ${file.relativePath}`);
+      }
+      console.log('\nSelf-test runbook:');
+      for (const step of result.runbook) console.log(`  ${step}`);
+    } catch (error) {
+      console.error(`evolution-selftest failed: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
+  });
+
+program
   .command('send')
   .description('Send a message to a session (via hook server IPC or direct tmux)')
   .argument('[target]', 'Target: label, session name, or project:role')
