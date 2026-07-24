@@ -866,6 +866,9 @@ describe('evolution orchestrator', () => {
     ]);
     expect(autopilot.value.roundtables.every((roundtable) => roundtable.status === 'complete')).toBe(true);
     expect(autopilot.value.roundtables.find((roundtable) => roundtable.id === 'planning-review')?.summary).toContain('PASS: local deterministic');
+    expect(autopilot.value.loopControl.signals.find((signal) => signal.id === 'p2p_roundtables')).toEqual(expect.objectContaining({
+      status: 'complete',
+    }));
     expect(autopilot.value.evidence.some((entry) => entry.source === 'local_roundtable_review')).toBe(true);
     expect(autopilot.value.liveEvents.some((entry) => entry.title.includes('local fallback PASS'))).toBe(true);
     expect(sent.filter((message) => message.type === EVOLUTION_PIPELINE_MSG.PROJECTION).length).toBeGreaterThanOrEqual(7);

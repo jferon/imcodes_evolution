@@ -141,7 +141,7 @@ export interface P2pTarget {
   mode: string;    // mode key e.g. 'audit'
 }
 
-export type P2pPostSummaryExecutionPolicy = 'required' | 'disabled';
+export type P2pPostSummaryExecutionPolicy = 'required' | 'final_only' | 'disabled';
 
 export interface StartP2pRunOptions {
   initiatorSession: string;
@@ -190,6 +190,8 @@ export interface StartP2pRunOptions {
   /**
    * Controls the legacy "after discussion, execute the original request" gate.
    * Default is `required` to preserve existing P2P behavior. Set to
+   * `final_only` when intermediate rounds are analysis/review and the original
+   * request must be executed exactly once after the final round. Set to
    * `disabled` for review-only discussions such as Evolution roundtables where
    * agents must only produce PASS/REWORK guidance and must not execute work.
    */
@@ -2542,7 +2544,9 @@ async function executeChain(run: P2pRun, modeConfig: P2pMode | undefined, server
       // generic "execute the original request" gate there burns an extra
       // execution turn + follow-up confirmation and can falsely block on a
       // discussion-only task, so the gate is opt-out per run.
-      const shouldRunExecutionGate = (isFlowCycleEnd || isLastRound) && shouldRunPostSummaryExecutionGate(run);
+      const shouldRunExecutionGate = (isFlowCycleEnd || isLastRound)
+        && shouldRunPostSummaryExecutionGate(run)
+        && (run.postSummaryExecution !== 'final_only' || isLastRound);
       const inlineExecutionSpec = shouldRunExecutionGate
         ? createPostSummaryExecutionSpec(run, {
           cycleIndex: Math.ceil(run.currentRound / pipelineLength),

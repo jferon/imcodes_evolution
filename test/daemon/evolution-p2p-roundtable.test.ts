@@ -156,7 +156,7 @@ describe('evolution P2P roundtable launcher', () => {
       finalSummaryExtraInstruction: string;
     };
     expect(makerOptions.userText).toContain('你的任务不是讨论，而是真实撰写可交付的 PRD 文档');
-    expect(makerOptions.postSummaryExecution).toBe('required');
+    expect(makerOptions.postSummaryExecution).toBe('final_only');
     expect(makerOptions.finalSummaryExtraInstruction).toContain('真实写入 Maker 要求的产物文件');
     expect(makerOptions.finalSummaryExtraInstruction).not.toContain('do not edit project files');
 
@@ -205,7 +205,7 @@ describe('evolution P2P roundtable launcher', () => {
       finalSummaryExtraInstruction: string;
     };
     expect(designMakerOptions.userText).toContain('你的任务不是讨论，而是真实产出可交付的设计文件');
-    expect(designMakerOptions.postSummaryExecution).toBe('required');
+    expect(designMakerOptions.postSummaryExecution).toBe('final_only');
     expect(designMakerOptions.finalSummaryExtraInstruction).toContain('真实写入 Maker 要求的产物文件');
     expect(designMakerOptions.finalSummaryExtraInstruction).toContain('only create or update the declared Maker output artifacts');
   });

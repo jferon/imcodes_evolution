@@ -70,6 +70,16 @@ async function writeJson(path: string, value: unknown): Promise<void> {
 
 async function prepareProject(projectRoot: string): Promise<string> {
   await mkdir(projectRoot, { recursive: true });
+  // This smoke is intentionally deterministic and runs without live helper
+  // sessions. Opt into draft-preview explicitly; production watcher defaults
+  // remain governed + strict and must hard-block without a real Maker.
+  await writeJson(join(projectRoot, '.imc/evolution/policy.json'), {
+    version: 1,
+    executionPolicy: 'draft_preview',
+    roundtableGateMode: 'planning',
+    autoStartImplementation: true,
+    requireHifiHumanApproval: false,
+  });
   await writeJson(join(projectRoot, '.imc/evolution/design.json'), {
     tasteSkill: {
       enabled: true,

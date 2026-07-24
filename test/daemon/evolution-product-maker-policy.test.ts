@@ -16,6 +16,7 @@ import {
 } from '../../src/daemon/evolution-stage-runner.js';
 import {
   getEvolutionRun,
+  hydrateEvolutionRun,
   launchEvolutionRun,
   launchEvolutionRunFromInboxCandidate,
   readEvolutionProjectPolicy,
@@ -164,6 +165,253 @@ describe('Product Maker governed dispatch — the agent PRD survives the determi
     const { readFile } = await import('node:fs/promises');
     const onDisk = await readFile(join(runDir, PRODUCT_MAKER_PRD_RELATIVE_PATH), 'utf8');
     expect(onDisk).toContain('减少人工汇总时间 80%');
+  });
+
+  it('accepts the final maker verdict when P2P appends execution audit sections after the marker', async () => {
+    const root = await makeRoot();
+    const sourceRelativePath = await writeRequirement(root, 'pm-audit-suffix.md');
+    let p2pRunId = '';
+    setEvolutionRoundtableLauncher(async (request) => {
+      p2pRunId = `p2p_${request.roundtableSpecId}_audit_suffix`;
+      return {
+        ok: true,
+        p2pRunId,
+        discussionId: `dsc_${p2pRunId}`,
+        contextPath: `.imc/discussions/${p2pRunId}.md`,
+      };
+    });
+
+    const launched = await launchEvolutionRun({
+      projectRoot: root,
+      nowMs: 20_000,
+      request: {
+        requestId: 'req-pm-audit-suffix',
+        sessionName: 'deck_demo_brain',
+        sourceRelativePath,
+        executionPolicy: 'governed',
+        roundtableGateMode: 'strict',
+      },
+    });
+    expect(launched.ok).toBe(true);
+    if (!launched.ok) return;
+
+    await runEvolutionAutopilot(launched.value.runId, null, { nowMs: 21_000 });
+    const runDir = join(root, '.imc/evolution', launched.value.runId);
+    await mkdir(join(runDir, 'artifacts'), { recursive: true });
+    await writeFile(join(runDir, PRODUCT_MAKER_PRD_RELATIVE_PATH), AGENT_PRD, 'utf8');
+
+    await recordEvolutionP2pRunProjection({
+      run: {
+        id: p2pRunId,
+        discussion_id: `dsc_${p2pRunId}`,
+        status: 'completed',
+        mode_key: 'discuss',
+        current_round: 2,
+        total_rounds: 2,
+        result_summary: [
+          '## brain:codex-sdk:discuss — Final Summary',
+          'PRD 已完成并真实写入，交由控制面注册 immutable revision。',
+          '<!-- EVOLUTION_VERDICT: PASS -->',
+          '',
+          '## P2P Original Request Execution Confirmed (cycle 2/2)',
+          'Marker file: .imc/discussions/example.cycle2.execution-confirmation-marker.json',
+          'Status: completed',
+          'Attempts: 1',
+        ].join('\n'),
+        completed_at: '2026-07-24T08:00:00.000Z',
+      },
+      serverLink: { send() { /* ignore */ } },
+      nowMs: 22_000,
+    });
+
+    const stored = getEvolutionRun(launched.value.runId);
+    const makerAttempt = stored?.value?.attempts?.find((attempt) => attempt.kind === 'maker' && attempt.stage === 'intake_normalized');
+    expect(makerAttempt?.status).toBe('passed');
+    expect(makerAttempt?.error).toBeUndefined();
+    expect(makerAttempt?.outputRevisionIds.length).toBeGreaterThanOrEqual(1);
+    expect(stored?.value?.artifacts.find((artifact) => artifact.kind === 'prd')?.assurance).toBe('agent_attested');
+  });
+
+  it('does not mistake an intermediate-round marker for a terminal result during restart recovery', async () => {
+    const root = await makeRoot();
+    const sourceRelativePath = await writeRequirement(root, 'pm-mid-round-restart.md');
+    const p2pRunId = 'p2p_product_maker_mid_round';
+    setEvolutionRoundtableLauncher(async () => ({
+      ok: true,
+      p2pRunId,
+      discussionId: `dsc_${p2pRunId}`,
+      contextPath: `.imc/discussions/${p2pRunId}.md`,
+    }));
+
+    const launched = await launchEvolutionRun({
+      projectRoot: root,
+      nowMs: 30_000,
+      request: {
+        requestId: 'req-pm-mid-round-restart',
+        sessionName: 'deck_demo_brain',
+        sourceRelativePath,
+        executionPolicy: 'governed',
+        roundtableGateMode: 'strict',
+      },
+    });
+    expect(launched.ok).toBe(true);
+    if (!launched.ok) return;
+    await runEvolutionAutopilot(launched.value.runId, null, { nowMs: 31_000 });
+
+    const contextPath = join(root, '.imc/discussions', `${p2pRunId}.md`);
+    await mkdir(join(root, '.imc/discussions'), { recursive: true });
+    await writeFile(contextPath, [
+      '# P2P Discussion',
+      '## brain — Round 1/2 Summary',
+      '还需要第二轮收敛。',
+      '<!-- EVOLUTION_VERDICT: REWORK -->',
+      '',
+      '## P2P Original Request Execution Confirmed (cycle 1/2)',
+      `Marker file: ${contextPath}.cycle1.execution-marker.json`,
+      'Status: completed',
+      'Attempts: 1',
+    ].join('\n'), 'utf8');
+
+    const hydrated = await hydrateEvolutionRun(root, launched.value.runId, 32_000);
+    expect(hydrated.ok).toBe(true);
+    if (!hydrated.ok) return;
+    expect(hydrated.value.roundtables.find((roundtable) => roundtable.id === EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID)?.status).toBe('running');
+    expect(hydrated.value.attempts?.find((attempt) => attempt.kind === 'maker')?.status).toBe('running');
+  });
+
+  it('recovers a final maker PASS from discussion context when the completion callback was lost', async () => {
+    const root = await makeRoot();
+    const sourceRelativePath = await writeRequirement(root, 'pm-final-restart.md');
+    const p2pRunId = 'p2p_product_maker_final_restart';
+    setEvolutionRoundtableLauncher(async () => ({
+      ok: true,
+      p2pRunId,
+      discussionId: `dsc_${p2pRunId}`,
+      contextPath: `.imc/discussions/${p2pRunId}.md`,
+    }));
+
+    const launched = await launchEvolutionRun({
+      projectRoot: root,
+      nowMs: 40_000,
+      request: {
+        requestId: 'req-pm-final-restart',
+        sessionName: 'deck_demo_brain',
+        sourceRelativePath,
+        executionPolicy: 'governed',
+        roundtableGateMode: 'strict',
+      },
+    });
+    expect(launched.ok).toBe(true);
+    if (!launched.ok) return;
+    await runEvolutionAutopilot(launched.value.runId, null, { nowMs: 41_000 });
+
+    const runDir = join(root, '.imc/evolution', launched.value.runId);
+    await mkdir(join(runDir, 'artifacts'), { recursive: true });
+    await writeFile(join(runDir, PRODUCT_MAKER_PRD_RELATIVE_PATH), AGENT_PRD, 'utf8');
+    const contextPath = join(root, '.imc/discussions', `${p2pRunId}.md`);
+    await mkdir(join(root, '.imc/discussions'), { recursive: true });
+    await writeFile(contextPath, [
+      '# P2P Discussion',
+      '### Final Summary — Maker Execution Completion',
+      'PRD 已完成并写入。',
+      '<!-- EVOLUTION_VERDICT: PASS -->',
+      '',
+      '## P2P Original Request Execution Confirmed (cycle 2/2)',
+      `Marker file: ${contextPath}.cycle2.execution-marker.json`,
+      'Status: completed',
+      'Attempts: 1',
+    ].join('\n'), 'utf8');
+
+    const hydrated = await hydrateEvolutionRun(root, launched.value.runId, 42_000);
+    expect(hydrated.ok).toBe(true);
+    if (!hydrated.ok) return;
+    const makerAttempt = hydrated.value.attempts?.find((attempt) => attempt.kind === 'maker');
+    expect(makerAttempt?.status).toBe('passed');
+    expect(makerAttempt?.outputRevisionIds.length).toBeGreaterThanOrEqual(1);
+    expect(hydrated.value.artifacts.find((artifact) => artifact.kind === 'prd')?.assurance).toBe('agent_attested');
+  });
+
+  it('repairs a terminal maker attempt misclassified by a truncated completion callback without rewriting its audit record', async () => {
+    const root = await makeRoot();
+    const sourceRelativePath = await writeRequirement(root, 'pm-terminal-repair.md');
+    const p2pRunId = 'p2p_product_maker_terminal_repair';
+    setEvolutionRoundtableLauncher(async () => ({
+      ok: true,
+      p2pRunId,
+      discussionId: `dsc_${p2pRunId}`,
+      contextPath: `.imc/discussions/${p2pRunId}.md`,
+    }));
+
+    const launched = await launchEvolutionRun({
+      projectRoot: root,
+      nowMs: 50_000,
+      request: {
+        requestId: 'req-pm-terminal-repair',
+        sessionName: 'deck_demo_brain',
+        sourceRelativePath,
+        executionPolicy: 'governed',
+        roundtableGateMode: 'strict',
+      },
+    });
+    expect(launched.ok).toBe(true);
+    if (!launched.ok) return;
+    await runEvolutionAutopilot(launched.value.runId, null, { nowMs: 51_000 });
+
+    const runDir = join(root, '.imc/evolution', launched.value.runId);
+    await mkdir(join(runDir, 'artifacts'), { recursive: true });
+    await writeFile(join(runDir, PRODUCT_MAKER_PRD_RELATIVE_PATH), AGENT_PRD, 'utf8');
+    const contextPath = join(root, '.imc/discussions', `${p2pRunId}.md`);
+    await mkdir(join(root, '.imc/discussions'), { recursive: true });
+    await writeFile(contextPath, [
+      '# P2P Discussion',
+      '### Final Summary — Maker Execution Completion',
+      'PRD 已完成并写入。',
+      '<!-- EVOLUTION_VERDICT: PASS -->',
+      '',
+      '## P2P Original Request Execution Confirmed (cycle 2/2)',
+      `Marker file: ${contextPath}.cycle2.execution-marker.json`,
+      'Status: completed',
+      'Attempts: 1',
+    ].join('\n'), 'utf8');
+
+    await recordEvolutionP2pRunProjection({
+      run: {
+        id: p2pRunId,
+        discussion_id: `dsc_${p2pRunId}`,
+        status: 'completed',
+        mode_key: 'discuss',
+        current_round: 2,
+        total_rounds: 2,
+        // Mirrors the observed 2 KiB tail truncation: the durable context has
+        // PASS, but the terminal callback no longer includes the marker.
+        result_summary: 'truncated terminal tail without the governed marker',
+        completed_at: '2026-07-24T09:00:00.000Z',
+      },
+      nowMs: 52_000,
+    });
+    const blocked = getEvolutionRun(launched.value.runId);
+    expect(blocked?.value?.attempts?.at(-1)?.status).toBe('blocked');
+    expect(blocked?.value?.stage).toBe('needs_human');
+
+    const hydrated = await hydrateEvolutionRun(root, launched.value.runId, 53_000);
+    expect(hydrated.ok).toBe(true);
+    if (!hydrated.ok) return;
+    const makerAttempts = hydrated.value.attempts?.filter((attempt) => attempt.kind === 'maker') ?? [];
+    expect(makerAttempts).toHaveLength(2);
+    expect(makerAttempts[0]).toEqual(expect.objectContaining({
+      status: 'blocked',
+      error: 'machine_readable_evolution_verdict_missing',
+    }));
+    expect(makerAttempts[1]).toEqual(expect.objectContaining({
+      status: 'passed',
+      p2pRunId,
+    }));
+    expect(makerAttempts[1]!.outputRevisionIds.length).toBeGreaterThanOrEqual(1);
+    expect(hydrated.value.stage).toBe('product_discussion');
+    expect(hydrated.value.roundtables.find((roundtable) => roundtable.id === EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID)).toEqual(expect.objectContaining({
+      status: 'complete',
+      attemptId: makerAttempts[1]!.id,
+    }));
   });
 });
 

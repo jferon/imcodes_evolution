@@ -289,7 +289,11 @@ setEvolutionRoundtableLauncher(async (
       rounds: 2,
       modeOverride: 'discuss',
       hopTimeoutMs: 300_000,
-      postSummaryExecution: isMakerRequest(request) ? 'required' : 'disabled',
+      // Maker helpers discuss/review across both rounds, then write/promote the
+      // artifact once after convergence. Executing after every intermediate
+      // round duplicated expensive agent work and made a healthy Maker look
+      // stuck for twice as long.
+      postSummaryExecution: isMakerRequest(request) ? 'final_only' : 'disabled',
       finalSummaryExtraInstruction: isMakerRequest(request)
         ? [
             'Evolution Maker mode requires real artifact execution after the two-round discussion.',

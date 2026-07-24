@@ -1616,16 +1616,38 @@ function roundtableSignal(run: EvolutionRun): EvolutionLoopControlSignal {
   }
   if (roundtables.length > 0) {
     const verified = roundtables.filter((roundtable) => {
+      if (roundtable.status === 'skipped') return true;
+      if (roundtable.status !== 'complete') return false;
+
+      if (
+        roundtable.id === EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID
+        || roundtable.id === EVOLUTION_DESIGN_MAKER_ROUNDTABLE_ID
+      ) {
+        const attempt = roundtable.attemptId
+          ? (run.attempts ?? []).find((entry) => entry.id === roundtable.attemptId)
+          : undefined;
+        // Makers deliberately have no self-verdict. Their governed proof is a
+        // passed attempt bound to validated, promoted output revisions.
+        return attempt?.kind === 'maker'
+          && attempt.status === 'passed'
+          && attempt.outputRevisionIds.length > 0;
+      }
+
       const verdict = roundtable.verdictId
         ? (run.verdictRecords ?? []).find((entry) => entry.id === roundtable.verdictId)
         : undefined;
-      return roundtable.status === 'complete' && verdict?.machineReadable === true && verdict.verdict === 'PASS';
+      if (verdict?.machineReadable === true && verdict.verdict === 'PASS') return true;
+
+      // Draft-preview local fallbacks are deterministic pipeline evidence, not
+      // agent verdicts, so they intentionally do not create checker records.
+      return (run.executionPolicy ?? 'draft_preview') !== 'governed'
+        && planningRoundtableVerdict(roundtable.summary, true) === 'pass';
     });
     return {
       id: 'p2p_roundtables',
       label: 'P2P roundtables',
       status: verified.length === roundtables.length ? 'complete' : 'blocked',
-      detail: `${verified.length}/${roundtables.length} roundtables have a bound machine-readable PASS verdict.`,
+      detail: `${verified.length}/${roundtables.length} roundtables satisfied their completion contract.`,
     };
   }
   return {
@@ -4356,8 +4378,19 @@ function roundtableStatusForP2p(status: P2pRunStatus): EvolutionRoundtableRef['s
 }
 
 function structuredEvolutionVerdictMarker(value: string | undefined): string | undefined {
-  const lines = (value ?? '').replace(/\r\n/g, '\n').trim().split('\n');
-  const lastLine = lines.at(-1)?.trim();
+  const normalized = (value ?? '').replace(/\r\n/g, '\n').trim();
+  const lines = normalized.split('\n');
+  let lastLine = lines.at(-1)?.trim();
+  if (!lastLine || !/^<!--\s*EVOLUTION_VERDICT:\s*(PASS|REWORK|BLOCKED)\s*-->$/i.test(lastLine)) {
+    // P2P owns these audit sections and appends them only after the initiator
+    // has completed the original-request execution gate. They therefore sit
+    // after the otherwise-terminal Evolution verdict in result_summary.
+    // Ignore only this exact orchestrator-owned suffix; arbitrary prose after
+    // a marker must continue to invalidate governed verdicts.
+    const auditSuffixIndex = normalized.search(/^## P2P Original Request Execution (?:Re)?Confirmed\b.*$/mi);
+    if (auditSuffixIndex < 0) return undefined;
+    lastLine = normalized.slice(0, auditSuffixIndex).trim().split('\n').at(-1)?.trim();
+  }
   return lastLine && /^<!--\s*EVOLUTION_VERDICT:\s*(PASS|REWORK|BLOCKED)\s*-->$/i.test(lastLine)
     ? lastLine
     : undefined;
@@ -4380,8 +4413,17 @@ function summarizeP2pRoundtable(run: P2pRunUpdatePayload): string {
 
 function extractRoundtableContextSummary(markdown: string, allowLegacy: boolean): string | null {
   const normalized = markdown.replace(/\r\n/g, '\n');
-  const markerMatches = [...normalized.matchAll(/^##\s+(Business Summary|Result|Summary|Assistant|Final|结论|讨论结果)\b.*$/gim)];
-  const markerIndex = markerMatches.length > 0 ? markerMatches[markerMatches.length - 1]?.index ?? -1 : -1;
+  const finalSummaryMatches = [...normalized.matchAll(/^#{2,6}\s+.*(?:Final Summary|最终总结|最终结论).*$/gim)];
+  const legacySummaryMatches = allowLegacy
+    ? [...normalized.matchAll(/^##\s+(Business Summary|Result|Summary|Assistant|Final|结论|讨论结果)\b.*$/gim)]
+    : [];
+  const summaryMatches = finalSummaryMatches.length > 0 ? finalSummaryMatches : legacySummaryMatches;
+  const markerIndex = summaryMatches.length > 0 ? summaryMatches[summaryMatches.length - 1]?.index ?? -1 : -1;
+  // A governed multi-round P2P file can already contain a perfectly valid
+  // REWORK/PASS marker after an intermediate round. It is not terminal until
+  // the orchestrator-authored Final Summary section exists. Without this
+  // guard, a daemon restart mid-run incorrectly completes the whole Maker.
+  if (markerIndex < 0 && !allowLegacy) return null;
   const body = markerIndex >= 0 ? normalized.slice(markerIndex) : normalized.slice(Math.max(0, normalized.length - 8_000));
   const verdict = structuredEvolutionVerdictMarker(body);
   if (!verdict && allowLegacy) {
@@ -4410,6 +4452,129 @@ async function readRoundtableContextSummary(entry: RuntimeEntry, roundtable: Evo
   }
 }
 
+async function recoverMisclassifiedMakerRoundtablesFromContext(
+  entry: RuntimeEntry,
+  nowMs: number,
+): Promise<Set<string>> {
+  const run = entry.run;
+  const recoveredIds = new Set<string>();
+  for (const roundtable of [...(run.roundtables ?? [])]) {
+    if (
+      roundtable.status !== 'complete'
+      || !roundtable.attemptId
+      || (
+        roundtable.id !== EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID
+        && roundtable.id !== EVOLUTION_DESIGN_MAKER_ROUNDTABLE_ID
+      )
+    ) continue;
+    const originalAttempt = (run.attempts ?? []).find((attempt) => attempt.id === roundtable.attemptId);
+    if (
+      originalAttempt?.kind !== 'maker'
+      || originalAttempt.status !== 'blocked'
+      || originalAttempt.error !== 'machine_readable_evolution_verdict_missing'
+    ) continue;
+    if ((run.attempts ?? []).some((attempt) => (
+      attempt.id !== originalAttempt.id
+      && attempt.p2pRunId === roundtable.p2pRunId
+      && attempt.error?.startsWith('maker_context_recovery_promotion_failed:')
+    ))) continue;
+
+    const summary = await readRoundtableContextSummary(entry, roundtable);
+    if (!summary || planningRoundtableVerdict(summary, false) !== 'pass') continue;
+
+    // Preserve the original blocked attempt as immutable audit history. The
+    // repaired proof becomes a fresh recovery attempt bound to the same P2P
+    // run and to newly validated/promoted output revisions.
+    const recoveryAttempt = await createEvolutionAttempt({
+      projectRoot: entry.projectRoot,
+      run,
+      kind: 'maker',
+      stage: originalAttempt.stage,
+      roleId: originalAttempt.roleId,
+      ...(originalAttempt.checkerRoleId ? { checkerRoleId: originalAttempt.checkerRoleId } : {}),
+      inputRevisionIds: originalAttempt.inputRevisionIds,
+      skillSnapshotIds: originalAttempt.skillSnapshotIds,
+      nowMs,
+    });
+    const promotion = roundtable.id === EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID
+      ? await registerProductMakerOutputArtifacts({
+          projectRoot: entry.projectRoot,
+          run,
+          producerAttemptId: recoveryAttempt.id,
+          nowMs,
+        })
+      : await registerDesignMakerOutputArtifacts({
+          projectRoot: entry.projectRoot,
+          run,
+          producerAttemptId: recoveryAttempt.id,
+          nowMs,
+        });
+    if (!promotion.ok) {
+      await completeEvolutionAttempt({
+        projectRoot: entry.projectRoot,
+        run,
+        attemptId: recoveryAttempt.id,
+        status: 'failed',
+        ...(roundtable.p2pRunId ? { p2pRunId: roundtable.p2pRunId } : {}),
+        error: `maker_context_recovery_promotion_failed:${promotion.reason ?? 'unknown'}`,
+        nowMs,
+      });
+      appendEvidence(run, {
+        source: 'maker_context_recovery',
+        summary: `${roundtable.topic} terminal context had PASS, but output promotion failed: ${promotion.reason ?? 'unknown'}.`,
+        createdAt: nowMs,
+      });
+      continue;
+    }
+
+    await completeEvolutionAttempt({
+      projectRoot: entry.projectRoot,
+      run,
+      attemptId: recoveryAttempt.id,
+      status: 'passed',
+      outputRevisionIds: promotion.revisionIds,
+      ...(roundtable.p2pRunId ? { p2pRunId: roundtable.p2pRunId } : {}),
+      nowMs,
+    });
+    const next: EvolutionRoundtableRef = {
+      ...roundtable,
+      attemptId: recoveryAttempt.id,
+      dispatchToken: recoveryAttempt.dispatchToken,
+      summary,
+      updatedAt: nowMs,
+    };
+    delete next.error;
+    upsertRoundtable(run, next);
+
+    const strictQuestionId = `strict-roundtable-${run.runId}-${roundtable.id}-blocked`;
+    const repairingStrictBlock = run.stage === 'needs_human'
+      && run.blockingQuestions.some((question) => question.id === strictQuestionId);
+    run.blockingQuestions = run.blockingQuestions.filter((question) => question.id !== strictQuestionId);
+    if (repairingStrictBlock) {
+      run.stage = roundtable.stage;
+      applyRoleStatesForStage(run, roundtable.stage, nowMs);
+      delete run.verdict;
+      delete run.terminalReason;
+    }
+    run.latestMessage = `${roundtable.topic} recovered from final discussion context; validated outputs were promoted.`;
+    appendEvidence(run, {
+      source: 'maker_context_recovery',
+      summary: `${roundtable.topic} recovered from ${roundtable.p2pRunId ?? 'discussion context'}; preserved blocked attempt ${originalAttempt.id} and promoted ${promotion.revisionIds.length} revision(s) with ${recoveryAttempt.id}.`,
+      createdAt: nowMs,
+    });
+    appendDiscussion(run, {
+      kind: 'artifact_summary',
+      stage: roundtable.stage,
+      roleId: originalAttempt.roleId,
+      author: 'Loop Supervisor / 总控',
+      text: `${roundtable.topic} 的最终 PASS 已从讨论文件恢复；原误判 attempt 保留审计，新 recovery attempt 已绑定真实产物 revision。`,
+      createdAt: nowMs,
+    });
+    recoveredIds.add(roundtable.id);
+  }
+  return recoveredIds;
+}
+
 async function reconcileRuntimeRoundtableContextFiles(
   entry: RuntimeEntry,
   nowMs: number,
@@ -4417,7 +4582,7 @@ async function reconcileRuntimeRoundtableContextFiles(
 ): Promise<EvolutionProjection | null> {
   const run = entry.run;
   if (isEvolutionTerminalStage(run.stage)) return null;
-  const changedRoundtableIds = new Set<string>();
+  const changedRoundtableIds = await recoverMisclassifiedMakerRoundtablesFromContext(entry, nowMs);
   for (const roundtable of [...(run.roundtables ?? [])]) {
     const canReconcileFromContext = roundtable.status === 'running' ||
       roundtable.status === 'planned' ||
@@ -4521,6 +4686,9 @@ async function reconcileRuntimeRoundtableContextFiles(
       if (gate.disposition === 'block') {
         projection = await markStrictRoundtableGateBlocked(entry, roundtable, gate.reason, nowMs, serverLink);
         break;
+      } else if (gate.disposition === 'allow' && run.stage === roundtable.stage) {
+        const resumed = await runEvolutionAutopilot(run.runId, serverLink ?? null, { nowMs });
+        if (resumed.ok) projection = resumed.value;
       }
     }
   }

@@ -187,6 +187,7 @@ async function runPlanningScenario(options: {
   sourceRelativePath?: string;
   projectRoot?: string;
   nowOffset: number;
+  expectedVisualFidelityLauncherBlock?: boolean;
 }): Promise<SelftestScenarioResult> {
   const projectRoot = options.projectRoot ?? await prepareProject(options.id);
   const sourceRelativePath = options.sourceRelativePath ?? await writeRequirement(projectRoot, options.id, options.content);
@@ -207,20 +208,47 @@ async function runPlanningScenario(options: {
 
   const autopilot = await runEvolutionAutopilot(launched.value.runId, null, { nowMs: baseNow + options.nowOffset + 1 });
   if (!autopilot.ok) throw new Error(`${options.id}: autopilot failed: ${autopilot.issues.map((issue) => issue.message).join('; ')}`);
-  assertNoUnexpectedBlockers(autopilot.value, options.id, ['tasks_ready']);
-  requireArtifactKinds(autopilot.value, options.id, [
-    'prd',
-    'hifi_spec',
-    'hifi_mockup',
-    'taste_hifi_prompt',
-    'taste_hifi_output',
-    'architecture_baseline',
-    'openspec_tasks',
-    'implementation_task_matrix',
-    'test_plan',
-    'test_cases',
-    'deployment_plan',
-  ]);
+  if (options.expectedVisualFidelityLauncherBlock) {
+    const validation = validateEvolutionProjection(autopilot.value);
+    if (!validation.ok) {
+      throw new Error(`${options.id}: projection validation failed: ${validation.issues.map((issue) => issue.code).join(', ')}`);
+    }
+    if (autopilot.value.stage !== 'needs_human') {
+      throw new Error(`${options.id}: expected honest visual-fidelity needs_human gate but got ${autopilot.value.stage}`);
+    }
+    const fidelity = autopilot.value.roundtables.find((roundtable) => roundtable.id === 'visual-fidelity-review');
+    if (fidelity?.status !== 'failed' || fidelity.error !== 'roundtable_launcher_unavailable') {
+      throw new Error(`${options.id}: expected visual-fidelity launcher hard block, got ${fidelity?.status ?? 'missing'}:${fidelity?.error ?? 'no_error'}`);
+    }
+    if (!autopilot.value.blockingQuestions.some((question) => question.id.includes('visual-fidelity-review-blocked'))) {
+      throw new Error(`${options.id}: visual-fidelity hard block did not create an actionable blocking question`);
+    }
+    requireArtifactKinds(autopilot.value, options.id, [
+      'prd',
+      'design_reference_manifest',
+      'design_reference_image',
+      'hifi_spec',
+      'hifi_mockup',
+      'taste_hifi_prompt',
+      'taste_hifi_output',
+      'taste_hifi_reference',
+    ]);
+  } else {
+    assertNoUnexpectedBlockers(autopilot.value, options.id, ['tasks_ready']);
+    requireArtifactKinds(autopilot.value, options.id, [
+      'prd',
+      'hifi_spec',
+      'hifi_mockup',
+      'taste_hifi_prompt',
+      'taste_hifi_output',
+      'architecture_baseline',
+      'openspec_tasks',
+      'implementation_task_matrix',
+      'test_plan',
+      'test_cases',
+      'deployment_plan',
+    ]);
+  }
   return {
     id: options.id,
     projectRoot,
@@ -261,6 +289,7 @@ async function runReferenceImportScenario(): Promise<SelftestScenarioResult> {
     content: '',
     designTargetSurface: 'both',
     nowOffset: 21,
+    expectedVisualFidelityLauncherBlock: true,
   });
   const runDir = join(projectRoot, '.imc/evolution', result.runId);
   const prompt = await readFile(join(runDir, 'design/taste-hifi-prompt.md'), 'utf8');
@@ -388,7 +417,7 @@ async function main(): Promise<void> {
       '',
       `- Workspace: \`${workspaceRoot}\``,
       `- Scenarios: ${results.length}`,
-      '- Result: PASS — no unexpected blocking questions, failed stages, or error live events.',
+      '- Result: PASS — no unexpected blockers; the reference-image scenario honestly hard-blocked at visual fidelity because no live checker launcher was installed.',
       '',
       '| Scenario | Stage | Run | Evidence | Roundtables |',
       '| --- | --- | --- | ---: | --- |',
@@ -396,7 +425,7 @@ async function main(): Promise<void> {
       '',
       '## Coverage',
       '- Raw idea / incomplete PRD → deterministic planning artifacts.',
-      '- Reference images → import brief, image copy, multi-reference high-fidelity requirement.',
+      '- Reference images → import brief, image copy, multi-reference high-fidelity requirement, then an honest needs_human gate without a live visual checker.',
       '- Existing code replica → project style audit and style-preserving design handoff.',
       '- Complete PRD → direct planning without extra blockers.',
       '- Auto Deliver + staging → deterministic PASS callback, safe staging command, production human gate.',

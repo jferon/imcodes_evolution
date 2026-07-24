@@ -982,6 +982,50 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(confirmationPrompts.every((prompt) => prompt.includes('Do not just say it is done'))).toBe(true);
   });
 
+  it('runs final-only post-summary execution once after all discussion rounds', async () => {
+    const confirmationPrompts: string[] = [];
+    const inlineExecutionPrompts: string[] = [];
+    sendKeysDelayedEnterMock.mockImplementation(async (session: string, prompt: string) => {
+      if (!prompt.includes('[P2P Discussion Task') && session === 'deck_proj_brain') {
+        confirmationPrompts.push(prompt);
+      }
+      if (prompt.includes('[P2P Discussion Task')) {
+        if (session === 'deck_proj_brain' && prompt.includes('Execution proof required')) {
+          inlineExecutionPrompts.push(prompt);
+        }
+        const filePath = pathFromPrompt(prompt);
+        const heading = headingFromPrompt(prompt);
+        await appendFile(filePath, `\n## ${heading}\n\nOutput from ${session}.\n`, 'utf8');
+        await writeExecutionMarkerFromPrompt(prompt);
+        setTimeout(() => notifySessionIdle(session), 20);
+        return;
+      }
+      if (await writeExecutionMarkerFromPrompt(prompt)) {
+        setTimeout(() => notifySessionIdle(session), 20);
+        return;
+      }
+      setTimeout(() => notifySessionIdle(session), 20);
+    });
+
+    const run = await startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'discuss' }],
+      userText: 'write the governed maker artifact once after discussion converges',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      rounds: 2,
+      modeOverride: 'discuss',
+      postSummaryExecution: 'final_only',
+    });
+
+    await waitForStatus(run.id, ['completed']);
+    expect(inlineExecutionPrompts).toHaveLength(1);
+    expect(inlineExecutionPrompts[0]).toContain('"cycleIndex": 2');
+    expect(inlineExecutionPrompts[0]).toContain('"cycleTotal": 2');
+    expect(confirmationPrompts).toHaveLength(1);
+    expect(confirmationPrompts[0]).toContain('Team execution follow-up verification');
+  });
+
   it('includes the previous cycle output in the next cycle participant kickoff prompt', async () => {
     const initialPrompts: string[] = [];
     const nextCycleHopPrompts: string[] = [];
