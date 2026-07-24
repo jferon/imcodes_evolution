@@ -2555,6 +2555,15 @@
     "approve_hifi": "승인하고 계속",
     "redesign_hifi": "재설계 요청",
     "hifi_approved_message": "사용자가 고충실도 검토 세트를 승인했습니다.",
-    "redesign_default_feedback": "요구사항과 참조 이미지 제약을 유지하여 고충실도 세트를 다시 디자인하세요."
+    "redesign_default_feedback": "요구사항과 참조 이미지 제약을 유지하여 고충실도 세트를 다시 디자인하세요.",
+    "blocking_header": "자가 진화 · 사람의 개입이 필요합니다",
+    "blocking_intro": "실행 {{runId}}이(가) needs_human에서 일시 중지되었습니다. 사유:",
+    "blocking_gate_row": "대기 중인 유형화 게이트: {{kind}}",
+    "blocking_gate_hint": "War Room에서 검토 후 결정하세요(미리보기와 게이트 작업이 그곳에 있습니다).",
+    "blocking_later": "나중에",
+    "blocking_open_war_room": "War Room 열기",
+    "blocking_confirm": "확인 후 계속",
+    "blocking_continuing": "계속 중…",
+    "blocking_continue_message": "차단 대화상자에서 확인했습니다. 계속 진행해 주세요."
   }
 }

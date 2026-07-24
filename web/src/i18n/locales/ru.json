@@ -2555,6 +2555,15 @@
     "approve_hifi": "Одобрить и продолжить",
     "redesign_hifi": "Запросить редизайн",
     "hifi_approved_message": "Пользователь одобрил набор детального дизайна.",
-    "redesign_default_feedback": "Переработайте набор, сохранив требования и ограничения референсов."
+    "redesign_default_feedback": "Переработайте набор, сохранив требования и ограничения референсов.",
+    "blocking_header": "Самоэволюция · Требуется вмешательство человека",
+    "blocking_intro": "Запуск {{runId}} приостановлен на needs_human. Причины:",
+    "blocking_gate_row": "Ожидает решения типизированный гейт: {{kind}}",
+    "blocking_gate_hint": "Проверьте и примите решение в War Room (превью и действия гейтов находятся там).",
+    "blocking_later": "Позже",
+    "blocking_open_war_room": "Открыть War Room",
+    "blocking_confirm": "Подтвердить и продолжить",
+    "blocking_continuing": "Продолжение…",
+    "blocking_continue_message": "Подтверждено в диалоге блокировки; продолжайте."
   }
 }

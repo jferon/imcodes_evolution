@@ -2557,6 +2557,15 @@
     "approve_hifi": "核准並繼續",
     "redesign_hifi": "重新設計",
     "hifi_approved_message": "使用者已核准本輪高保真評審集。",
-    "redesign_default_feedback": "請重新設計高保真評審集，並保留需求與參考圖約束。"
+    "redesign_default_feedback": "請重新設計高保真評審集，並保留需求與參考圖約束。",
+    "blocking_header": "自我進化 · 需要人工介入",
+    "blocking_intro": "執行 {{runId}} 已在 needs_human 暫停。原因：",
+    "blocking_gate_row": "待決策的類型化門禁：{{kind}}",
+    "blocking_gate_hint": "請在 War Room 中審閱並決策（預覽與門禁操作在那裡）。",
+    "blocking_later": "稍後處理",
+    "blocking_open_war_room": "開啟 War Room",
+    "blocking_confirm": "確認繼續",
+    "blocking_continuing": "繼續中…",
+    "blocking_continue_message": "已在阻塞彈窗確認，請繼續。"
   }
 }

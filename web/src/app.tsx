@@ -45,6 +45,7 @@ import { useOpenSpecAutoDeliver } from './hooks/useOpenSpecAutoDeliver.js';
 import { isOpenSpecAutoDeliverActiveProjection } from './openspec-auto-deliver.js';
 import { EvolutionWarRoomPanel } from './components/EvolutionWarRoom.js';
 import { EvolutionControlConsole } from './components/EvolutionControlConsole.js';
+import { EvolutionBlockingDialog } from './components/EvolutionBlockingDialog.js';
 import { EvolutionLauncherBubble } from './components/EvolutionLauncherBubble.js';
 import { useEvolutionPipeline } from './hooks/useEvolutionPipeline.js';
 import { isEvolutionActiveProjection } from './evolution-pipeline.js';
@@ -2241,6 +2242,9 @@ export function App() {
       ?? null;
   }, [activeSession, appOpenSpecAutoSessionName, sessions, visibleMainSessions]);
   const [appEvolutionWarRoomOpen, setAppEvolutionWarRoomOpen] = useState(false);
+  // Signature of the needs_human blocker set the user already dismissed via
+  // the blocking dialog — a NEW blocker set (different signature) re-pops it.
+  const [appEvolutionBlockingDismissed, setAppEvolutionBlockingDismissed] = useState<string | null>(null);
   const [appEvolutionConsoleOpen, setAppEvolutionConsoleOpen] = useState(true);
   const appEvolutionPipeline = useEvolutionPipeline({
     ws: wsRef.current,
@@ -5681,6 +5685,17 @@ export function App() {
             appEvolutionPipeline.approveRoleSkillCandidate(roleId, candidateArtifactId, approvalMessage, undefined, approverId);
           }}
           onRefresh={() => { appEvolutionPipeline.requestStatus(); }}
+        />
+      )}
+
+      {selectedServerId && !appEvolutionWarRoomOpen && (
+        <EvolutionBlockingDialog
+          projection={appEvolutionPipeline.projection}
+          continuePending={appEvolutionPipeline.continuePending}
+          dismissedSignature={appEvolutionBlockingDismissed}
+          onDismiss={(signature) => setAppEvolutionBlockingDismissed(signature)}
+          onContinue={(message) => { appEvolutionPipeline.continueRun(undefined, message); }}
+          onOpenWarRoom={() => setAppEvolutionWarRoomOpen(true)}
         />
       )}
 

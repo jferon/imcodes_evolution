@@ -2557,6 +2557,15 @@
     "approve_hifi": "Approve and continue",
     "redesign_hifi": "Request redesign",
     "hifi_approved_message": "High-fidelity review set approved by the user.",
-    "redesign_default_feedback": "Please redesign the high-fidelity set and preserve the requirement and reference-image constraints."
+    "redesign_default_feedback": "Please redesign the high-fidelity set and preserve the requirement and reference-image constraints.",
+    "blocking_header": "Self-Evolution · Human intervention required",
+    "blocking_intro": "Run {{runId}} is paused at needs_human. Reasons:",
+    "blocking_gate_row": "Typed gate pending: {{kind}}",
+    "blocking_gate_hint": "Review and decide in the War Room (previews and gate actions live there).",
+    "blocking_later": "Later",
+    "blocking_open_war_room": "Open War Room",
+    "blocking_confirm": "Confirm & continue",
+    "blocking_continuing": "Continuing…",
+    "blocking_continue_message": "Confirmed from the blocking dialog; please continue."
   }
 }

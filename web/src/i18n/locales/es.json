@@ -2556,6 +2556,15 @@
     "approve_hifi": "Aprobar y continuar",
     "redesign_hifi": "Solicitar rediseño",
     "hifi_approved_message": "El usuario aprobó el conjunto de alta fidelidad.",
-    "redesign_default_feedback": "Rediseña el conjunto de alta fidelidad manteniendo los requisitos y las referencias."
+    "redesign_default_feedback": "Rediseña el conjunto de alta fidelidad manteniendo los requisitos y las referencias.",
+    "blocking_header": "Autoevolución · Se requiere intervención humana",
+    "blocking_intro": "La ejecución {{runId}} está pausada en needs_human. Motivos:",
+    "blocking_gate_row": "Puerta tipada pendiente: {{kind}}",
+    "blocking_gate_hint": "Revísalo y decide en el War Room (las vistas previas y acciones de puerta están allí).",
+    "blocking_later": "Más tarde",
+    "blocking_open_war_room": "Abrir War Room",
+    "blocking_confirm": "Confirmar y continuar",
+    "blocking_continuing": "Continuando…",
+    "blocking_continue_message": "Confirmado desde el diálogo de bloqueo; continúa."
   }
 }

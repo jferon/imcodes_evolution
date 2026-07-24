@@ -2555,6 +2555,15 @@
     "approve_hifi": "承認して続行",
     "redesign_hifi": "再設計を依頼",
     "hifi_approved_message": "ユーザーが高忠実度レビューセットを承認しました。",
-    "redesign_default_feedback": "要件と参照画像の制約を保って高忠実度セットを再設計してください。"
+    "redesign_default_feedback": "要件と参照画像の制約を保って高忠実度セットを再設計してください。",
+    "blocking_header": "自己進化 · 人の対応が必要です",
+    "blocking_intro": "実行 {{runId}} は needs_human で一時停止中です。理由：",
+    "blocking_gate_row": "未決の型付きゲート：{{kind}}",
+    "blocking_gate_hint": "War Room で確認して判断してください（プレビューとゲート操作はそちらにあります）。",
+    "blocking_later": "後で対応",
+    "blocking_open_war_room": "War Room を開く",
+    "blocking_confirm": "確認して続行",
+    "blocking_continuing": "続行中…",
+    "blocking_continue_message": "ブロックダイアログで確認済みです。続行してください。"
   }
 }
