@@ -26,6 +26,7 @@ import type {
   EvolutionStagingDeliveryStatus,
   EvolutionVerdict,
 } from './evolution-pipeline-constants.js';
+import type { EvolutionRolePerformanceRecord } from './evolution-role-performance.js';
 
 export type EvolutionRequestedBy = 'user' | 'watcher' | 'api' | 'cron' | 'demo';
 
@@ -565,6 +566,7 @@ export interface EvolutionProjection {
   designReviewSets?: EvolutionDesignReviewSet[];
   authorizedRevisions?: Record<string, string>;
   foundationEvidence?: EvolutionFoundationEvidence[];
+  rolePerformance?: EvolutionRolePerformanceRecord[];
   evidence: EvolutionEvidence[];
   executionTimeline: EvolutionExecutionTimelineItem[];
   liveEvents: EvolutionLiveEvent[];

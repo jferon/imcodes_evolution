@@ -97,6 +97,7 @@ import {
 } from '../../shared/ui-spec.js';
 import { appendDiscussion, appendEvidence, appendLiveEvent, shortSha256, upsertArtifact, upsertScore } from './evolution-run-helpers.js';
 import { EVOLUTION_GATE_KIND_POLICIES, authorizeEvolutionGateAction, evolutionGateApprovalAssurance } from '../../shared/evolution-gate-policies.js';
+import { computeEvolutionRolePerformance, summarizeEvolutionRolePerformance } from '../../shared/evolution-role-performance.js';
 import type { EvolutionGateActorType } from '../../shared/evolution-gate-policies.js';
 import { bootstrapGreenfieldFoundation, probeFoundationCapabilities } from './evolution-foundation.js';
 import type { FoundationProbeResult } from './evolution-foundation.js';
@@ -1777,6 +1778,7 @@ function buildLoopControl(run: EvolutionRun, nowMs: number): EvolutionLoopContro
 
 export function buildEvolutionProjection(run: EvolutionRun, nowMs = Date.now()): EvolutionProjection {
   const executionTimeline = run.executionTimeline ?? buildExecutionTimeline(run);
+  const rolePerformance = computeEvolutionRolePerformance(run, nowMs);
   return {
     projectionVersion: 1,
     ...(run.controlVersion === 2 ? { controlVersion: 2 as const } : {}),
@@ -1838,6 +1840,7 @@ export function buildEvolutionProjection(run: EvolutionRun, nowMs = Date.now()):
       ...entry,
       artifactRevisionIds: [...entry.artifactRevisionIds],
     })) } : {}),
+    ...(rolePerformance.length > 0 ? { rolePerformance } : {}),
     evidence: run.evidence.map((entry) => ({ ...entry })),
     executionTimeline: executionTimeline.map((entry) => ({
       ...entry,
@@ -2954,6 +2957,8 @@ interface ApprovedRoleSkillManifestEntry {
   approvedAt: string;
   approvalMessage?: string;
   previousSha256?: string;
+  /** Role eval snapshot from the approving run at promotion time. */
+  rolePerformanceSummary?: string;
 }
 
 interface ApprovedRoleSkillManifest {
@@ -2973,6 +2978,8 @@ interface RoleSkillApprovalVote {
   approvedAt: string;
   runId: string;
   approvalMessage?: string;
+  /** Honest snapshot of what the role observably did in the voting run. */
+  rolePerformanceSummary?: string;
 }
 
 interface RoleSkillApprovalRecord {
@@ -3245,6 +3252,30 @@ export async function approveEvolutionRoleSkillCandidate(
     }
     const approvedAt = new Date(nowMs).toISOString();
     const candidateSha256 = sha256(candidateContent);
+    // Evidence-based promotion (#24): every vote carries the role's performance record from
+    // this run, and an unproven role is surfaced loudly (advisory, not a hard
+    // block — human multi-approval remains the authority).
+    const rolePerformanceRecord = computeEvolutionRolePerformance(entry.run, nowMs).find((record) => record.roleId === options.roleId);
+    const rolePerformanceSummary = rolePerformanceRecord
+      ? summarizeEvolutionRolePerformance(rolePerformanceRecord)
+      : `role=${options.roleId}; no observations in this run; proven=false`;
+    if (!rolePerformanceRecord?.proven) {
+      appendEvidence(entry.run, {
+        source: 'role_skill_performance_warning',
+        summary: `Skill promotion vote recorded while ${options.roleId} is UNPROVEN in this run — ${rolePerformanceSummary}.`,
+        createdAt: nowMs,
+      });
+      appendLiveEvent(entry.run, {
+        source: 'role_skill',
+        kind: 'gate',
+        severity: 'warning',
+        roleId: options.roleId,
+        stage: entry.run.stage,
+        title: 'Role eval: unproven in this run',
+        detail: rolePerformanceSummary,
+        createdAt: nowMs,
+      });
+    }
     const existingRecord = await readRoleSkillApprovalRecord(entry.projectRoot, definition.skillName, candidateSha256);
     const existingVotes = existingRecord?.votes ?? [];
     const nextVotes = existingVotes.some((vote) => vote.approverId === approverId)
@@ -3253,6 +3284,7 @@ export async function approveEvolutionRoleSkillCandidate(
         approverId,
         approvedAt,
         runId: entry.run.runId,
+        rolePerformanceSummary,
         ...(options.approvalMessage?.trim() ? { approvalMessage: options.approvalMessage.trim() } : {}),
       }];
     const thresholdMet = nextVotes.length >= policy.requiredApprovals;
@@ -3339,6 +3371,7 @@ export async function approveEvolutionRoleSkillCandidate(
       candidateArtifactId: candidate.id,
       runId: entry.run.runId,
       approvedAt,
+      rolePerformanceSummary,
       ...(options.approvalMessage?.trim() ? { approvalMessage: options.approvalMessage.trim() } : {}),
       ...(previousApproved ? { previousSha256: sha256(previousApproved) } : {}),
     };
