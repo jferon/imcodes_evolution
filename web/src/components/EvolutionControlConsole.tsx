@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { EVOLUTION_REQUIREMENT_INBOX_DIR, isEvolutionTerminalStage } from '@shared/evolution-pipeline-constants.js';
 import type { WsClient } from '../ws-client.js';
+import { copyToClipboard } from '../util/clipboard.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import {
   EVOLUTION_ROLE_IDS,
@@ -153,6 +154,7 @@ export function EvolutionControlConsole({
   const [targetRole, setTargetRole] = useState<'all' | EvolutionRoleId>('all');
   const [showDirectoryBrowser, setShowDirectoryBrowser] = useState(false);
   const [selectedInboxPath, setSelectedInboxPath] = useState<string | null>(null);
+  const [copiedDirectoryPath, setCopiedDirectoryPath] = useState<string | null>(null);
   const active = isEvolutionActiveProjection(projection);
   const currentStageIndex = stageIndex(projection?.stage);
   const activeWatcher = useMemo(() => (
@@ -178,11 +180,19 @@ export function EvolutionControlConsole({
   useEffect(() => {
     if (lastError) setSelectedInboxPath(null);
   }, [lastError]);
+  useEffect(() => {
+    if (!copiedDirectoryPath) return;
+    const timeout = window.setTimeout(() => setCopiedDirectoryPath(null), 1_600);
+    return () => window.clearTimeout(timeout);
+  }, [copiedDirectoryPath]);
   const applyInboxDirectory = (path: string) => {
     const requestId = onSetInboxDirectory(path);
     if (requestId === null) return;
     setSelectedInboxPath(path);
     setShowDirectoryBrowser(false);
+  };
+  const copyDirectoryPath = (path: string) => {
+    copyToClipboard(path, () => setCopiedDirectoryPath(path));
   };
   const roles = useMemo(() => (
     projection?.roles?.length
@@ -248,7 +258,15 @@ export function EvolutionControlConsole({
             <div class="evolution-control-meta">
               <span>{projectLabel ?? '未选择项目'}</span>
               <span>{sessionName ?? 'No session'}</span>
-              <span>{projectRoot ?? 'No project root'}</span>
+              <span
+                class={projectRoot ? `evolution-copyable-path${copiedDirectoryPath === projectRoot ? ' copied' : ''}` : undefined}
+                title={projectRoot ? (copiedDirectoryPath === projectRoot ? '已复制项目目录' : '双击复制项目目录') : undefined}
+                onDblClick={() => {
+                  if (projectRoot) copyDirectoryPath(projectRoot);
+                }}
+              >
+                {projectRoot ?? 'No project root'}
+              </span>
             </div>
           </div>
           <div class="evolution-control-hero-actions">
@@ -271,17 +289,24 @@ export function EvolutionControlConsole({
             <h2>需求入口</h2>
             <p>支持 .md / .txt / .json。文件稳定约 2 秒后会自动触发自我进化。</p>
           </div>
-          <button
-            type="button"
-            class="evolution-control-inbox-path-picker"
-            aria-label={t('file_browser.title_dir')}
-            title={t('file_browser.title_dir')}
-            disabled={!ws || !projectRoot || !sessionName || scanPending}
-            onClick={() => setShowDirectoryBrowser(true)}
-          >
-            <code>{inboxPath}</code>
-            <span>{scanPending ? '…' : t('file_browser.browse')}</span>
-          </button>
+          <div class="evolution-control-inbox-path-picker">
+            <code
+              class={`evolution-copyable-path${copiedDirectoryPath === inboxPath ? ' copied' : ''}`}
+              title={copiedDirectoryPath === inboxPath ? '已复制需求目录' : '双击复制需求目录'}
+              onDblClick={() => copyDirectoryPath(inboxPath)}
+            >
+              {inboxPath}
+            </code>
+            <button
+              type="button"
+              aria-label={t('file_browser.title_dir')}
+              title={t('file_browser.title_dir')}
+              disabled={!ws || !projectRoot || !sessionName || scanPending}
+              onClick={() => setShowDirectoryBrowser(true)}
+            >
+              {scanPending ? '…' : t('file_browser.browse')}
+            </button>
+          </div>
           <div class="evolution-control-card-footer">
             <span class={activeWatcher ? 'ok' : 'muted'}>Watcher：{activeWatcher ? 'active' : 'inactive'}</span>
             {activeWatcher && <span>扫描：{Math.round(activeWatcher.intervalMs / 1000)}s</span>}

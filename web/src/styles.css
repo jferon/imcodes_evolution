@@ -4520,6 +4520,17 @@ select.input-sm { padding-right: 22px; background-position: right 7px center; }
   font-size: 11px;
 }
 
+.evolution-copyable-path {
+  cursor: copy;
+  user-select: text;
+}
+
+.evolution-copyable-path.copied {
+  border-color: rgba(74, 222, 128, 0.68) !important;
+  box-shadow: 0 0 0 2px rgba(74, 222, 128, 0.14), 0 0 18px rgba(34, 197, 94, 0.16);
+  color: #bbf7d0 !important;
+}
+
 .evolution-control-card-footer .ok {
   border-color: rgba(74, 222, 128, 0.38);
   color: #bbf7d0;
@@ -4602,7 +4613,7 @@ select.input-sm { padding-right: 22px; background-position: right 7px center; }
   display: block;
 }
 
-.evolution-control-inbox-path-picker > span {
+.evolution-control-inbox-path-picker > button {
   padding: 9px 12px;
   border: 1px solid rgba(56, 189, 248, 0.34);
   border-radius: 12px;
@@ -4613,13 +4624,13 @@ select.input-sm { padding-right: 22px; background-position: right 7px center; }
   white-space: nowrap;
 }
 
-.evolution-control-inbox-path-picker:hover:not(:disabled) code,
-.evolution-control-inbox-path-picker:focus-visible code {
+.evolution-control-inbox-path-picker code:hover,
+.evolution-control-inbox-path-picker code:focus-visible {
   border-color: rgba(103, 232, 249, 0.68);
   box-shadow: 0 0 0 2px rgba(34, 211, 238, 0.12);
 }
 
-.evolution-control-inbox-path-picker:disabled {
+.evolution-control-inbox-path-picker > button:disabled {
   cursor: not-allowed;
   opacity: 0.56;
 }

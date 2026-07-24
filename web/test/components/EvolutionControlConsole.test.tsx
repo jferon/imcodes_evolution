@@ -1,7 +1,7 @@
 /**
  * @vitest-environment jsdom
  */
-import { cleanup, fireEvent, render, screen } from '@testing-library/preact';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('react-i18next', () => ({
@@ -65,8 +65,43 @@ describe('EvolutionControlConsole requirement directory picker', () => {
     fireEvent.click(screen.getByRole('button', { name: 'choose-test-directory' }));
     expect(onSetInboxDirectory).toHaveBeenCalledWith('/workspace/requirements');
     expect(screen.queryByTestId('directory-browser')).toBeNull();
-    expect(screen.getByRole('button', { name: '选择目录' }).textContent)
+    expect(screen.getByTitle('双击复制需求目录').textContent)
       .toContain('/workspace/requirements');
+  });
+
+  it('copies the project and watcher directories on double click without opening the browser', async () => {
+    const writeText = vi.fn(() => Promise.resolve());
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+    render(
+      <EvolutionControlConsole
+        ws={{} as never}
+        projection={null}
+        watchers={[]}
+        sessionName="deck_demo_brain"
+        projectRoot="/workspace/project"
+        projectLabel="demo"
+        onOpenWarRoom={vi.fn()}
+        onLaunchDemo={vi.fn()}
+        onScanInbox={vi.fn()}
+        onSetInboxDirectory={vi.fn()}
+        onSendUserMessage={vi.fn()}
+        onRefresh={vi.fn()}
+        onNewSubSession={vi.fn()}
+        onStartDiscussion={vi.fn()}
+        onViewDiscussions={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.dblClick(screen.getByTitle('双击复制项目目录'));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith('/workspace/project'));
+
+    fireEvent.dblClick(screen.getByTitle('双击复制需求目录'));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith('/workspace/project/.imcodes/inbox/requirements'));
+    expect(screen.queryByTestId('directory-browser')).toBeNull();
   });
 });
 
