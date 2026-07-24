@@ -1200,7 +1200,7 @@ function releaseRoundtableGateForHumanContinue(
   targetStage: EvolutionStage,
   message: string | undefined,
   nowMs: number,
-): boolean {
+): { released: boolean; resumeStage: EvolutionStage } {
   const releaseTargets = (run.roundtables ?? []).filter((roundtable) => {
     if (roundtable.stage !== targetStage) return false;
     if (roundtable.id === PLANNING_ROUNDTABLE_ID) {
@@ -1209,23 +1209,39 @@ function releaseRoundtableGateForHumanContinue(
     if ((run.roundtableGateMode ?? 'planning') !== 'strict') return false;
     return roundtableGateDecision(roundtable, run).disposition === 'block';
   });
+  let resumeStage = targetStage;
   for (const roundtable of releaseTargets) {
     // A human asking the pipeline to continue is not an agent/checker PASS.
-    // Preserve the failed verdict as evidence, then remove only the active
-    // roundtable reference so the same governed stage launches a fresh attempt.
-    run.roundtables = (run.roundtables ?? []).filter((entry) => entry.id !== roundtable.id);
+    // Preserve the failed verdict as evidence. In governed mode, a Product
+    // Critic REWORK must return to the Product Maker so the PRD changes before
+    // it is reviewed again; directly relaunching the checker only repeats the
+    // same discussion over the same immutable input revision.
+    const retryProductMaker = (run.executionPolicy ?? 'draft_preview') === 'governed'
+      && roundtable.id === 'product-review';
+    if (retryProductMaker) {
+      resumeStage = 'intake_normalized';
+      run.roundtables = (run.roundtables ?? []).filter((entry) => (
+        entry.id !== roundtable.id && entry.id !== EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID
+      ));
+    } else {
+      run.roundtables = (run.roundtables ?? []).filter((entry) => entry.id !== roundtable.id);
+    }
     appendDiscussion(run, {
       kind: 'gate',
-      stage: targetStage,
+      stage: resumeStage,
       roleId: 'loop_supervisor',
       author: 'Loop Supervisor / 总控',
-      text: `人工要求重新执行 ${roundtable.topic}，恢复到 ${targetStage} 后将启动新的受治理圆桌；原 REWORK/失败结论保持不变。${message ? `说明：${message}` : ''}`,
+      text: retryProductMaker
+        ? `人工确认处理 ${roundtable.topic} 的 REWORK，流程先回到 Product Maker 修订 PRD，再用新 revision 发起产品审查；原 REWORK 结论保持审计。${message ? `说明：${message}` : ''}`
+        : `人工要求重新执行 ${roundtable.topic}，恢复到 ${targetStage} 后将启动新的受治理圆桌；原 REWORK/失败结论保持不变。${message ? `说明：${message}` : ''}`,
       createdAt: nowMs,
     });
     appendEvidence(run, {
-      source: 'human_roundtable_retry',
+      source: retryProductMaker ? 'human_maker_rework_retry' : 'human_roundtable_retry',
       summary: [
-        `Human requested a fresh ${roundtable.id} attempt at ${targetStage}.`,
+        retryProductMaker
+          ? `Human routed ${roundtable.id} REWORK back to ${EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID} at intake_normalized before another checker attempt.`
+          : `Human requested a fresh ${roundtable.id} attempt at ${targetStage}.`,
         `Previous status=${roundtable.status}.`,
         roundtable.p2pRunId ? `Previous p2pRunId=${roundtable.p2pRunId}.` : '',
         roundtable.summary ? `Previous verdict=${roundtable.summary.slice(0, 500)}.` : '',
@@ -1238,7 +1254,7 @@ function releaseRoundtableGateForHumanContinue(
       question.id !== `planning-roundtable-${run.runId}-blocked`
     ));
   }
-  return releaseTargets.length > 0;
+  return { released: releaseTargets.length > 0, resumeStage };
 }
 
 function evolutionScoreModuleForOpenSpec(module: string): EvolutionScoreModuleId | null {
@@ -2676,15 +2692,16 @@ export async function continueEvolutionRun(options: ContinueEvolutionRunOptions)
     run.blockingQuestions = run.blockingQuestions.filter((question) => question.id !== `design-hifi-approval-${run.runId}`);
   }
   releaseUserPauseGateForHumanContinue(run, targetStage, options.message, nowMs);
-  const retryRoundtable = releaseRoundtableGateForHumanContinue(run, targetStage, options.message, nowMs);
+  const roundtableRelease = releaseRoundtableGateForHumanContinue(run, targetStage, options.message, nowMs);
+  const resumeStage = roundtableRelease.resumeStage;
   const advanced = await advanceEvolutionRunStage({
     runId: validRunId.value,
-    nextStage: targetStage,
-    reason: options.message ?? `Human gate resolved; continuing at ${targetStage}.`,
+    nextStage: resumeStage,
+    reason: options.message ?? `Human gate resolved; continuing at ${resumeStage}.`,
     nowMs,
   });
-  if (!advanced.ok || !retryRoundtable) return advanced;
-  await maybeStartRoundtablesForStage(entry, options.serverLink ?? null, nowMs, targetStage);
+  if (!advanced.ok || !roundtableRelease.released) return advanced;
+  await maybeStartRoundtablesForStage(entry, options.serverLink ?? null, nowMs, resumeStage);
   return ok(buildEvolutionProjection(run, nowMs));
 }
 
@@ -5446,12 +5463,22 @@ function renderVisualFidelityRoundtablePrompt(run: EvolutionRun): string {
   ].join('\n');
 }
 
+function latestProductReviewReworkFeedback(run: EvolutionRun): string | null {
+  const verdict = [...(run.verdictRecords ?? [])].reverse().find((entry) => (
+    entry.stage === 'product_discussion'
+    && entry.checkerRoleId === 'product_critic'
+    && entry.verdict === 'REWORK'
+  ));
+  return verdict?.summary?.trim().slice(0, 8_000) || null;
+}
+
 function renderProductMakerPrompt(run: EvolutionRun): string {
   const runDirRelative = `${EVOLUTION_RUN_ROOT_DIR}/${run.runId}`;
   const referenceImagePaths = run.artifacts
     .filter((artifact) => artifact.kind === 'design_reference_image')
     .map((artifact) => `${runDirRelative}/${artifact.path}`);
   const normalizedPath = run.artifacts.find((artifact) => artifact.kind === 'normalized_requirement')?.path;
+  const reworkFeedback = latestProductReviewReworkFeedback(run);
   return [
     `你是本次自我进化 run ${run.runId} 的产品经理 Maker。你的任务不是讨论，而是真实撰写可交付的 PRD 文档。`,
     '',
@@ -5460,6 +5487,15 @@ function renderProductMakerPrompt(run: EvolutionRun): string {
     ...(normalizedPath ? [`- 标准化需求：\`${runDirRelative}/${normalizedPath}\``] : []),
     ...(referenceImagePaths.length > 0
       ? ['- 参考图（必须逐张用 Read 工具真实查看）：', ...referenceImagePaths.map((path) => `  - ${path}`)]
+      : []),
+    ...(reworkFeedback
+      ? [
+          '',
+          '## 上一轮 Product Critic 的 REWORK（必须逐条落实）',
+          '这是审查结论，不是新一轮空谈。请先修改 PRD，再在最终消息中逐条说明如何关闭这些问题：',
+          '',
+          reworkFeedback,
+        ]
       : []),
     '',
     '## 第二步：写出以下文件（路径相对项目根目录）',

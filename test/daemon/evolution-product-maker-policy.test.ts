@@ -15,6 +15,7 @@ import {
   registerProductMakerOutputArtifacts,
 } from '../../src/daemon/evolution-stage-runner.js';
 import {
+  continueEvolutionRun,
   getEvolutionRun,
   hydrateEvolutionRun,
   launchEvolutionRun,
@@ -103,6 +104,90 @@ describe('Product Maker output promotion', () => {
 });
 
 describe('Product Maker governed dispatch — the agent PRD survives the deterministic template', () => {
+  it('routes Product Critic REWORK back through Product Maker before another review', async () => {
+    const root = await makeRoot();
+    const sourceRelativePath = await writeRequirement(root, 'pm-review-rework.md');
+    const captured: Array<{ roundtableSpecId: string; p2pRunId: string; prompt: string }> = [];
+    let counter = 0;
+    setEvolutionRoundtableLauncher(async (request) => {
+      counter += 1;
+      const p2pRunId = `p2p_${request.roundtableSpecId}_${counter}`;
+      captured.push({ roundtableSpecId: request.roundtableSpecId, p2pRunId, prompt: request.prompt });
+      return { ok: true, p2pRunId, discussionId: `dsc_${p2pRunId}`, contextPath: `.imc/discussions/${p2pRunId}.md` };
+    });
+
+    const launched = await launchEvolutionRun({
+      projectRoot: root,
+      nowMs: 5_000,
+      request: {
+        requestId: 'req-pm-review-rework',
+        sessionName: 'deck_demo_brain',
+        sourceRelativePath,
+        executionPolicy: 'governed',
+        roundtableGateMode: 'strict',
+      },
+    });
+    expect(launched.ok).toBe(true);
+    if (!launched.ok) return;
+    const runDir = join(root, '.imc/evolution', launched.value.runId);
+    const serverLink = { send() { /* ignore */ } };
+
+    await runEvolutionAutopilot(launched.value.runId, serverLink, { nowMs: 5_100 });
+    expect(captured[0]?.roundtableSpecId).toBe(EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID);
+    await mkdir(join(runDir, 'artifacts'), { recursive: true });
+    await writeFile(join(runDir, PRODUCT_MAKER_PRD_RELATIVE_PATH), AGENT_PRD, 'utf8');
+    await recordEvolutionP2pRunProjection({
+      run: {
+        id: captured[0]!.p2pRunId,
+        discussion_id: `dsc_${captured[0]!.p2pRunId}`,
+        status: 'completed',
+        mode_key: 'discuss',
+        current_round: 2,
+        total_rounds: 2,
+        result_summary: 'PRD 已写入。\n<!-- EVOLUTION_VERDICT: PASS -->',
+        completed_at: '2026-07-24T10:00:00.000Z',
+      },
+      serverLink,
+      nowMs: 5_200,
+    });
+    expect(captured[1]?.roundtableSpecId).toBe('product-review');
+
+    await recordEvolutionP2pRunProjection({
+      run: {
+        id: captured[1]!.p2pRunId,
+        discussion_id: `dsc_${captured[1]!.p2pRunId}`,
+        status: 'completed',
+        mode_key: 'review',
+        current_round: 2,
+        total_rounds: 2,
+        result_summary: '必须补齐购买人画像和付款失败验收。\n<!-- EVOLUTION_VERDICT: REWORK -->',
+        completed_at: '2026-07-24T10:01:00.000Z',
+      },
+      serverLink,
+      nowMs: 5_300,
+    });
+    expect(getEvolutionRun(launched.value.runId)?.value?.stage).toBe('needs_human');
+
+    const continued = await continueEvolutionRun({
+      runId: launched.value.runId,
+      message: '确认修订后再审查。',
+      serverLink,
+      nowMs: 5_400,
+    });
+    expect(continued.ok).toBe(true);
+    if (!continued.ok) return;
+    expect(continued.value.stage).toBe('intake_normalized');
+    expect(continued.value.roundtables.find((roundtable) => roundtable.id === 'product-review')).toBeUndefined();
+    expect(continued.value.roundtables.find((roundtable) => roundtable.id === EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID))
+      .toEqual(expect.objectContaining({ status: 'running' }));
+    expect(captured[2]?.roundtableSpecId).toBe(EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID);
+    expect(captured[2]?.prompt).toContain('上一轮 Product Critic 的 REWORK');
+    expect(captured[2]?.prompt).toContain('购买人画像和付款失败验收');
+    expect(continued.value.evidence).toContainEqual(expect.objectContaining({
+      source: 'human_maker_rework_retry',
+    }));
+  });
+
   it('launches the maker first, promotes on PASS, and the intake template never overwrites the agent PRD', async () => {
     const root = await makeRoot();
     const sourceRelativePath = await writeRequirement(root, 'pm-slice.md');
