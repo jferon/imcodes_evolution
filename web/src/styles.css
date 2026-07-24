@@ -4978,6 +4978,49 @@ select.input-sm { padding-right: 22px; background-position: right 7px center; }
   margin: 16px 0;
 }
 
+.evolution-war-room-contextual-actions {
+  margin: 14px 0 4px;
+  padding: 12px;
+  border: 1px solid rgba(56, 189, 248, 0.28);
+  border-radius: 14px;
+  background:
+    linear-gradient(135deg, rgba(8, 47, 73, 0.72), rgba(30, 41, 59, 0.82)),
+    rgba(2, 6, 23, 0.88);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 10px 28px rgba(2, 132, 199, 0.1);
+}
+
+.evolution-war-room-contextual-actions > .btn,
+.evolution-war-room-contextual-actions .evolution-openspec-loop-action > .btn {
+  border-width: 1px;
+  font-weight: 800;
+  box-shadow: 0 8px 18px rgba(2, 6, 23, 0.28);
+}
+
+.evolution-action-pause {
+  border-color: rgba(251, 191, 36, 0.48);
+  background: linear-gradient(180deg, rgba(180, 83, 9, 0.86), rgba(120, 53, 15, 0.9));
+  color: #fef3c7;
+}
+
+.evolution-action-continue,
+.evolution-action-openspec {
+  border-color: rgba(34, 211, 238, 0.54);
+  background: linear-gradient(180deg, rgba(8, 145, 178, 0.94), rgba(30, 64, 175, 0.94));
+  color: #ecfeff;
+}
+
+.evolution-action-restart {
+  border-color: rgba(74, 222, 128, 0.48);
+  background: linear-gradient(180deg, rgba(22, 163, 74, 0.9), rgba(21, 94, 117, 0.92));
+  color: #f0fdf4;
+}
+
+.evolution-action-staging {
+  border-color: rgba(192, 132, 252, 0.5);
+  background: linear-gradient(180deg, rgba(126, 34, 206, 0.88), rgba(76, 29, 149, 0.92));
+  color: #faf5ff;
+}
+
 .evolution-openspec-loop-action {
   display: inline-flex;
   flex-direction: column;

@@ -346,7 +346,7 @@ describe('EvolutionWarRoomPanel status feedback', () => {
     expect(status.textContent).toContain('等待 daemon 返回 ACK');
   });
 
-  it('keeps the OpenSpec development loop button disabled until blockers and roundtables pass', () => {
+  it('hides the OpenSpec development loop action until blockers and roundtables pass', () => {
     const onStartAutoDeliver = vi.fn();
     render(<EvolutionWarRoomPanel {...props({
       onStartAutoDeliver,
@@ -367,11 +367,8 @@ describe('EvolutionWarRoomPanel status feedback', () => {
       }),
     })} />);
 
-    const button = screen.getByRole('button', { name: '启动 OpenSpec 开发 Loop' }) as HTMLButtonElement;
-    expect(button.disabled).toBe(true);
-    expect(screen.getByText(/当前处于人工阻塞/).textContent).toContain('planning_roundtable_requires_rework');
-
-    fireEvent.click(button);
+    expect(screen.queryByRole('button', { name: '启动 OpenSpec 开发 Loop' })).toBeNull();
+    expect(screen.getByRole('button', { name: '继续/解除阻塞' })).toBeTruthy();
     expect(onStartAutoDeliver).not.toHaveBeenCalled();
   });
 
@@ -456,8 +453,35 @@ describe('EvolutionWarRoomPanel status feedback', () => {
     expect(status.textContent).toContain('暂停前阶段：高保真设计');
     expect(screen.getByTestId('evolution-operator-guide').textContent).toContain('换个时间回来后，直接点击“继续执行”');
     expect(screen.getByRole('button', { name: '继续执行' })).toBeTruthy();
-    expect((screen.getByRole('button', { name: '暂停' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByRole('button', { name: '暂停' })).toBeNull();
     expect(screen.getByTestId('evolution-progress-overview').textContent).toContain('已暂停');
+  });
+
+  it('shows only the action relevant to the current running stage', () => {
+    render(<EvolutionWarRoomPanel {...props({
+      projection: makeProjection({
+        stage: 'product_discussion',
+        linkedOpenSpecChange: undefined,
+      }),
+    })} />);
+
+    const actionBar = screen.getByRole('button', { name: '暂停' }).closest('.evolution-war-room-contextual-actions');
+    expect(actionBar).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '继续/解除阻塞' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '启动 OpenSpec 开发 Loop' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '检查 Staging 配置' })).toBeNull();
+  });
+
+  it('shows the staging check only at the delivery configuration gate', () => {
+    render(<EvolutionWarRoomPanel {...props({
+      projection: makeProjection({
+        stage: 'delivery_ready',
+        linkedOpenSpecChange: undefined,
+      }),
+    })} />);
+
+    expect(screen.getByRole('button', { name: '检查 Staging 配置' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '启动 OpenSpec 开发 Loop' })).toBeNull();
   });
 
   it('enables the OpenSpec development loop button after all required preconditions pass', () => {

@@ -714,6 +714,29 @@ export function EvolutionWarRoomPanel({
   const openSpecLoopGate = projection
     ? evaluateOpenSpecLoopGate(projection, { handlerAvailable: !!onStartAutoDeliver, pending: autoDeliverPending })
     : null;
+  const showPauseAction = canPause;
+  const showContinueAction = !!projection
+    && !terminal
+    && !hifiApprovalQuestion
+    && !hifiReviewGate
+    && (projection.stage === 'needs_human' || isProductionGate);
+  const showRestartAction = projection?.stage === 'stopped' && !!projection.source.relativePath;
+  const showOpenSpecAction = !!projection?.linkedOpenSpecChange
+    && (openSpecLoopGate?.canStart === true || autoDeliverPending);
+  const showStagingCheckAction = !!projection
+    && !terminal
+    && (
+      projection.stage === 'delivery_ready'
+      || projection.blockingQuestions.some((question) => (
+        question.id.startsWith(`staging-config-${projection.runId}-`)
+        || question.id.startsWith(`staging-delivery-${projection.runId}-`)
+      ))
+    );
+  const showContextualActions = showPauseAction
+    || showContinueAction
+    || showRestartAction
+    || showOpenSpecAction
+    || showStagingCheckAction;
   const canImportReferenceBrief = !!serverId && !!projectRoot && referenceFiles.length > 0 && !referenceBriefPending && !referenceUploading;
 
   useEffect(() => {
@@ -1143,38 +1166,48 @@ export function EvolutionWarRoomPanel({
               </section>
             )}
 
-            <div class="evolution-war-room-actions">
-              <button class="btn btn-secondary" disabled={!canPause || stopPending} onClick={onStop}>{stopPending ? '暂停中…' : '暂停'}</button>
-              <button class="btn btn-secondary" disabled={terminal || continuePending || !!hifiApprovalQuestion || !!hifiReviewGate} onClick={() => onContinue(message)}>
-                {continuePending ? '继续中…' : isProductionGate ? '确认生产门禁' : paused ? '继续执行' : '继续/解除阻塞'}
-              </button>
-              {projection.stage === 'stopped' && projection.source.relativePath && (
-                <button class="btn btn-primary" disabled={launchPending} onClick={handleRestartFromCurrentRequirement}>
-                  {launchPending ? '启动中…' : '从当前需求重新启动'}
-                </button>
-              )}
-              {projection.linkedOpenSpecChange && (
-                <div class="evolution-openspec-loop-action">
-                  <button
-                    class="btn btn-primary"
-                    disabled={!openSpecLoopGate?.canStart}
-                    title={openSpecLoopGate?.reason}
-                    onClick={() => {
-                      if (!openSpecLoopGate?.canStart) return;
-                      onStartAutoDeliver?.(projection.linkedOpenSpecChange!);
-                    }}
-                  >
-                    {autoDeliverPending ? '开发 Loop 启动中…' : '启动 OpenSpec 开发 Loop'}
+            {showContextualActions && (
+              <div class="evolution-war-room-actions evolution-war-room-contextual-actions">
+                {showPauseAction && (
+                  <button class="btn evolution-action-pause" disabled={stopPending} onClick={onStop}>
+                    {stopPending ? '暂停中…' : '暂停'}
                   </button>
-                  <span class={openSpecLoopGate?.canStart ? 'gate-pass' : 'gate-blocked'}>
-                    {openSpecLoopGate?.reason}
-                  </span>
-                </div>
-              )}
-              <button class="btn btn-secondary" disabled={stagingCheckPending} onClick={onCheckStaging}>
-                {stagingCheckPending ? '检查中…' : '检查 Staging 配置'}
-              </button>
-            </div>
+                )}
+                {showContinueAction && (
+                  <button class="btn evolution-action-continue" disabled={continuePending} onClick={() => onContinue(message)}>
+                    {continuePending ? '继续中…' : isProductionGate ? '确认生产门禁' : paused ? '继续执行' : '继续/解除阻塞'}
+                  </button>
+                )}
+                {showRestartAction && (
+                  <button class="btn evolution-action-restart" disabled={launchPending} onClick={handleRestartFromCurrentRequirement}>
+                  {launchPending ? '启动中…' : '从当前需求重新启动'}
+                  </button>
+                )}
+                {showOpenSpecAction && (
+                  <div class="evolution-openspec-loop-action">
+                    <button
+                      class="btn evolution-action-openspec"
+                      disabled={!openSpecLoopGate?.canStart}
+                      title={openSpecLoopGate?.reason}
+                      onClick={() => {
+                        if (!openSpecLoopGate?.canStart) return;
+                        onStartAutoDeliver?.(projection.linkedOpenSpecChange!);
+                      }}
+                    >
+                      {autoDeliverPending ? '开发 Loop 启动中…' : '启动 OpenSpec 开发 Loop'}
+                    </button>
+                    <span class="gate-pass">
+                      {openSpecLoopGate?.reason}
+                    </span>
+                  </div>
+                )}
+                {showStagingCheckAction && (
+                  <button class="btn evolution-action-staging" disabled={stagingCheckPending} onClick={onCheckStaging}>
+                    {stagingCheckPending ? '检查中…' : '检查 Staging 配置'}
+                  </button>
+                )}
+              </div>
+            )}
 
             <section class="evolution-loop-control">
               <div class="evolution-section-heading">
