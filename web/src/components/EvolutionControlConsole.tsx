@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import { EVOLUTION_REQUIREMENT_INBOX_DIR } from '@shared/evolution-pipeline-constants.js';
+import { EVOLUTION_REQUIREMENT_INBOX_DIR, isEvolutionTerminalStage } from '@shared/evolution-pipeline-constants.js';
 import type { WsClient } from '../ws-client.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import {
@@ -338,8 +338,15 @@ export function EvolutionControlConsole({
             {CONSOLE_STAGES.map((item) => {
               const itemIndex = stageIndex(item.stage);
               const state = !projection ? 'todo' : itemIndex < currentStageIndex ? 'done' : itemIndex === currentStageIndex ? 'current' : 'todo';
+              // Breathing light (same sci-fi pulse as sub-session cards) only
+              // while the run is actively executing this stage — a run parked
+              // at needs_human or a terminal stage does not "breathe".
+              const breathing = state === 'current'
+                && projection
+                && projection.stage !== 'needs_human'
+                && !isEvolutionTerminalStage(projection.stage);
               return (
-                <div key={item.stage} class={`evolution-control-stage ${state}`}>
+                <div key={item.stage} class={`evolution-control-stage ${state}${breathing ? ' subcard-running-pulse' : ''}`}>
                   <b>{item.label}</b>
                   <span>{item.detail}</span>
                 </div>

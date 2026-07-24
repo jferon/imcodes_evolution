@@ -69,3 +69,50 @@ describe('EvolutionControlConsole requirement directory picker', () => {
       .toContain('/workspace/requirements');
   });
 });
+
+describe('EvolutionControlConsole stage breathing light', () => {
+  function renderWithProjection(stage: string) {
+    render(
+      <EvolutionControlConsole
+        ws={{} as never}
+        projection={{
+          stage,
+          roles: [],
+          artifacts: [],
+          blockingQuestions: [],
+          evidence: [],
+          discussion: [],
+        } as never}
+        watchers={[]}
+        sessionName="deck_demo_brain"
+        projectRoot="/workspace/project"
+        projectLabel="demo"
+        onOpenWarRoom={vi.fn()}
+        onLaunchDemo={vi.fn()}
+        onScanInbox={vi.fn()}
+        onSetInboxDirectory={vi.fn()}
+        onSendUserMessage={vi.fn()}
+        onRefresh={vi.fn()}
+        onNewSubSession={vi.fn()}
+        onStartDiscussion={vi.fn()}
+        onViewDiscussions={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+  }
+
+  it('breathes (sub-session pulse class) on the currently-executing stage card only', () => {
+    renderWithProjection('design_lofi');
+    const card = screen.getByText('低保真').closest('.evolution-control-stage');
+    expect(card?.className).toContain('current');
+    expect(card?.className).toContain('subcard-running-pulse');
+    // Non-current cards never breathe.
+    const other = screen.getByText('开发 Loop').closest('.evolution-control-stage');
+    expect(other?.className).not.toContain('subcard-running-pulse');
+  });
+
+  it('does not breathe while the run waits for a human', () => {
+    renderWithProjection('needs_human');
+    expect(document.querySelector('.subcard-running-pulse')).toBeNull();
+  });
+});
