@@ -26,6 +26,7 @@ vi.mock('../../src/daemon/p2p-orchestrator.js', async (importOriginal) => {
 });
 
 import {
+  advanceEvolutionRunStage,
   launchEvolutionRun,
   runEvolutionAutopilot,
   setEvolutionRoundtableLauncher,
@@ -119,5 +120,93 @@ describe('evolution P2P roundtable launcher', () => {
       p2pRunId: 'p2p_two_rounds',
       discussionId: 'dsc_two_rounds',
     }));
+
+    startP2pRunMock.mockClear();
+    startP2pRunMock.mockResolvedValue({
+      id: 'p2p_product_maker',
+      discussionId: 'dsc_product_maker',
+      contextFilePath: join(root, '.imc/discussions/p2p_product_maker.md'),
+    });
+    const governed = await launchEvolutionRun({
+      projectRoot: root,
+      nowMs: 3_000,
+      request: {
+        requestId: 'req-p2p-product-maker',
+        sessionName: 'deck_demo_brain',
+        projectName: 'demo',
+        sourceRelativePath,
+        executionPolicy: 'governed',
+        roundtableGateMode: 'strict',
+      },
+    });
+    expect(governed.ok).toBe(true);
+    if (!governed.ok) return;
+
+    const governedProjection = await runEvolutionAutopilot(
+      governed.value.runId,
+      { send() { /* no-op */ } },
+      { nowMs: 4_000 },
+    );
+    expect(governedProjection.ok).toBe(true);
+    if (!governedProjection.ok) return;
+
+    const makerOptions = startP2pRunMock.mock.calls[0]?.[0] as {
+      userText: string;
+      postSummaryExecution: string;
+      finalSummaryExtraInstruction: string;
+    };
+    expect(makerOptions.userText).toContain('你的任务不是讨论，而是真实撰写可交付的 PRD 文档');
+    expect(makerOptions.postSummaryExecution).toBe('required');
+    expect(makerOptions.finalSummaryExtraInstruction).toContain('真实写入 Maker 要求的产物文件');
+    expect(makerOptions.finalSummaryExtraInstruction).not.toContain('do not edit project files');
+
+    startP2pRunMock.mockClear();
+    startP2pRunMock.mockResolvedValue({
+      id: 'p2p_design_maker',
+      discussionId: 'dsc_design_maker',
+      contextFilePath: join(root, '.imc/discussions/p2p_design_maker.md'),
+    });
+    const designGoverned = await launchEvolutionRun({
+      projectRoot: root,
+      nowMs: 5_000,
+      request: {
+        requestId: 'req-p2p-design-maker',
+        sessionName: 'deck_demo_brain',
+        projectName: 'demo',
+        sourceRelativePath,
+        executionPolicy: 'governed',
+        roundtableGateMode: 'strict',
+      },
+    });
+    expect(designGoverned.ok).toBe(true);
+    if (!designGoverned.ok) return;
+
+    for (const [index, stage] of ['intake_normalized', 'product_discussion', 'prd_ready', 'design_lofi'].entries()) {
+      const advanced = await advanceEvolutionRunStage({
+        runId: designGoverned.value.runId,
+        nextStage: stage as 'intake_normalized' | 'product_discussion' | 'prd_ready' | 'design_lofi',
+        nowMs: 6_000 + index,
+      });
+      expect(advanced.ok).toBe(true);
+    }
+
+    const designProjection = await runEvolutionAutopilot(
+      designGoverned.value.runId,
+      { send() { /* no-op */ } },
+      { nowMs: 7_000 },
+    );
+    expect(designProjection.ok).toBe(true);
+    if (!designProjection.ok) return;
+
+    expect(startP2pRunMock).toHaveBeenCalledTimes(1);
+    const designMakerOptions = startP2pRunMock.mock.calls[0]?.[0] as {
+      userText: string;
+      postSummaryExecution: string;
+      finalSummaryExtraInstruction: string;
+    };
+    expect(designMakerOptions.userText).toContain('你的任务不是讨论，而是真实产出可交付的设计文件');
+    expect(designMakerOptions.postSummaryExecution).toBe('required');
+    expect(designMakerOptions.finalSummaryExtraInstruction).toContain('真实写入 Maker 要求的产物文件');
+    expect(designMakerOptions.finalSummaryExtraInstruction).toContain('only create or update the declared Maker output artifacts');
   });
 });

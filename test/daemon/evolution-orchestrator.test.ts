@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EVOLUTION_HIFI_REDESIGN_MESSAGE_PREFIX, EVOLUTION_PIPELINE_MSG, EVOLUTION_REQUIREMENT_INBOX_DIR } from '../../shared/evolution-pipeline-constants.js';
+import type { EvolutionProjection } from '../../shared/evolution-pipeline-types.js';
 import { parseOpenSpecTasksMarkdown } from '../../shared/openspec-auto-deliver-validators.js';
 import { validateEvolutionProjection } from '../../shared/evolution-pipeline-validators.js';
 import { stopAllEvolutionInboxWatchers } from '../../src/daemon/evolution-inbox-watch-manager.js';
@@ -3208,8 +3209,10 @@ describe('evolution orchestrator', () => {
     expect(launched.ok).toBe(true);
     if (!launched.ok) return;
     let launchCount = 0;
-    setEvolutionRoundtableLauncher(async () => {
+    const launcherLinks: unknown[] = [];
+    setEvolutionRoundtableLauncher(async (_request, serverLink) => {
       launchCount += 1;
+      launcherLinks.push(serverLink);
       return {
         ok: true,
         p2pRunId: `p2p_strict_rework_${launchCount}`,
@@ -3248,26 +3251,36 @@ describe('evolution orchestrator', () => {
       assurance: 'pipeline_draft',
     }));
 
-    const continued = await continueEvolutionRun({
-      runId: launched.value.runId,
-      message: '已补充 buyer personas 和支付假设，允许继续生成 PRD。',
-      nowMs: 63_000,
-    });
+    const sent: Record<string, unknown>[] = [];
+    const retryServerLink = { send(message: Record<string, unknown>) { sent.push(message); } };
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(63_000);
+    try {
+      await handleEvolutionPipelineCommand({
+        type: EVOLUTION_PIPELINE_MSG.CONTINUE,
+        requestId: 'req-strict-rework-continue',
+        runId: launched.value.runId,
+        message: '已补充 buyer personas 和支付假设，允许继续生成 PRD。',
+      }, retryServerLink as never);
+    } finally {
+      nowSpy.mockRestore();
+    }
 
-    expect(continued.ok).toBe(true);
-    if (!continued.ok) return;
-    expect(continued.value.stage).toBe('product_discussion');
-    expect(continued.value.verdict).toBeUndefined();
-    expect(continued.value.blockingQuestions).toHaveLength(0);
-    expect(continued.value.roundtables.find((roundtable) => roundtable.id === 'product-review')).toEqual(expect.objectContaining({
+    const continueAck = sent.find((message) => message.type === EVOLUTION_PIPELINE_MSG.CONTINUE_ACK) as {
+      projection?: EvolutionProjection;
+    } | undefined;
+    expect(continueAck?.projection?.stage).toBe('product_discussion');
+    expect(continueAck?.projection?.verdict).toBeUndefined();
+    expect(continueAck?.projection?.blockingQuestions).toHaveLength(0);
+    expect(continueAck?.projection?.roundtables.find((roundtable) => roundtable.id === 'product-review')).toEqual(expect.objectContaining({
       status: 'running',
       p2pRunId: 'p2p_strict_rework_2',
     }));
-    expect(continued.value.roundtables.find((roundtable) => roundtable.id === 'product-review')?.summary).toBeUndefined();
-    expect(continued.value.evidence).toContainEqual(expect.objectContaining({
+    expect(continueAck?.projection?.roundtables.find((roundtable) => roundtable.id === 'product-review')?.summary).toBeUndefined();
+    expect(continueAck?.projection?.evidence).toContainEqual(expect.objectContaining({
       source: 'human_roundtable_retry',
       summary: expect.stringContaining('Previous verdict=REWORK'),
     }));
+    expect(launcherLinks[1]).toBe(retryServerLink);
 
     const retryPending = await runEvolutionAutopilot(launched.value.runId, null, { nowMs: 64_000 });
     expect(retryPending.ok).toBe(true);

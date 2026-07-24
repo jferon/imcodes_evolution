@@ -189,6 +189,7 @@ export interface ContinueEvolutionRunOptions {
   targetStage?: EvolutionStage;
   message?: string;
   nowMs?: number;
+  serverLink?: EvolutionServerLink | null;
 }
 
 export interface EvolutionGateActor {
@@ -2661,7 +2662,7 @@ export async function continueEvolutionRun(options: ContinueEvolutionRunOptions)
     nowMs,
   });
   if (!advanced.ok || !retryRoundtable) return advanced;
-  await maybeStartRoundtablesForStage(entry, null, nowMs, targetStage);
+  await maybeStartRoundtablesForStage(entry, options.serverLink ?? null, nowMs, targetStage);
   return ok(buildEvolutionProjection(run, nowMs));
 }
 
@@ -6304,6 +6305,7 @@ export async function handleEvolutionPipelineCommand(cmd: Record<string, unknown
         runId: cmd.runId,
         ...(targetStage ? { targetStage } : {}),
         ...(typeof cmd.message === 'string' ? { message: cmd.message } : {}),
+        serverLink,
       });
       sendResult(serverLink, EVOLUTION_PIPELINE_MSG.CONTINUE_ACK, result, { requestId: cmd.requestId });
       if (result.ok && !isEvolutionTerminalStage(result.value.stage)) {

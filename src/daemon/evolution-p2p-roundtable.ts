@@ -3,7 +3,11 @@ import { isAbsolute, join, relative, resolve } from 'node:path';
 import type { ServerLink } from './server-link.js';
 import { listSessions, getSession, type SessionRecord } from '../store/session-store.js';
 import { appendP2pRunUserIntervention, startP2pRun, type P2pTarget } from './p2p-orchestrator.js';
-import { EVOLUTION_VISUAL_FIDELITY_ROUNDTABLE_ID } from '../../shared/evolution-pipeline-constants.js';
+import {
+  EVOLUTION_DESIGN_MAKER_ROUNDTABLE_ID,
+  EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID,
+  EVOLUTION_VISUAL_FIDELITY_ROUNDTABLE_ID,
+} from '../../shared/evolution-pipeline-constants.js';
 import { isClaudeCodeFamily } from '../../shared/agent-types.js';
 import { defaultDedicatedExecutionRoutingPreference } from '../../shared/execution-clone.js';
 import { createExecutionClone } from './execution-clone.js';
@@ -35,6 +39,11 @@ function sameProjectRoot(left: string, right: string): boolean {
 
 function isVisualFidelityRequest(request: EvolutionRoundtableLaunchRequest): boolean {
   return request.roundtableSpecId === EVOLUTION_VISUAL_FIDELITY_ROUNDTABLE_ID;
+}
+
+function isMakerRequest(request: EvolutionRoundtableLaunchRequest): boolean {
+  return request.roundtableSpecId === EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID
+    || request.roundtableSpecId === EVOLUTION_DESIGN_MAKER_ROUNDTABLE_ID;
 }
 
 export function isEligibleHelper(session: SessionRecord, request: EvolutionRoundtableLaunchRequest): boolean {
@@ -280,14 +289,22 @@ setEvolutionRoundtableLauncher(async (
       rounds: 2,
       modeOverride: 'discuss',
       hopTimeoutMs: 300_000,
-      postSummaryExecution: 'disabled',
-      finalSummaryExtraInstruction: [
-        'Evolution roundtable mode is discussion-and-review.',
-        'Use the injected role skill playbooks: Round 1 expands and improves the artifact set; Round 2 cross-reviews and converges to PASS/REWORK.',
-        'Do not execute the original requirement, do not edit project files, do not run delivery/development tasks, and do not write P2P execution proof markers.',
-        'End with role-owned required changes, artifact paths that should be updated, and any human decisions needed before the Evolution pipeline continues.',
-        'The final line must be exactly one machine marker: <!-- EVOLUTION_VERDICT: PASS -->, <!-- EVOLUTION_VERDICT: REWORK -->, or <!-- EVOLUTION_VERDICT: BLOCKED -->.',
-      ].join('\n'),
+      postSummaryExecution: isMakerRequest(request) ? 'required' : 'disabled',
+      finalSummaryExtraInstruction: isMakerRequest(request)
+        ? [
+            'Evolution Maker mode requires real artifact execution after the two-round discussion.',
+            '两轮讨论收敛后，必须使用可用的文件工具真实写入 Maker 要求的产物文件，并严格写到原始请求指定的路径。',
+            'Do not implement application code and do not edit run.json; only create or update the declared Maker output artifacts.',
+            'Never claim PASS until the required files exist and contain substantive, requirement-specific content.',
+            'The final line must be exactly one machine marker: <!-- EVOLUTION_VERDICT: PASS -->, <!-- EVOLUTION_VERDICT: REWORK -->, or <!-- EVOLUTION_VERDICT: BLOCKED -->.',
+          ].join('\n')
+        : [
+            'Evolution roundtable mode is discussion-and-review.',
+            'Use the injected role skill playbooks: Round 1 expands and improves the artifact set; Round 2 cross-reviews and converges to PASS/REWORK.',
+            'Do not execute the original requirement, do not edit project files, do not run delivery/development tasks, and do not write P2P execution proof markers.',
+            'End with role-owned required changes, artifact paths that should be updated, and any human decisions needed before the Evolution pipeline continues.',
+            'The final line must be exactly one machine marker: <!-- EVOLUTION_VERDICT: PASS -->, <!-- EVOLUTION_VERDICT: REWORK -->, or <!-- EVOLUTION_VERDICT: BLOCKED -->.',
+          ].join('\n'),
       launchOrigin: {
         kind: 'manual',
         commandId: request.requestId,
