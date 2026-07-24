@@ -29,6 +29,12 @@ import {
 } from '../../shared/ui-spec.js';
 import { getEvolutionRunPaths, writeEvolutionRun } from './evolution-artifact-store.js';
 import { runEvolutionTasteHifiGeneration, runEvolutionUiScreenshots } from './evolution-design-runner.js';
+import {
+  EVOLUTION_HIFI_DRAFT_PLACEHOLDER_LABEL,
+  readPromotedUiSpecDocument,
+  renderUiSpecOverviewSvg,
+  renderUiSpecScreenSvg,
+} from './evolution-hifi-svg.js';
 import { appendDiscussion, appendEvidence, appendLiveEvent, upsertArtifact, upsertScore } from './evolution-run-helpers.js';
 import {
   persistEvolutionGate,
@@ -1529,12 +1535,16 @@ function renderHifiScreenSvg(digest: RequirementDigest, uiModel: ProductUiModel,
     '<rect width="1440" height="920" fill="url(#screenBg)"/>',
     '<rect x="70" y="54" width="1300" height="812" rx="34" fill="#ffffff" stroke="#dbe3ef" filter="url(#shadow)"/>',
     `<rect x="104" y="88" width="1232" height="96" rx="26" fill="${colors.surface}" stroke="${colors.border}"/>`,
-    svgTextLines([title, purpose], 140, 128, { fill: '#0f172a', size: 30, weight: 900, gap: 38 }),
-    `<rect x="1096" y="112" width="198" height="44" rx="22" fill="${colors.primary}" opacity="0.94"/>`,
-    svgTextLines([refNote], 1120, 142, { fill: '#ffffff', size: 15, weight: 900 }),
+    // Real typographic hierarchy: one title, one small muted subtitle.
+    svgTextLines([title], 140, 132, { fill: '#0f172a', size: 28, weight: 800 }),
+    svgTextLines([purpose], 140, 164, { fill: '#64748b', size: 15, weight: 550 }),
+    // Honest status: this screen is an MD-derived draft placeholder, not hi-fi.
+    '<rect x="1024" y="102" width="272" height="34" rx="17" fill="#fef3c7" stroke="#f59e0b"/>',
+    svgTextLines([EVOLUTION_HIFI_DRAFT_PLACEHOLDER_LABEL], 1048, 125, { fill: '#b45309', size: 14, weight: 800 }),
+    svgTextLines([refNote], 1048, 158, { fill: '#94a3b8', size: 12, weight: 600 }),
     '<rect x="104" y="226" width="282" height="560" rx="28" fill="#f8fafc" stroke="#dbe3ef"/>',
     svgTextLines(['导航/对象'], 140, 276, { fill: '#0f172a', size: 25, weight: 900 }),
-    svgTextLines(uiModel.navigation.slice(0, 5), 140, 326, { fill: '#475569', size: 18, weight: 750, gap: 42 }),
+    svgTextLines(uiModel.navigation.slice(0, 5).map((entry) => truncateForSvg(entry, 16)), 140, 326, { fill: '#475569', size: 18, weight: 750, gap: 42 }),
     '<rect x="426" y="226" width="520" height="560" rx="28" fill="#ffffff" stroke="#dbe3ef"/>',
     svgTextLines(['主内容', ...entities.map((entity) => `• ${truncateForSvg(entity, 30)}`)], 464, 282, { fill: '#0f172a', size: 24, weight: 850, gap: 44 }),
     `<rect x="464" y="514" width="420" height="54" rx="18" fill="${colors.primary}" opacity="0.10" stroke="${colors.primary}"/>`,
@@ -2686,32 +2696,55 @@ export async function runEvolutionPlanningStages(options: RunEvolutionPlanningSt
       content: renderHifiSpec(instructions, uiModel, designReferenceImages),
       nowMs,
     });
+    // Prefer the Design Maker's promoted, agent-attested ui-spec.json:
+    // structured components render as prototype-grade mockups. The MD-derived
+    // skeleton is only a fallback and is labeled a draft placeholder — it is
+    // never presented as real high fidelity.
+    const promotedUiSpec = await readPromotedUiSpecDocument(projectRoot, run);
     await writeRunArtifact({
       projectRoot,
       run,
       kind: 'hifi_mockup',
       path: 'design/hifi-mockup.svg',
-      title: 'High-Fidelity Mockup SVG',
+      title: promotedUiSpec ? 'High-Fidelity Overview (from ui-spec)' : `High-Fidelity Mockup SVG（${EVOLUTION_HIFI_DRAFT_PLACEHOLDER_LABEL}）`,
       roleId: 'visual_designer',
       stage: 'design_hifi',
-      content: renderHifiMockupSvg(digest, uiModel, designReferenceImages),
+      content: promotedUiSpec ? renderUiSpecOverviewSvg(promotedUiSpec) : renderHifiMockupSvg(digest, uiModel, designReferenceImages),
       nowMs,
     });
-    const hifiTargets = hifiScreenTargets(uiModel, designReferenceImages);
-    for (const [targetIndex, target] of hifiTargets.entries()) {
-      const screenPath = `design/hifi-screens/screen-${String(targetIndex + 1).padStart(2, '0')}.svg`;
-      await writeRunArtifact({
-        projectRoot,
-        run,
-        kind: 'hifi_mockup',
-        path: screenPath,
-        title: `High-Fidelity Screen ${targetIndex + 1} · ${target.name}`,
-        roleId: 'visual_designer',
-        stage: 'design_hifi',
-        content: renderHifiScreenSvg(digest, uiModel, target, targetIndex, hifiTargets.length),
-        nowMs,
-      });
-      hifiArtifactIds.push(artifactId('hifi_mockup', screenPath));
+    if (promotedUiSpec) {
+      for (const [screenIndex, specScreen] of promotedUiSpec.screens.slice(0, 12).entries()) {
+        const screenPath = `design/hifi-screens/screen-${String(screenIndex + 1).padStart(2, '0')}.svg`;
+        await writeRunArtifact({
+          projectRoot,
+          run,
+          kind: 'hifi_mockup',
+          path: screenPath,
+          title: `High-Fidelity Screen ${screenIndex + 1} · ${specScreen.name}`,
+          roleId: 'visual_designer',
+          stage: 'design_hifi',
+          content: renderUiSpecScreenSvg(promotedUiSpec, screenIndex),
+          nowMs,
+        });
+        hifiArtifactIds.push(artifactId('hifi_mockup', screenPath));
+      }
+    } else {
+      const hifiTargets = hifiScreenTargets(uiModel, designReferenceImages);
+      for (const [targetIndex, target] of hifiTargets.entries()) {
+        const screenPath = `design/hifi-screens/screen-${String(targetIndex + 1).padStart(2, '0')}.svg`;
+        await writeRunArtifact({
+          projectRoot,
+          run,
+          kind: 'hifi_mockup',
+          path: screenPath,
+          title: `Draft Screen ${targetIndex + 1} · ${target.name}（${EVOLUTION_HIFI_DRAFT_PLACEHOLDER_LABEL}）`,
+          roleId: 'visual_designer',
+          stage: 'design_hifi',
+          content: renderHifiScreenSvg(digest, uiModel, target, targetIndex, hifiTargets.length),
+          nowMs,
+        });
+        hifiArtifactIds.push(artifactId('hifi_mockup', screenPath));
+      }
     }
     await writeRunArtifact({
       projectRoot,
@@ -3042,11 +3075,24 @@ export async function runEvolutionPlanningStages(options: RunEvolutionPlanningSt
         run.gates = [...(run.gates ?? []), gate];
         await persistEvolutionGate(projectRoot, run, gate);
       }
+      // Honesty check: without an agent-attested ui-spec, taste-skill output,
+      // or reference images, the review set is a deterministic draft skeleton
+      // — say so in the gate question instead of calling it high fidelity.
+      const hasRealDesignSource = run.artifacts.some((artifact) => (
+        (artifact.kind === 'ui_spec' && artifact.assurance === 'agent_attested')
+        // The built-in taste output is a deterministic template, not a real
+        // external design source — only externally-generated output counts.
+        || (artifact.kind === 'taste_hifi_output' && artifact.path !== BUILT_IN_TASTE_OUTPUT_RELATIVE_PATH)
+        || artifact.kind === 'design_reference_image'
+        || artifact.kind === 'ui_preview_screenshot'
+      ));
       run.blockingQuestions.push({
         id: approvalQuestionId,
         stage: 'design_hifi',
         roleId: 'visual_designer',
-        question: '高保真设计已生成。请先在 War Room 预览全部高保真图片：满意后批准进入架构；不满意请选择“重新设计”并补充修改意见。',
+        question: hasRealDesignSource
+          ? '高保真设计已生成。请先在 War Room 预览全部高保真图片：满意后批准进入架构；不满意请选择“重新设计”并补充修改意见。'
+          : `当前评审集是${EVOLUTION_HIFI_DRAFT_PLACEHOLDER_LABEL}（无设计 agent 产物 / taste-skill 输出 / 参考图）。建议选择“重新设计”并等待真实设计产出；如仅验证流程可批准继续，但该批准不代表视觉质量达标。`,
         createdAt: nowMs,
       });
       appendDiscussion(run, {
