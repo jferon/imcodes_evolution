@@ -308,6 +308,8 @@ interface AutoDeliverRoleSkillSnapshot {
   sourcePath: string;
   sha256: string;
   content: string;
+  /** Honest authority classification from resolution time (manifest check). */
+  verification?: 'manifest_verified' | 'legacy_unverified' | 'built_in' | 'quarantined_fallback';
 }
 
 const AUTO_DELIVER_MAKER_ROLE_IDS = [
@@ -430,6 +432,23 @@ function queueAutoDeliverPromptForTransportResend(
   return 'resend_queued';
 }
 
+/**
+ * Timeline projection must not carry full executable role-skill bodies —
+ * they are policy payload for the provider, not conversation text. Replace
+ * each ROLE_SKILL block with an envelope line (role + sha256 + byte count)
+ * so the timeline stays auditable without copying custom skill content into
+ * ordinary history/memory surfaces. The PROVIDER payload is untouched — this
+ * applies only to the product-projection copy.
+ */
+export function redactRoleSkillBodiesForTimeline(prompt: string): string {
+  return prompt.replace(
+    /<<< ROLE_SKILL ([^>]*?)>>>\n([\s\S]*?)<<< END_ROLE_SKILL [^>]*?>>>/g,
+    (_match, header: string, body: string) => (
+      `<<< ROLE_SKILL ${header.trim()} — content redacted for timeline (${Buffer.byteLength(body)} bytes sent to provider in full) >>>`
+    ),
+  );
+}
+
 async function sendAutoDeliverPromptToImplementationSession(
   run: AutoDeliverRun,
   prompt: string,
@@ -448,7 +467,8 @@ async function sendAutoDeliverPromptToImplementationSession(
     const result = runtime.send(prompt, commandId);
     if (result === 'sent') {
       timelineEmitter.emit(run.targetImplementationSessionName, 'user.message', {
-        text: prompt,
+        // Redacted projection: full skill bodies go to the provider only.
+        text: redactRoleSkillBodiesForTimeline(prompt),
         allowDuplicate: true,
         commandId,
       }, { source: 'daemon', confidence: 'high', eventId: `openspec-auto:${commandId}` });
@@ -1251,12 +1271,22 @@ async function ensureImplementationRoleSkillSnapshots(run: AutoDeliverRun): Prom
   try {
     const snapshots = await Promise.all(AUTO_DELIVER_MAKER_ROLE_IDS.map(async (roleId) => {
       const resolved = await resolveApprovedEvolutionRoleSkill(run.projectRoot, roleId);
+      if (resolved.verification === 'quarantined_fallback' && resolved.quarantine) {
+        // Post-approval tamper detected: the built-in fallback is used and the
+        // mismatch is recorded loudly — never silently.
+        run.evidence = mergeEvidence(run.evidence, [{
+          source: 'role_skill_quarantine',
+          summary: `Approved skill file ${resolved.quarantine.relativePath} no longer matches its approval manifest (expected ${resolved.quarantine.expectedSha256.slice(0, 12)}, found ${resolved.quarantine.actualSha256.slice(0, 12)}); using built-in ${roleId} definition instead.`,
+          stale: false,
+        }]);
+      }
       return {
         roleId,
         skillName: resolved.skillName,
         sourcePath: resolved.sourcePath,
         sha256: resolved.sha256,
         content: resolved.content,
+        verification: resolved.verification,
       } satisfies AutoDeliverRoleSkillSnapshot;
     }));
     const bytes = snapshots.reduce((total, snapshot) => total + Buffer.byteLength(snapshot.content), 0);

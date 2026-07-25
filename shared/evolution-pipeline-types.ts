@@ -27,6 +27,7 @@ import type {
   EvolutionVerdict,
 } from './evolution-pipeline-constants.js';
 import type { EvolutionRolePerformanceRecord } from './evolution-role-performance.js';
+import type { EvolutionPinnedVerification, EvolutionVerificationState } from './evolution-verification.js';
 
 export type EvolutionRequestedBy = 'user' | 'watcher' | 'api' | 'cron' | 'demo';
 
@@ -517,6 +518,12 @@ export interface EvolutionRun {
   designReviewSets?: EvolutionDesignReviewSet[];
   authorizedRevisions?: Record<string, string>;
   foundationEvidence?: EvolutionFoundationEvidence[];
+  /** Verification policy copied into the run at launch (temporal integrity). */
+  pinnedVerification?: EvolutionPinnedVerification;
+  /** sha256 (or 'absent') per governance source file, captured at launch. */
+  governanceSourceDigests?: Record<string, string>;
+  /** Daemon-observed verification results; cleared by new implementation activity. */
+  verificationState?: EvolutionVerificationState;
   processedMutationIds?: string[];
   evidence: EvolutionEvidence[];
   executionTimeline?: EvolutionExecutionTimelineItem[];
@@ -567,6 +574,8 @@ export interface EvolutionProjection {
   authorizedRevisions?: Record<string, string>;
   foundationEvidence?: EvolutionFoundationEvidence[];
   rolePerformance?: EvolutionRolePerformanceRecord[];
+  pinnedVerification?: EvolutionPinnedVerification;
+  verificationState?: EvolutionVerificationState;
   evidence: EvolutionEvidence[];
   executionTimeline: EvolutionExecutionTimelineItem[];
   liveEvents: EvolutionLiveEvent[];

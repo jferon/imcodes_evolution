@@ -109,6 +109,16 @@ import { EVOLUTION_GATE_KIND_POLICIES, authorizeEvolutionGateAction, evolutionGa
 import { computeEvolutionRolePerformance, summarizeEvolutionRolePerformance } from '../../shared/evolution-role-performance.js';
 import type { EvolutionGateActorType } from '../../shared/evolution-gate-policies.js';
 import { bootstrapGreenfieldFoundation, probeFoundationCapabilities } from './evolution-foundation.js';
+import {
+  EVOLUTION_VERIFICATION_POLICY_RELATIVE_PATH,
+  validateEvolutionVerificationPolicy,
+} from '../../shared/evolution-verification.js';
+import {
+  computeGovernanceSourceDigests,
+  computeWorkspaceDigest,
+  diffGovernanceSourceDigests,
+  runPinnedVerificationCommands,
+} from './evolution-verify-runner.js';
 import type { FoundationProbeResult } from './evolution-foundation.js';
 import { lookupAttachmentById } from './file-transfer-handler.js';
 import { recordEvolutionInboxSeenFiles } from './evolution-inbox-watcher.js';
@@ -2016,6 +2026,22 @@ export function buildEvolutionProjection(run: EvolutionRun, nowMs = Date.now()):
       artifactRevisionIds: [...entry.artifactRevisionIds],
     })) } : {}),
     ...(rolePerformance.length > 0 ? { rolePerformance } : {}),
+    ...(run.pinnedVerification ? {
+      pinnedVerification: {
+        policy: {
+          version: run.pinnedVerification.policy.version,
+          commands: run.pinnedVerification.policy.commands.map((command) => ({ ...command, args: [...command.args] })),
+        },
+        policySha256: run.pinnedVerification.policySha256,
+        pinnedAt: run.pinnedVerification.pinnedAt,
+      },
+    } : {}),
+    ...(run.verificationState ? {
+      verificationState: {
+        ...run.verificationState,
+        results: run.verificationState.results.map((result) => ({ ...result })),
+      },
+    } : {}),
     evidence: run.evidence.map((entry) => ({ ...entry })),
     executionTimeline: executionTimeline.map((entry) => ({
       ...entry,
@@ -2077,6 +2103,10 @@ export async function launchEvolutionRun(options: LaunchEvolutionRunOptions): Pr
       run.writePolicy.inventoryCapturedAt = options.nowMs ?? Date.now();
       await writeEvolutionRun(projectRoot, run);
     }
+    // Launch-pin the verification policy + governance-source digests
+    // (temporal integrity: the mutable files are never re-read for this run,
+    // so a workspace agent cannot inject commands mid-run).
+    await pinVerificationConfigurationAtLaunch(projectRoot, run, options.nowMs ?? Date.now());
     upsertRuntime(projectRoot, run);
     const projection = buildEvolutionProjection(run, options.nowMs ?? Date.now());
     requestProjectionByFingerprint.set(fingerprint, projection);
@@ -2222,6 +2252,46 @@ export async function importEvolutionReferenceBrief(
  * (governed + strict + hifi human approval + fail-closed). A policy can only
  * relax behavior by being explicitly present and valid — never by accident.
  */
+/**
+ * Copy the validated verification policy and the digests of every
+ * project-writable governance source into the run at launch. Failures are
+ * recorded honestly (invalid policy = not pinned) and never break launch.
+ */
+async function pinVerificationConfigurationAtLaunch(projectRoot: string, run: EvolutionRun, nowMs: number): Promise<void> {
+  try {
+    run.governanceSourceDigests = await computeGovernanceSourceDigests(projectRoot);
+    const raw = await readFile(safeProjectRelativePath(projectRoot, EVOLUTION_VERIFICATION_POLICY_RELATIVE_PATH), 'utf8').catch(() => null);
+    if (raw !== null) {
+      const parsed = validateEvolutionVerificationPolicy(JSON.parse(raw) as unknown);
+      if (parsed.ok) {
+        run.pinnedVerification = {
+          policy: parsed.value,
+          policySha256: sha256(raw),
+          pinnedAt: nowMs,
+        };
+        appendEvidence(run, {
+          source: 'verification_policy',
+          summary: `Pinned ${parsed.value.commands.length} verification command(s) (${parsed.value.commands.filter((command) => command.tier === 'required').length} required) from ${EVOLUTION_VERIFICATION_POLICY_RELATIVE_PATH} at launch.`,
+          createdAt: nowMs,
+        });
+      } else {
+        appendEvidence(run, {
+          source: 'verification_policy',
+          summary: `Verification policy at ${EVOLUTION_VERIFICATION_POLICY_RELATIVE_PATH} is invalid and was NOT pinned: ${parsed.issues.map((item) => item.code).join(', ')}.`,
+          createdAt: nowMs,
+        });
+      }
+    }
+    await writeEvolutionRun(projectRoot, run);
+  } catch (error) {
+    appendEvidence(run, {
+      source: 'verification_policy',
+      summary: `Verification pinning failed: ${describeUnknownError(error)}.`,
+      createdAt: nowMs,
+    });
+  }
+}
+
 export async function readEvolutionProjectPolicy(projectRoot: string): Promise<EvolutionProjectPolicy | null> {
   try {
     const raw = await readFile(safeProjectRelativePath(safeProjectRoot(projectRoot), EVOLUTION_PROJECT_POLICY_RELATIVE_PATH), 'utf8');
@@ -4432,6 +4502,123 @@ async function verifyGreenfieldFoundationOnPass(entry: RuntimeEntry, nowMs: numb
   return true;
 }
 
+/**
+ * Delivery gate (repair checklist #12): at OpenSpec `passed`, verify with the
+ * daemon's own hands. Governed runs fail closed — no pinned policy, mutated
+ * governance sources, or failing required commands all mean the run is NOT
+ * delivery-ready, regardless of what the implementation agent claimed. Draft
+ * runs record honest `unverified`/warning evidence without blocking.
+ */
+async function enforcePinnedVerificationOnPass(entry: RuntimeEntry, nowMs: number): Promise<boolean> {
+  const run = entry.run;
+  const governed = (run.executionPolicy ?? 'draft_preview') === 'governed';
+  const blockWithQuestion = (questionId: string, reason: string): false => {
+    run.stage = 'needs_human';
+    applyRoleStatesForStage(run, 'needs_human', nowMs);
+    run.latestMessage = `Delivery verification blocked: ${reason}`;
+    if (!run.blockingQuestions.some((question) => question.id === questionId)) {
+      run.blockingQuestions.push({
+        id: questionId,
+        stage: 'needs_human',
+        roleId: 'qa_engineer',
+        question: `Delivery verification blocked: ${reason}`,
+        createdAt: nowMs,
+      });
+    }
+    appendDiscussion(run, {
+      kind: 'gate',
+      stage: 'needs_human',
+      roleId: 'qa_engineer',
+      author: '测试工程师',
+      text: run.latestMessage,
+      createdAt: nowMs,
+    });
+    appendEvidence(run, { source: 'daemon_verification', summary: run.latestMessage, createdAt: nowMs });
+    return false;
+  };
+
+  // 1. Governance-source mutation check BEFORE any command executes.
+  if (run.governanceSourceDigests) {
+    const current = await computeGovernanceSourceDigests(entry.projectRoot);
+    const mutated = diffGovernanceSourceDigests(run.governanceSourceDigests, current);
+    if (mutated.length > 0) {
+      appendEvidence(run, {
+        source: 'daemon_verification',
+        summary: `Governance sources changed since launch: ${mutated.join(', ')}. Pinned configuration remains authoritative; mutated files were NOT re-read.`,
+        createdAt: nowMs,
+      });
+      if (governed) {
+        return blockWithQuestion(
+          `verification-governance-mutated-${run.runId}`,
+          `governance_path_mutated: ${mutated.join(', ')} — review the changes, then relaunch or explicitly continue.`,
+        );
+      }
+    }
+  }
+
+  // 2. Policy presence.
+  const pinned = run.pinnedVerification;
+  if (!pinned || pinned.policy.commands.length === 0) {
+    if (governed) {
+      return blockWithQuestion(
+        `verification-policy-missing-${run.runId}`,
+        `no verification policy was pinned at launch (${EVOLUTION_VERIFICATION_POLICY_RELATIVE_PATH}). Governed delivery requires daemon-observed checks; configure the policy and relaunch.`,
+      );
+    }
+    appendEvidence(run, {
+      source: 'daemon_verification',
+      summary: 'Delivery is UNVERIFIED: no verification policy configured; only agent-claimed evidence exists.',
+      createdAt: nowMs,
+    });
+    return true;
+  }
+
+  // 3. Execute the pinned commands and bind to the current workspace.
+  const outcome = await runPinnedVerificationCommands(entry.projectRoot, pinned.policy);
+  const workspaceDigest = await computeWorkspaceDigest(entry.projectRoot);
+  run.verificationState = {
+    results: outcome.results,
+    workspaceDigest,
+    allRequiredPassed: outcome.allRequiredPassed,
+    completedAt: nowMs,
+  };
+  for (const result of outcome.results) {
+    appendEvidence(run, {
+      source: 'daemon_verification',
+      summary: `[${result.status}] ${result.id}: ${result.command} (exit=${result.exitCode ?? 'n/a'}, ${result.durationMs}ms, ${result.tier})`,
+      command: result.command,
+      ...(typeof result.exitCode === 'number' ? { exitCode: result.exitCode } : {}),
+      createdAt: nowMs,
+    });
+  }
+  appendLiveEvent(run, {
+    source: 'system',
+    kind: 'command',
+    severity: outcome.allRequiredPassed ? 'success' : 'error',
+    roleId: 'qa_engineer',
+    stage: run.stage,
+    title: 'Daemon-observed verification',
+    detail: outcome.allRequiredPassed
+      ? `All required checks passed (${outcome.results.length} command(s)); workspace ${workspaceDigest.slice(0, 12)}.`
+      : `Required checks failed: ${outcome.failedRequiredIds.join(', ')}.`,
+    createdAt: nowMs,
+  });
+  if (!outcome.allRequiredPassed) {
+    if (governed) {
+      return blockWithQuestion(
+        `verification-failed-${run.runId}`,
+        `required checks failed: ${outcome.failedRequiredIds.join(', ')}. The implementation claim of completion is not supported by daemon-observed evidence.`,
+      );
+    }
+    appendEvidence(run, {
+      source: 'daemon_verification',
+      summary: `Delivery proceeds UNVERIFIED in draft mode despite failed required checks: ${outcome.failedRequiredIds.join(', ')}.`,
+      createdAt: nowMs,
+    });
+  }
+  return true;
+}
+
 export async function recordEvolutionOpenSpecProjection(options: RecordEvolutionOpenSpecProjectionOptions): Promise<EvolutionProjection[]> {
   const nowMs = options.nowMs ?? Date.now();
   const projection = options.projection;
@@ -4515,12 +4702,31 @@ export async function recordEvolutionOpenSpecProjection(options: RecordEvolution
       });
     }
 
+    // Invalidation: new implementation activity makes any earlier verification
+    // stale — results must never authorize a workspace they did not observe.
+    if (run.verificationState && (
+      projection.status === 'implementation_task_loop'
+      || projection.status === 'spec_audit_repair'
+      || projection.status === 'implementation_audit_repair'
+    )) {
+      delete run.verificationState;
+      appendEvidence(run, {
+        source: 'daemon_verification',
+        summary: 'Prior daemon-observed verification invalidated by new implementation/repair activity; checks will re-run at the next passed gate.',
+        createdAt: nowMs,
+      });
+    }
+
     let foundationOk = true;
     if (projection.status === 'passed' && run.developmentMode === 'greenfield_new_system') {
       foundationOk = await verifyGreenfieldFoundationOnPass(entry, nowMs);
     }
+    let verificationOk = true;
+    if (projection.status === 'passed') {
+      verificationOk = await enforcePinnedVerificationOnPass(entry, nowMs);
+    }
     let next = await persistAndProject(entry, nowMs);
-    if (projection.status === 'passed' && foundationOk) {
+    if (projection.status === 'passed' && foundationOk && verificationOk) {
       next = await maybeRunStagingDelivery(entry, options.serverLink, nowMs) ?? next;
     }
     updated.push(next);

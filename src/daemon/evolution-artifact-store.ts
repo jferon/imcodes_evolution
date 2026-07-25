@@ -755,10 +755,58 @@ function renderEvolutionRoleSkill(definition: EvolutionRoleSkillDefinition): str
   ].join('\n');
 }
 
+export type ApprovedRoleSkillTemplateResult =
+  | {
+    status: 'ok';
+    content: string;
+    relativePath: string;
+    sha256: string;
+    bytes: number;
+    /**
+     * `verified` — bytes match the latest approval-manifest entry for this
+     * skill. `legacy_unverified` — no manifest entry exists (pre-manifest
+     * projects); the content is used but must never be presented as approved
+     * by governance.
+     */
+    manifestVerification: 'verified' | 'legacy_unverified';
+  }
+  | {
+    /**
+     * The approved file's bytes DIFFER from what multi-approval recorded —
+     * a post-approval edit (accidental or adversarial). The content is
+     * quarantined: callers must fall back to the built-in definition and
+     * surface the mismatch instead of executing unapproved bytes.
+     */
+    status: 'quarantined';
+    relativePath: string;
+    expectedSha256: string;
+    actualSha256: string;
+  };
+
+async function readApprovedRoleSkillManifestSha(projectRoot: string, skillName: string): Promise<string | null> {
+  try {
+    const raw = await readOptionalUtf8(safeJoin(projectRoot, `${EVOLUTION_ROLE_SKILL_APPROVED_LIBRARY_DIR}/manifest.json`));
+    if (raw === null) return null;
+    const parsed = JSON.parse(raw) as { entries?: Array<{ skillName?: unknown; sha256?: unknown }> };
+    if (!Array.isArray(parsed.entries)) return null;
+    for (let index = parsed.entries.length - 1; index >= 0; index -= 1) {
+      const entry = parsed.entries[index];
+      if (entry && entry.skillName === skillName && typeof entry.sha256 === 'string' && /^[a-f0-9]{64}$/.test(entry.sha256)) {
+        return entry.sha256;
+      }
+    }
+    return null;
+  } catch {
+    // An unreadable/corrupt manifest cannot verify anything — treat as absent
+    // (legacy) rather than blocking run creation.
+    return null;
+  }
+}
+
 async function readApprovedEvolutionRoleSkillTemplate(
   projectRoot: string,
   definition: EvolutionRoleSkillDefinition,
-): Promise<{ content: string; relativePath: string; sha256: string; bytes: number } | null> {
+): Promise<ApprovedRoleSkillTemplateResult | null> {
   const relativePath = `${EVOLUTION_ROLE_SKILL_APPROVED_LIBRARY_DIR}/${definition.skillName}.md`;
   const absolutePath = safeJoin(projectRoot, relativePath);
   const raw = await readOptionalUtf8(absolutePath);
@@ -776,11 +824,27 @@ async function readApprovedEvolutionRoleSkillTemplate(
   if (parsed.metadata.category !== EVOLUTION_ROLE_SKILL_CATEGORY) {
     throw new Error(`approved_role_skill_category_mismatch:${definition.skillName}:${parsed.metadata.category}`);
   }
+  const actualSha256 = sha256(Buffer.from(content));
+  // Authority check: the mutable approved file only counts as approved when
+  // its bytes still match what the multi-approval flow recorded in the
+  // manifest. A mismatch quarantines the file — its bytes must never flow
+  // into prompts labeled "project approved".
+  const manifestSha = await readApprovedRoleSkillManifestSha(projectRoot, definition.skillName);
+  if (manifestSha !== null && manifestSha !== actualSha256) {
+    return {
+      status: 'quarantined',
+      relativePath,
+      expectedSha256: manifestSha,
+      actualSha256,
+    };
+  }
   return {
+    status: 'ok',
     content,
     relativePath,
-    sha256: sha256(Buffer.from(content)),
+    sha256: actualSha256,
     bytes,
+    manifestVerification: manifestSha === null ? 'legacy_unverified' : 'verified',
   };
 }
 
@@ -795,10 +859,34 @@ export async function resolveApprovedEvolutionRoleSkill(
   sourcePath: string;
   content: string;
   sha256: string;
+  /** Honest authority classification of the resolved bytes. */
+  verification: 'manifest_verified' | 'legacy_unverified' | 'built_in' | 'quarantined_fallback';
+  /** Present when the approved file was quarantined (post-approval tamper). */
+  quarantine?: { relativePath: string; expectedSha256: string; actualSha256: string };
 }> {
   const definition = EVOLUTION_ROLE_SKILL_DEFINITIONS.find((entry) => entry.roleId === roleId);
   if (!definition) throw new Error(`unknown_evolution_role:${roleId}`);
   const approved = await readApprovedEvolutionRoleSkillTemplate(projectRoot, definition);
+  if (approved?.status === 'quarantined') {
+    // Post-approval edit detected: NEVER execute unapproved bytes. Fall back
+    // to the built-in definition and carry the mismatch for evidence trails.
+    const content = renderEvolutionRoleSkill(definition);
+    return {
+      roleId,
+      label: definition.label,
+      skillName: definition.skillName,
+      source: 'built_in',
+      sourcePath: `builtin:evolution/${definition.skillName}`,
+      content,
+      sha256: sha256(Buffer.from(content)),
+      verification: 'quarantined_fallback',
+      quarantine: {
+        relativePath: approved.relativePath,
+        expectedSha256: approved.expectedSha256,
+        actualSha256: approved.actualSha256,
+      },
+    };
+  }
   const content = approved?.content ?? renderEvolutionRoleSkill(definition);
   return {
     roleId,
@@ -808,6 +896,7 @@ export async function resolveApprovedEvolutionRoleSkill(
     sourcePath: approved?.relativePath ?? `builtin:evolution/${definition.skillName}`,
     content,
     sha256: sha256(Buffer.from(content)),
+    verification: approved ? (approved.manifestVerification === 'verified' ? 'manifest_verified' : 'legacy_unverified') : 'built_in',
   };
 }
 
@@ -820,11 +909,14 @@ export async function ensureDefaultEvolutionRoleSkillFiles(projectRoot: string, 
       skillName: definition.skillName,
     });
     const approvedTemplate = await readApprovedEvolutionRoleSkillTemplate(projectRoot, definition);
+    // Quarantined approved files (post-approval tamper) never seed new
+    // projects — they fall back to the built-in definition.
+    const approvedContent = approvedTemplate?.status === 'ok' ? approvedTemplate.content : null;
     let seededFromApprovedLibrary = false;
     await mkdir(dirname(skillPath), { recursive: true });
     try {
-      await writeFile(skillPath, approvedTemplate?.content ?? renderEvolutionRoleSkill(definition), { encoding: 'utf8', flag: 'wx' });
-      seededFromApprovedLibrary = approvedTemplate !== null;
+      await writeFile(skillPath, approvedContent ?? renderEvolutionRoleSkill(definition), { encoding: 'utf8', flag: 'wx' });
+      seededFromApprovedLibrary = approvedContent !== null;
     } catch (error) {
       if (!(error instanceof Error) || !('code' in error) || error.code !== 'EEXIST') throw error;
     }
@@ -843,7 +935,7 @@ export async function ensureDefaultEvolutionRoleSkillFiles(projectRoot: string, 
       bytes: content.byteLength,
       createdAt: nowMs,
     });
-    if (approvedTemplate && seededFromApprovedLibrary) {
+    if (approvedTemplate?.status === 'ok' && seededFromApprovedLibrary) {
       artifacts.push({
         id: `role_skill_library:${definition.skillName}:${approvedTemplate.sha256.slice(0, 12)}`,
         kind: 'role_skill_library',
