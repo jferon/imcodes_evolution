@@ -115,12 +115,65 @@ const BUSINESS_SPEC: UiSpecDocument = {
     {
       name: '资格购买申请 · 待审核',
       viewport: { width: 1440, height: 900 },
-      components: [],
+      components: [
+        {
+          type: 'IdentityContextBar',
+          props: { value: '超级管理员', source: '新接口' },
+        },
+        {
+          type: 'FilterGrid',
+          title: '申请筛选',
+          props: {
+            fields: ['申请人/单号', '购买类型', '申请状态'],
+            columns: 3,
+          },
+        },
+        {
+          type: 'VxeGrid',
+          title: '资格购买申请',
+          props: {
+            columns: ['申请单号', '申请人', '申请身份', '购买内容', '数量', '单价', '金额', '申请时间', '状态', '操作'],
+            toolbar: ['新建购买申请'],
+          },
+          children: [
+            { type: 'ReviewActions', title: '审核动作', props: { items: ['确认发放', '拒绝'] } },
+          ],
+        },
+      ],
     },
     {
       name: '收益流水 · 结算视图',
       viewport: { width: 1440, height: 900 },
-      components: [],
+      components: [
+        {
+          type: 'StatisticGrid',
+          title: '收益概览',
+          props: {
+            items: ['所有身份收益', '当前身份收益', '已结算', '待结算'],
+            columns: 4,
+          },
+        },
+        {
+          type: 'FilterGrid',
+          title: '流水筛选',
+          props: {
+            fields: ['业务账号', '收益类型', '行政区', '结算状态'],
+            columns: 4,
+          },
+        },
+        {
+          type: 'VxeGrid',
+          title: '收益流水',
+          props: {
+            columns: ['流水号', '发生时间', '业务账号', '收益类型', '收益身份', '收益人', '行政区', '收益金额', '状态', '操作'],
+            toolbar: ['账号配置'],
+          },
+          children: [
+            { type: 'ConfirmAction', title: '确认结算' },
+            { type: 'Drawer', title: '账号配置' },
+          ],
+        },
+      ],
     },
     {
       name: '账号列表 · 390px 窄屏',
@@ -132,8 +185,10 @@ const BUSINESS_SPEC: UiSpecDocument = {
         },
         {
           type: 'ScrollableVxeGrid',
+          title: '账号列表',
           props: {
-            columns: ['账号信息', '后台身份', '前台版本', '统一有效期', '用户行政区', '状态', '操作'],
+            visibleLeadingColumns: ['账号信息', '后台身份'],
+            fixedRightAction: '更多',
           },
         },
       ],
@@ -189,6 +244,67 @@ describe('renderUiSpecScreenSvg — reviewable high-fidelity screens from struct
     expect((svg.match(/<image\b/g) ?? []).length).toBeGreaterThanOrEqual(4);
     expect(svg).not.toContain('fill="#e8edf4"');
     expect(svg).not.toContain('账号列表 · 超级管…');
+  });
+
+  it.each([
+    {
+      screenIndex: 0,
+      layout: 'desktop',
+      expected: ['账号列表', '林晓夏', '浙江省 · 杭州市', '2027-07-23'],
+      minimumImages: 4,
+    },
+    {
+      screenIndex: 1,
+      layout: 'desktop',
+      expected: ['资格购买申请', 'AP-20260724-018', '林晓夏', '官方代理名额'],
+      minimumImages: 4,
+    },
+    {
+      screenIndex: 2,
+      layout: 'desktop',
+      expected: ['收益流水', '¥286,420.50', 'RV-20260724-1092', 'taojin-ops-01', '账号开通收益'],
+      minimumImages: 4,
+    },
+    {
+      screenIndex: 3,
+      layout: 'mobile',
+      expected: ['账号列表', '林晓夏', '官方代理', '更多'],
+      minimumImages: 5,
+    },
+  ])('renders screen $screenIndex as a complete $layout business preview', ({
+    screenIndex,
+    layout,
+    expected,
+    minimumImages,
+  }) => {
+    const svg = renderUiSpecScreenSvg(BUSINESS_SPEC, screenIndex);
+    expect(svg).toContain(`data-layout="${layout}"`);
+    expect(svg).toContain('data-render-quality="reviewable-hifi"');
+    for (const value of expected) expect(svg).toContain(value);
+    expect((svg.match(/<path\b/g) ?? []).length).toBeGreaterThanOrEqual(10);
+    expect((svg.match(/<image\b/g) ?? []).length).toBeGreaterThanOrEqual(minimumImages);
+    expect(svg).not.toContain('fill="#e8edf4"');
+    expect(svg).not.toContain(EVOLUTION_HIFI_DRAFT_PLACEHOLDER_LABEL);
+  });
+
+  it('keeps every desktop sidebar label short, complete, and icon-backed', () => {
+    const svg = renderUiSpecScreenSvg(BUSINESS_SPEC, 1);
+    const sidebarLabels = [...svg.matchAll(/<text x="58"[^>]*>([^<]+)<\/text>/g)].map((match) => match[1]);
+    expect(sidebarLabels).toEqual(['账号列表', '资格购买申请', '收益流水', '移动端']);
+    expect(sidebarLabels.every((label) => !label.includes('…') && label.length <= 8)).toBe(true);
+    expect((svg.match(/data-icon="(?:users|file|wallet|grid)"/g) ?? []).length).toBe(4);
+  });
+
+  it('renders the four-screen overview with icons, images, and every target viewport', () => {
+    const overview = renderUiSpecOverviewSvg(BUSINESS_SPEC);
+    for (const title of ['账号列表 · 超级管理员', '资格购买申请 · 待审核', '收益流水 · 结算视图']) {
+      expect(overview).toContain(title);
+    }
+    expect(overview).toMatch(/<text[^>]*>账号列表<\/text>/);
+    expect(overview).toContain('1440×900');
+    expect(overview).toContain('390×844');
+    expect((overview.match(/<path\b/g) ?? []).length).toBeGreaterThanOrEqual(12);
+    expect((overview.match(/<image\b/g) ?? []).length).toBeGreaterThanOrEqual(4);
   });
 
   it('uses domain-shaped values and avatars when a person/account column is not first', () => {

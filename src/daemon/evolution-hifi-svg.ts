@@ -53,6 +53,19 @@ function clip(value: string, max: number): string {
   return normalized.length > max ? `${normalized.slice(0, Math.max(1, max - 1))}…` : normalized;
 }
 
+function clipByVisualUnits(value: string, maxUnits: number): string {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  let units = 0;
+  let output = '';
+  for (const character of normalized) {
+    const nextUnits = /[\u0000-\u00ff]/.test(character) ? 1 : 2;
+    if (units + nextUnits > maxUnits) return `${output}…`;
+    output += character;
+    units += nextUnits;
+  }
+  return output;
+}
+
 function text(
   x: number,
   y: number,
@@ -364,7 +377,7 @@ function tableBlock(component: UiSpecComponent, mobile: boolean): Block {
           if (isAvatarColumn(label)) {
             parts.push(
               avatarImage(tx, ry + 10, 34, row),
-              text(tx + 44, ry + 29, clip(value, Math.max(4, Math.floor((colW - 50) / 8))), 12, 700, T.text),
+              text(tx + 44, ry + 29, clipByVisualUnits(value, Math.max(8, Math.floor((colW - 50) / 6))), 12, 700, T.text),
               text(tx + 44, ry + 44, `taojin0${row + 1}`, 9, 500, T.faint),
             );
           } else if (/状态/.test(label)) {
@@ -372,7 +385,7 @@ function tableBlock(component: UiSpecComponent, mobile: boolean): Block {
           } else if (/操作/.test(label)) {
             parts.push(text(tx, ry + 34, clip(value, Math.max(4, Math.floor(colW / 12))), 11, 700, T.primary));
           } else {
-            parts.push(text(tx, ry + 34, clip(value, Math.max(4, Math.floor((colW - 8) / 11))), 11, /金额|收益/.test(label) ? 700 : 550, /金额|收益/.test(label) ? T.text : T.muted));
+            parts.push(text(tx, ry + 34, clipByVisualUnits(value, Math.max(8, Math.floor((colW - 8) / 6))), 11, /金额|收益/.test(label) ? 700 : 550, /金额|收益/.test(label) ? T.text : T.muted));
           }
         });
       }
