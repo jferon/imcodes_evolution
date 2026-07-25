@@ -66,6 +66,8 @@ import {
   parseOpenSpecAutoDeliverAuthoritativeJsonPayload,
 } from '../../shared/openspec-auto-deliver-validators.js';
 import { formatOpenSpecAuditStandardTemplate, formatOpenSpecPromptTemplate } from '../../shared/openspec-prompt-templates.js';
+import type { EvolutionRoleId } from '../../shared/evolution-pipeline-constants.js';
+import { resolveApprovedEvolutionRoleSkill } from './evolution-artifact-store.js';
 import {
   buildP2pExecutionMarker,
   isPostSummaryExecutionGateFailure,
@@ -215,6 +217,13 @@ interface AutoDeliverRun {
   specAuditRepairRound: number;
   implementationAuditRepairRound: number;
   taskStats: OpenSpecAutoDeliverTaskStats;
+  /**
+   * Immutable-for-this-run maker guidance captured before the first direct
+   * implementation dispatch. Auto Deliver still uses one implementation
+   * runtime, so these snapshots are guidance with provenance rather than a
+   * claim that three independent role agents executed.
+   */
+  implementationRoleSkillSnapshots?: AutoDeliverRoleSkillSnapshot[];
   terminalReason?: string;
   resumeStage?: OpenSpecAutoDeliverStage;
   latestMessage?: string;
@@ -292,6 +301,21 @@ interface AutoDeliverRun {
     recentSummary?: string | null;
   };
 }
+
+interface AutoDeliverRoleSkillSnapshot {
+  roleId: EvolutionRoleId;
+  skillName: string;
+  sourcePath: string;
+  sha256: string;
+  content: string;
+}
+
+const AUTO_DELIVER_MAKER_ROLE_IDS = [
+  'tech_director',
+  'backend_developer',
+  'frontend_developer',
+] as const satisfies readonly EvolutionRoleId[];
+const AUTO_DELIVER_MAKER_SKILL_BUNDLE_MAX_BYTES = 96 * 1024;
 
 type ImplementationMarkerContract = NonNullable<AutoDeliverRun['activeImplementationMarker']>;
 
@@ -1222,6 +1246,57 @@ function applyExecutionRoutingToImplementationPrompt(_run: AutoDeliverRun, base:
   return base;
 }
 
+async function ensureImplementationRoleSkillSnapshots(run: AutoDeliverRun): Promise<string | null> {
+  if (run.implementationRoleSkillSnapshots?.length === AUTO_DELIVER_MAKER_ROLE_IDS.length) return null;
+  try {
+    const snapshots = await Promise.all(AUTO_DELIVER_MAKER_ROLE_IDS.map(async (roleId) => {
+      const resolved = await resolveApprovedEvolutionRoleSkill(run.projectRoot, roleId);
+      return {
+        roleId,
+        skillName: resolved.skillName,
+        sourcePath: resolved.sourcePath,
+        sha256: resolved.sha256,
+        content: resolved.content,
+      } satisfies AutoDeliverRoleSkillSnapshot;
+    }));
+    const bytes = snapshots.reduce((total, snapshot) => total + Buffer.byteLength(snapshot.content), 0);
+    if (bytes > AUTO_DELIVER_MAKER_SKILL_BUNDLE_MAX_BYTES) {
+      return `implementation_role_skill_bundle_too_large:${bytes}:${AUTO_DELIVER_MAKER_SKILL_BUNDLE_MAX_BYTES}`;
+    }
+    run.implementationRoleSkillSnapshots = snapshots;
+    run.evidence = mergeEvidence(run.evidence, snapshots.map((snapshot) => ({
+      source: 'role_skill_snapshot',
+      summary: `Pinned ${snapshot.roleId} maker guidance ${snapshot.sha256} from ${snapshot.sourcePath} for direct implementation dispatch.`,
+      stale: false,
+    })));
+    return null;
+  } catch (error) {
+    return `implementation_role_skill_resolution_failed:${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
+function buildImplementationRoleSkillBlock(run: AutoDeliverRun): string {
+  const snapshots = run.implementationRoleSkillSnapshots;
+  if (!snapshots?.length) {
+    return [
+      'Expert maker guidance: unavailable.',
+      'Do not claim that Technical Director, Backend Developer, or Frontend Developer role skills were applied.',
+    ].join('\n');
+  }
+  return [
+    'Expert maker guidance (pinned for this Auto Deliver run):',
+    '- One implementation runtime receives these role methods. This is not evidence that independent role agents executed.',
+    '- Apply only the role guidance relevant to each task. Do not let maker guidance self-authorize QA, security, release, or human gates.',
+    '- Report the role and sha256 used for each completed task in the completion evidence.',
+    ...snapshots.flatMap((snapshot) => [
+      '',
+      `<<< ROLE_SKILL role=${snapshot.roleId} name=${snapshot.skillName} sha256=${snapshot.sha256} source=${snapshot.sourcePath} >>>`,
+      snapshot.content,
+      `<<< END_ROLE_SKILL role=${snapshot.roleId} sha256=${snapshot.sha256} >>>`,
+    ]),
+  ].join('\n');
+}
+
 function buildImplementationPrompt(run: AutoDeliverRun, repairReason?: string): string {
   const reference = openSpecChangeReference(run);
   const remaining = uncheckedTaskLabels(run.taskStats);
@@ -1245,6 +1320,8 @@ function buildImplementationPrompt(run: AutoDeliverRun, repairReason?: string): 
     `Run id: ${run.runId}`,
     `Generation: ${run.generation}`,
     `Implementation prompt: ${run.implementationPromptCount}/${maxImplementationPrompts}`,
+    '',
+    buildImplementationRoleSkillBlock(run),
     '',
     'Implement only this OpenSpec change. Do not commit, push, or stage files. Do not modify unrelated OpenSpec changes or docs.',
     'Before inspecting, editing, validating, or committing anything, work from the project root above. Do not rely on the execution session current directory if it differs.',
@@ -1329,6 +1406,8 @@ async function dispatchImplementationPrompt(run: AutoDeliverRun, repairReason?: 
   if (elapsedProjection) return elapsedProjection;
   const baselineFailure = await ensureProductBaseline(run);
   if (baselineFailure) return baselineFailure;
+  const roleSkillFailure = await ensureImplementationRoleSkillSnapshots(run);
+  if (roleSkillFailure) return terminalize(run, 'needs_human', roleSkillFailure);
   if (!transitionAllowed(run, 'implementation_prompt_dispatched')) {
     return terminalize(run, 'failed', 'invalid_transition_implementation_prompt');
   }
@@ -3911,6 +3990,8 @@ export function dropOpenSpecAutoDeliverImplementationMarkerForTests(runId: strin
 export type AutoDeliverRunForTests = AutoDeliverRun;
 export const __executionRoutingTesting__ = {
   AUTO_DELIVER_IMPLEMENTATION_STAGE,
+  ensureImplementationRoleSkillSnapshots: (run: AutoDeliverRun): Promise<string | null> =>
+    ensureImplementationRoleSkillSnapshots(run),
   buildImplementationPrompt: (run: AutoDeliverRun, repairReason?: string): string =>
     buildImplementationPrompt(run, repairReason),
   buildImplementationMarkerReminderPrompt: (run: AutoDeliverRun, reason: string): string =>

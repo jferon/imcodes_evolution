@@ -132,6 +132,7 @@ describe('Team final-execution prompt routing injection (5.3)', () => {
 
 const {
   AUTO_DELIVER_IMPLEMENTATION_STAGE,
+  ensureImplementationRoleSkillSnapshots,
   buildImplementationPrompt,
   buildImplementationMarkerReminderPrompt,
   buildSpecRepairPrompt,
@@ -176,6 +177,55 @@ function fakeAutoDeliverRun(
 // therefore GATED OFF on the Auto-Deliver path (it would tell the model to delegate
 // to clones that never exist). These tests lock that no-op contract.
 describe('Auto Deliver implementation prompt routing injection is deferred (no appendix)', () => {
+  it('resolves and pins all delivery maker role skills before direct dispatch', async () => {
+    const run = fakeAutoDeliverRun();
+    await expect(ensureImplementationRoleSkillSnapshots(run)).resolves.toBeNull();
+    expect(run.implementationRoleSkillSnapshots?.map((snapshot) => snapshot.roleId)).toEqual([
+      'tech_director',
+      'backend_developer',
+      'frontend_developer',
+    ]);
+    expect(run.implementationRoleSkillSnapshots?.every((snapshot) => (
+      snapshot.content.length > 0 && /^[a-f0-9]{64}$/.test(snapshot.sha256)
+    ))).toBe(true);
+  });
+
+  it('injects the exact pinned expert maker skills with provenance into the direct implementation prompt', () => {
+    const run = fakeAutoDeliverRun();
+    run.implementationRoleSkillSnapshots = [
+      {
+        roleId: 'tech_director',
+        skillName: 'tech-baseline-adr',
+        sourcePath: 'builtin:evolution/tech-baseline-adr',
+        sha256: 'a'.repeat(64),
+        content: 'TECH_DIRECTOR_EXPERT_METHOD',
+      },
+      {
+        roleId: 'backend_developer',
+        skillName: 'backend-implementation',
+        sourcePath: 'builtin:evolution/backend-implementation',
+        sha256: 'b'.repeat(64),
+        content: 'BACKEND_EXPERT_METHOD',
+      },
+      {
+        roleId: 'frontend_developer',
+        skillName: 'frontend-implementation',
+        sourcePath: 'builtin:evolution/frontend-implementation',
+        sha256: 'c'.repeat(64),
+        content: 'FRONTEND_EXPERT_METHOD',
+      },
+    ];
+
+    const prompt = buildImplementationPrompt(run);
+    expect(prompt).toContain('Expert maker guidance (pinned for this Auto Deliver run)');
+    expect(prompt).toContain('TECH_DIRECTOR_EXPERT_METHOD');
+    expect(prompt).toContain('BACKEND_EXPERT_METHOD');
+    expect(prompt).toContain('FRONTEND_EXPERT_METHOD');
+    expect(prompt).toContain(`role=backend_developer name=backend-implementation sha256=${'b'.repeat(64)}`);
+    expect(prompt).toContain('This is not evidence that independent role agents executed.');
+    expect(prompt).toContain('Do not let maker guidance self-authorize QA, security, release, or human gates.');
+  });
+
   it('implementation prompt is BYTE-IDENTICAL whether routing is absent, disabled, or enabled', () => {
     const noRouting = buildImplementationPrompt(fakeAutoDeliverRun());
     const disabled = buildImplementationPrompt(
