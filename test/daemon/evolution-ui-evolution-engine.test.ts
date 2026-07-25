@@ -25,6 +25,7 @@ import {
 } from '../../src/daemon/evolution-stage-runner.js';
 import { runEvolutionUiScreenshots } from '../../src/daemon/evolution-design-runner.js';
 import {
+  continueEvolutionRun,
   getEvolutionRun,
   launchEvolutionRun,
   recordEvolutionP2pRunProjection,
@@ -74,6 +75,15 @@ describe('UI Spec schema (shared/ui-spec.ts)', () => {
     if (!result.ok) return;
     expect(result.value.screens[0]!.components).toHaveLength(2);
     expect(result.value.design.tokensRef).toBe(DESIGN_SYSTEM_TOKENS_RELATIVE_PATH);
+
+    const descriptiveStyle = validateUiSpecDocument({
+      ...VALID_SPEC,
+      design: {
+        ...VALID_SPEC.design,
+        style: 'Dark technical operations console with evidence-first hierarchy, preserved host chrome, stronger small-text contrast, and intentionally separated prose typography.',
+      },
+    });
+    expect(descriptiveStyle.ok).toBe(true);
   });
 
   it('rejects specs without screens, with bad viewports, and non-JSON shapes', () => {
@@ -324,8 +334,50 @@ describe('Design Maker governed dispatch — end-to-end vertical slice', () => {
     const makerRoundtable = run?.value?.roundtables?.find((entry) => entry.id === EVOLUTION_DESIGN_MAKER_ROUNDTABLE_ID);
     expect(makerRoundtable?.summary).toContain('REWORK: maker outputs failed promotion');
     expect(makerRoundtable?.summary).not.toMatch(/<!--\s*EVOLUTION_VERDICT:\s*PASS\s*-->/i);
-    // (b) The happy path — schema-valid files promoting as agent_attested —
-    // is covered by the direct promotion unit tests above; re-completing a
-    // terminal attempt is intentionally forbidden (verdict immutability).
+    // (b) If the REWORK attempt did write valid files, a human Continue must
+    // reuse and promote those files instead of deleting the roundtable and
+    // dispatching a brand-new Design Maker from the beginning.
+    await mkdir(join(runDir, 'design/design-system'), { recursive: true });
+    await writeFile(join(runDir, UI_SPEC_RELATIVE_PATH), JSON.stringify(VALID_SPEC, null, 2), 'utf8');
+    await writeFile(
+      join(runDir, UI_PREVIEW_HTML_RELATIVE_PATH),
+      '<!doctype html><html><body><section id="screen-1">订单总览</section></body></html>',
+      'utf8',
+    );
+    await writeFile(
+      join(runDir, DESIGN_SYSTEM_TOKENS_RELATIVE_PATH),
+      JSON.stringify({ colors: { primary: '#3b82f6' } }),
+      'utf8',
+    );
+    const designMakerLaunchCount = captured.filter((entry) => (
+      entry.roundtableSpecId === EVOLUTION_DESIGN_MAKER_ROUNDTABLE_ID
+    )).length;
+    const continued = await continueEvolutionRun({
+      runId,
+      message: '沿用已生成的低保真与 Design Maker 文件，继续后续设计评审。',
+      nowMs: 16_000,
+    });
+    expect(continued.ok).toBe(true);
+    if (!continued.ok) return;
+    expect(continued.value.stage).toBe('design_lofi');
+    expect(continued.value.artifacts).toContainEqual(expect.objectContaining({
+      kind: 'ui_spec',
+      status: 'candidate',
+      assurance: 'agent_attested',
+    }));
+    expect(continued.value.roundtables.find((entry) => entry.id === EVOLUTION_DESIGN_MAKER_ROUNDTABLE_ID))
+      .toEqual(expect.objectContaining({ status: 'skipped' }));
+    expect(continued.value.evidence).toContainEqual(expect.objectContaining({
+      source: 'human_maker_output_reuse',
+    }));
+    expect(captured.filter((entry) => entry.roundtableSpecId === EVOLUTION_DESIGN_MAKER_ROUNDTABLE_ID))
+      .toHaveLength(designMakerLaunchCount);
+
+    const resumed = await runEvolutionAutopilot(runId, null, { nowMs: 17_000 });
+    expect(resumed.ok).toBe(true);
+    if (!resumed.ok) return;
+    expect(resumed.value.stage).toBe('design_hifi');
+    expect(captured.filter((entry) => entry.roundtableSpecId === EVOLUTION_DESIGN_MAKER_ROUNDTABLE_ID))
+      .toHaveLength(designMakerLaunchCount);
   });
 });

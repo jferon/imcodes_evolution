@@ -174,8 +174,8 @@ export function validateUiSpecDocument(value: unknown): UiSpecValidationResult<U
   if (!isRecord(value.page) || !isNonEmptyString(value.page.name) || !isNonEmptyString(value.page.type, 60)) {
     issues.push(issue('invalid_page', 'page.name and page.type are required non-empty strings.', 'page'));
   }
-  if (!isRecord(value.design) || !isNonEmptyString(value.design.style, 60)) {
-    issues.push(issue('invalid_design', 'design.style is a required non-empty string.', 'design'));
+  if (!isRecord(value.design) || !isNonEmptyString(value.design.style, 300)) {
+    issues.push(issue('invalid_design', 'design.style must be a non-empty string of at most 300 characters.', 'design'));
   }
   if (isRecord(value.design) && value.design.tokensRef !== undefined && !isNonEmptyString(value.design.tokensRef, 200)) {
     issues.push(issue('invalid_tokens_ref', 'design.tokensRef must be a run-relative path string.', 'design.tokensRef'));

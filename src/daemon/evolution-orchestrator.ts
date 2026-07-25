@@ -1269,6 +1269,59 @@ async function waiveProductReviewForHumanContinue(
   });
 }
 
+async function reuseDesignMakerOutputsForHumanContinue(
+  entry: RuntimeEntry,
+  roundtable: EvolutionRoundtableRef,
+  message: string | undefined,
+  nowMs: number,
+): Promise<boolean> {
+  const promotion = await registerDesignMakerOutputArtifacts({
+    projectRoot: entry.projectRoot,
+    run: entry.run,
+    ...(roundtable.attemptId ? { producerAttemptId: roundtable.attemptId } : {}),
+    nowMs,
+  });
+  if (!promotion.ok) return false;
+
+  const run = entry.run;
+  const previousStatus = roundtable.status;
+  const previousReason = roundtable.error ?? roundtable.summary ?? 'REWORK';
+  const attempt = roundtable.attemptId
+    ? (run.attempts ?? []).find((entry) => entry.id === roundtable.attemptId)
+    : undefined;
+  if (attempt) {
+    attempt.outputRevisionIds = [...new Set([
+      ...attempt.outputRevisionIds,
+      ...promotion.revisionIds,
+    ])];
+  }
+  upsertRoundtable(run, {
+    ...roundtable,
+    status: 'skipped',
+    error: `human_accepted_existing_outputs_after_${previousStatus}: ${previousReason.slice(0, 1_000)}`,
+    updatedAt: nowMs,
+  });
+  const justification = message?.trim()
+    || 'Human chose to reuse the existing Design Maker files and continue without regenerating low-fidelity design.';
+  appendDiscussion(run, {
+    kind: 'gate',
+    stage: 'design_lofi',
+    roleId: 'loop_supervisor',
+    author: 'Loop Supervisor / 总控',
+    text: `已校验并复用现有 Design Maker 文件（${promotion.revisionIds.length} 个 revision），保留原 ${previousStatus}/REWORK 审计，不重新执行产品、低保真或 Design Maker。说明：${justification}`,
+    artifactIds: run.artifacts
+      .filter((artifact) => promotion.revisionIds.includes(artifact.revisionId ?? ''))
+      .map((artifact) => artifact.id),
+    createdAt: nowMs,
+  });
+  appendEvidence(run, {
+    source: 'human_maker_output_reuse',
+    summary: `Human continued from existing Design Maker outputs after ${previousStatus}; promoted ${promotion.revisionIds.length} revision(s) and skipped a duplicate Design Maker dispatch. Previous result preserved: ${previousReason.slice(0, 500)}`,
+    createdAt: nowMs,
+  });
+  return true;
+}
+
 async function releaseRoundtableGateForHumanContinue(
   entry: RuntimeEntry,
   targetStage: EvolutionStage,
@@ -1293,9 +1346,14 @@ async function releaseRoundtableGateForHumanContinue(
     // design instead of silently regenerating the same product artifacts.
     const waiveProductReview = (run.executionPolicy ?? 'draft_preview') === 'governed'
       && roundtable.id === 'product-review';
+    const reuseDesignMaker = (run.executionPolicy ?? 'draft_preview') === 'governed'
+      && roundtable.id === EVOLUTION_DESIGN_MAKER_ROUNDTABLE_ID
+      && await reuseDesignMakerOutputsForHumanContinue(entry, roundtable, message, nowMs);
     if (waiveProductReview) {
       resumeStage = 'prd_ready';
       await waiveProductReviewForHumanContinue(entry, roundtable, message, nowMs);
+    } else if (reuseDesignMaker) {
+      resumeStage = 'design_lofi';
     } else {
       run.roundtables = (run.roundtables ?? []).filter((entry) => entry.id !== roundtable.id);
       appendDiscussion(run, {
@@ -2029,6 +2087,11 @@ export async function launchEvolutionDemoRun(options: LaunchEvolutionDemoRunOpti
   const sourcePath = safeProjectRelativePath(projectRoot, sourceRelativePath);
   await mkdir(dirname(sourcePath), { recursive: true });
   await writeFile(sourcePath, content, 'utf8');
+  // This file is created by an explicit War Room launch inside the passive
+  // watcher's inbox. Seed the exact path/size/mtime identity before returning
+  // so the next watcher poll cannot launch the same requirement again as a
+  // fresh watcher run and make the UI appear to restart from product intake.
+  await recordEvolutionInboxSeenFiles(projectRoot, [sourceRelativePath]);
   return launchEvolutionRun({
     projectRoot,
     nowMs,

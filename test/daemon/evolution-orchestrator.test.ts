@@ -365,6 +365,10 @@ describe('evolution orchestrator', () => {
     expect(sourcePath).toBeTruthy();
     if (!sourcePath || !projection) return;
     await expect(readFile(join(root, sourcePath), 'utf8')).resolves.toContain('IM.codes Evolution Factory Demo');
+    const inboxLedger = JSON.parse(
+      await readFile(join(root, '.imc/evolution/inbox-ledger.json'), 'utf8'),
+    ) as { seen?: string[] };
+    expect(inboxLedger.seen?.some((identity) => identity.startsWith(`${sourcePath}:`))).toBe(true);
     expect(validateEvolutionProjection(projection).ok).toBe(true);
   });
 
