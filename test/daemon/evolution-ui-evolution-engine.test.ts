@@ -23,7 +23,10 @@ import {
   PRODUCT_MAKER_PRD_RELATIVE_PATH,
   registerDesignMakerOutputArtifacts,
 } from '../../src/daemon/evolution-stage-runner.js';
-import { runEvolutionUiScreenshots } from '../../src/daemon/evolution-design-runner.js';
+import {
+  runEvolutionTasteHifiGeneration,
+  runEvolutionUiScreenshots,
+} from '../../src/daemon/evolution-design-runner.js';
 import {
   continueEvolutionRun,
   getEvolutionRun,
@@ -225,6 +228,29 @@ describe('Preview screenshot runner (opt-in, honest degradation)', () => {
   });
 });
 
+describe('Taste-skill design runner config isolation', () => {
+  it('treats a screenshot-only design.json as taste-skill not configured instead of failed', async () => {
+    const root = await makeRoot();
+    await mkdir(join(root, '.imc/evolution'), { recursive: true });
+    await writeFile(join(root, '.imc/evolution/design.json'), JSON.stringify({
+      screenshot: {
+        enabled: true,
+        command: process.execPath,
+        args: ['-e', 'process.exit(0)'],
+      },
+    }), 'utf8');
+
+    const result = await runEvolutionTasteHifiGeneration({
+      projectRoot: root,
+      runId: 'evo-screenshot-only',
+      nowMs: 1_000,
+    });
+
+    expect(result.status).toBe('not_configured');
+    expect(result.summary).toContain('no tasteSkill config');
+  });
+});
+
 describe('Design Maker governed dispatch — end-to-end vertical slice', () => {
   interface CapturedLaunch { roundtableSpecId: string; prompt: string; p2pRunId: string }
 
@@ -321,6 +347,11 @@ describe('Design Maker governed dispatch — end-to-end vertical slice', () => {
     // The maker prompt names the exact output contract.
     expect(makerLaunch.prompt).toContain(UI_SPEC_RELATIVE_PATH);
     expect(makerLaunch.prompt).toContain(UI_PREVIEW_HTML_RELATIVE_PATH);
+    expect(makerLaunch.prompt).toContain('至少 3 行真实业务语义的 mock 数据');
+    expect(makerLaunch.prompt).toContain('内联 SVG 图标');
+    expect(makerLaunch.prompt).toContain('图片或头像');
+    expect(makerLaunch.prompt).toContain('390px');
+    expect(makerLaunch.prompt).toContain('不得出现文字重叠');
 
     // (a) PASS claim with NO files written → downgraded to REWORK (machine
     // marker rewritten too), nothing promoted, run hard-blocks for rework.

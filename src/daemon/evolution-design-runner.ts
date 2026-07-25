@@ -343,6 +343,20 @@ export async function runEvolutionTasteHifiGeneration(options: {
       durationMs: 0,
     };
   }
+  // design.json may intentionally configure only the independent screenshot
+  // capability. Absence of a tasteSkill block means "not configured", not a
+  // malformed taste runner and must not poison an otherwise valid UI render.
+  if (isRecord(config.raw) && config.raw.tasteSkill === undefined) {
+    return {
+      status: 'not_configured',
+      required: false,
+      configPath,
+      summary: 'design.json has no tasteSkill config; built-in design output remains available.',
+      startedAt,
+      completedAt: startedAt,
+      durationMs: 0,
+    };
+  }
 
   let parsed: TasteSkillGenerationConfig;
   try {

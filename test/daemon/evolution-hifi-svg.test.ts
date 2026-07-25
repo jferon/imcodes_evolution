@@ -74,7 +74,74 @@ const SPEC: UiSpecDocument = {
   ],
 };
 
-describe('renderUiSpecScreenSvg — prototype-grade mockups from structured design data', () => {
+const BUSINESS_SPEC: UiSpecDocument = {
+  version: 1,
+  page: { name: '淘金术账号管理', type: 'vben-admin-module' },
+  design: { style: 'Existing Vben light theme with dense operational data.' },
+  layout: { sidebar: { width: 232 } },
+  screens: [
+    {
+      name: '账号列表 · 超级管理员',
+      viewport: { width: 1440, height: 900 },
+      components: [
+        {
+          type: 'IdentityContextBar',
+          props: {
+            value: '超级管理员',
+            source: '新接口',
+            hint: '切换后同步重置筛选、选中行和权限动作',
+          },
+        },
+        {
+          type: 'FilterGrid',
+          props: {
+            fields: ['账号关键词', '后台身份', '前台版本', '行政区'],
+            columns: 4,
+          },
+        },
+        {
+          type: 'VxeGrid',
+          props: {
+            columns: ['账号信息', '后台身份', '前台版本', '统一有效期', '用户行政区', '状态', '操作'],
+            toolbar: ['开通账号/身份'],
+          },
+          children: [
+            { type: 'RowAction', title: '查看详情' },
+            { type: 'OverflowMenu', title: '更多' },
+          ],
+        },
+      ],
+    },
+    {
+      name: '资格购买申请 · 待审核',
+      viewport: { width: 1440, height: 900 },
+      components: [],
+    },
+    {
+      name: '收益流水 · 结算视图',
+      viewport: { width: 1440, height: 900 },
+      components: [],
+    },
+    {
+      name: '账号列表 · 390px 窄屏',
+      viewport: { width: 390, height: 844 },
+      components: [
+        {
+          type: 'CompactHeader',
+          props: { identity: '官方代理', filtersCollapsed: true },
+        },
+        {
+          type: 'ScrollableVxeGrid',
+          props: {
+            columns: ['账号信息', '后台身份', '前台版本', '统一有效期', '用户行政区', '状态', '操作'],
+          },
+        },
+      ],
+    },
+  ],
+};
+
+describe('renderUiSpecScreenSvg — reviewable high-fidelity screens from structured design data', () => {
   it('renders real components with a proper hierarchy, never raw MD bullets', () => {
     const svg = renderUiSpecScreenSvg(SPEC, 0);
     // Real component content from the spec, not MD text slices.
@@ -106,6 +173,60 @@ describe('renderUiSpecScreenSvg — prototype-grade mockups from structured desi
     expect(overview).toContain('1440×900');
     expect(overview).toContain('订单总览');
     expect(overview).toContain('筛选与导出');
+  });
+
+  it('renders semantic props as real mock content with inline SVG icons and images', () => {
+    const svg = renderUiSpecScreenSvg(BUSINESS_SPEC, 0);
+    expect(svg).toContain('账号关键词');
+    expect(svg).toContain('后台身份');
+    expect(svg).toContain('开通账号/身份');
+    expect(svg).toContain('林晓夏');
+    expect(svg).toContain('浙江省 · 杭州市');
+    expect(svg).toContain('2027-07-23');
+    expect(svg).toContain('前台版本');
+    expect(svg).not.toMatch(/y="\d+"[^>]*>查看详情<\/text>/);
+    expect((svg.match(/<path\b/g) ?? []).length).toBeGreaterThanOrEqual(6);
+    expect((svg.match(/<image\b/g) ?? []).length).toBeGreaterThanOrEqual(4);
+    expect(svg).not.toContain('fill="#e8edf4"');
+    expect(svg).not.toContain('账号列表 · 超级管…');
+  });
+
+  it('uses domain-shaped values and avatars when a person/account column is not first', () => {
+    const spec: UiSpecDocument = {
+      ...BUSINESS_SPEC,
+      screens: [{
+        name: '收益明细',
+        viewport: { width: 1440, height: 900 },
+        components: [{
+          type: 'VxeGrid',
+          title: '收益流水',
+          props: {
+            columns: ['流水号', '发生时间', '业务账号', '收益类型', '收益身份', '操作'],
+            mockRows: [
+              { 流水号: 'RV-CUSTOM-001', 发生时间: '07-25 10:00', 业务账号: 'taojin-custom-01', 收益类型: '首单收益', 收益身份: '超级管理员', 操作: '查看' },
+              { 流水号: 'RV-CUSTOM-002', 发生时间: '07-25 09:20', 业务账号: 'taojin-custom-02', 收益类型: '续费收益', 收益身份: '官方代理', 操作: '查看' },
+              { 流水号: 'RV-CUSTOM-003', 发生时间: '07-24 20:18', 业务账号: 'taojin-custom-03', 收益类型: '采购收益', 收益身份: '区域代理', 操作: '查看' },
+            ],
+          },
+        }],
+      }],
+    };
+    const svg = renderUiSpecScreenSvg(spec, 0);
+    expect(svg).toContain('taojin-custom-01');
+    expect(svg).toContain('首单收益');
+    expect(svg).toContain('超级管理员');
+    expect((svg.match(/<image\b/g) ?? []).length).toBeGreaterThanOrEqual(4);
+  });
+
+  it('uses a collision-free mobile composition instead of squeezing the desktop sidebar', () => {
+    const svg = renderUiSpecScreenSvg(BUSINESS_SPEC, 3);
+    expect(svg).toContain('data-layout="mobile"');
+    expect(svg).toContain('账号列表');
+    expect(svg).toContain('林晓夏');
+    expect(svg).toContain('更多');
+    expect(svg).not.toContain('x1="232"');
+    expect(svg).not.toContain('font-size="20" font-weight="800"');
+    expect(svg).not.toContain('账号列表 · 390…');
   });
 });
 
