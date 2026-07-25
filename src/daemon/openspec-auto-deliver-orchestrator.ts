@@ -1371,6 +1371,7 @@ function buildImplementationPrompt(run: AutoDeliverRun, repairReason?: string): 
     'Before inspecting, editing, validating, or committing anything, work from the project root above. Do not rely on the execution session current directory if it differs.',
     'All relative file paths in this prompt are relative to that project root.',
     'Work through the remaining tasks below. Mark tasks.md checkboxes only after the work is genuinely complete.',
+    'PRESERVE every `<!-- task:... -->` annotation in tasks.md exactly when editing — they are governed task identity. Never delete, reorder into other lines, or invent annotations; leave them at the end of their checkbox line.',
     'Run reasonable local validation for the touched code when available. Treat the validation candidates below as project-specific hints only; choose the actual validation plan from the changed files and project tooling. Report exact commands and outcomes, or explain why validation could not run.',
     '',
     'Remaining tasks:',

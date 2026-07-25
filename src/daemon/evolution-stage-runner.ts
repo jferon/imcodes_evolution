@@ -47,6 +47,13 @@ import {
   renderUiSpecOverviewSvg,
   renderUiSpecScreenSvg,
 } from './evolution-hifi-svg.js';
+import {
+  EVOLUTION_TASK_ASSIGNMENT_MANIFEST_RELATIVE_PATH,
+  EVOLUTION_TASK_ASSIGNMENT_MANIFEST_VERSION,
+  formatEvolutionTaskAnnotation,
+  type EvolutionTaskAssignment,
+  type EvolutionTaskAssignmentManifest,
+} from '../../shared/evolution-task-manifest.js';
 import { appendDiscussion, appendEvidence, appendLiveEvent, upsertArtifact, upsertScore } from './evolution-run-helpers.js';
 import {
   persistEvolutionGate,
@@ -2194,6 +2201,76 @@ function renderOpenSpecDesign(
   ].join('\n');
 }
 
+/** Keyword heuristic — honestly labeled as such in the manifest, never presented as an agent decision. */
+function classifyTaskMakerRole(label: string): EvolutionRoleId {
+  const lower = label.toLowerCase();
+  if (/ui screen|screen "|responsive|design system|user-facing|前端|界面/.test(lower)) return 'frontend_developer';
+  if (/automated tests|validation and record|test plan|用例|测试/.test(lower)) return 'qa_engineer';
+  if (/staging|rollback|deployment|release notes|ci validation|发布/.test(lower)) return 'ops_release_manager';
+  return 'backend_developer';
+}
+
+/**
+ * Opaque task identity (checklist #16): annotate every generated checkbox
+ * with `<!-- task:<id> -->` and produce the canonical assignment manifest.
+ * IDs are generated once here and persisted in BOTH places; labels remain
+ * display/reconciliation evidence only.
+ */
+export function annotateOpenSpecTasksMarkdown(
+  markdown: string,
+  runId: string,
+  changeSlug: string,
+  nowMs: number,
+): { markdown: string; manifest: EvolutionTaskAssignmentManifest } {
+  const assignments: EvolutionTaskAssignment[] = [];
+  let ordinal = 0;
+  let inFence = false;
+  let fenceMarker: string | null = null;
+  const annotated = markdown.split('\n').map((line) => {
+    // Mirror the parser's fence handling: fenced pseudo-checkboxes are
+    // neither annotated nor assigned.
+    const fenceMatch = line.match(/^\s*(```+|~~~+)/);
+    if (fenceMatch) {
+      const marker = fenceMatch[1]?.[0] ?? '';
+      if (!inFence) {
+        inFence = true;
+        fenceMarker = marker;
+      } else if (marker === fenceMarker) {
+        inFence = false;
+        fenceMarker = null;
+      }
+      return line;
+    }
+    if (inFence) return line;
+    const match = line.match(/^(\s*-\s+\[[ xX]\]\s+)(.*)$/);
+    if (!match) return line;
+    const label = match[2]!.trim();
+    const taskId = `t-${sha256(`${runId}:${changeSlug}:${ordinal}:${label}`).slice(0, 16)}`;
+    const makerRoleId = classifyTaskMakerRole(label);
+    assignments.push({
+      taskId,
+      label,
+      ordinal,
+      makerRoleId,
+      checkerRoleId: makerRoleId === 'qa_engineer' ? 'tech_director' : 'qa_engineer',
+      assignmentSource: 'heuristic_label_classification',
+    });
+    ordinal += 1;
+    return `${match[1]}${label} ${formatEvolutionTaskAnnotation(taskId)}`;
+  }).join('\n');
+  return {
+    markdown: annotated,
+    manifest: {
+      version: EVOLUTION_TASK_ASSIGNMENT_MANIFEST_VERSION,
+      runId,
+      changeSlug,
+      revision: 1,
+      assignments,
+      createdAt: nowMs,
+    },
+  };
+}
+
 function renderOpenSpecTasks(
   digest: RequirementDigest,
   uiModel: ProductUiModel,
@@ -3481,6 +3558,21 @@ export async function runEvolutionPlanningStages(options: RunEvolutionPlanningSt
       ),
       nowMs,
     });
+    // Opaque task identity (#16): annotate checkboxes + write the canonical
+    // assignment manifest in the same generation pass.
+    const annotatedTasks = annotateOpenSpecTasksMarkdown(
+      renderOpenSpecTasks(
+        digest,
+        uiModel,
+        instructions,
+        run.developmentMode ?? 'brownfield_refactor',
+        run.developmentTargetRelativeDir,
+        run.greenfieldTopology,
+      ),
+      run.runId,
+      changeSlug,
+      nowMs,
+    );
     await writeProjectArtifact({
       projectRoot,
       run,
@@ -3489,14 +3581,18 @@ export async function runEvolutionPlanningStages(options: RunEvolutionPlanningSt
       title: 'OpenSpec Tasks',
       roleId: 'tech_director',
       stage: 'tasks_ready',
-      content: renderOpenSpecTasks(
-        digest,
-        uiModel,
-        instructions,
-        run.developmentMode ?? 'brownfield_refactor',
-        run.developmentTargetRelativeDir,
-        run.greenfieldTopology,
-      ),
+      content: annotatedTasks.markdown,
+      nowMs,
+    });
+    await writeRunArtifact({
+      projectRoot,
+      run,
+      kind: 'task_assignment_manifest',
+      path: EVOLUTION_TASK_ASSIGNMENT_MANIFEST_RELATIVE_PATH,
+      title: 'Task Assignment Manifest (heuristic v1)',
+      roleId: 'tech_director',
+      stage: 'tasks_ready',
+      content: `${JSON.stringify(annotatedTasks.manifest, null, 2)}\n`,
       nowMs,
     });
     await writeProjectArtifact({

@@ -17,6 +17,7 @@ import {
   type OpenSpecAutoDeliverScoreModuleId,
   materializeOpenSpecAutoDeliverPreset,
 } from './openspec-auto-deliver-constants.js';
+import { splitEvolutionTaskLabel } from './evolution-task-manifest.js';
 import type {
   OpenSpecAutoDeliverLaunchRequest,
   OpenSpecAutoDeliverTaskStats,
@@ -99,10 +100,12 @@ export function parseOpenSpecTasksMarkdown(markdown: string): OpenSpecAutoDelive
     const taskMatch = line.match(/^\s*-\s+\[([ xX])\]\s+(.*)$/);
     if (!taskMatch) return;
     const checked = taskMatch[1] === 'x' || taskMatch[1] === 'X';
+    const { label, taskId } = splitEvolutionTaskLabel((taskMatch[2] ?? '').trim());
     items.push({
       line: index + 1,
       checked,
-      label: (taskMatch[2] ?? '').trim(),
+      label,
+      ...(taskId ? { taskId } : {}),
     });
   });
   const checked = items.filter((item) => item.checked).length;

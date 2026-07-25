@@ -107,6 +107,12 @@ import {
 import { appendDiscussion, appendEvidence, appendLiveEvent, shortSha256, upsertArtifact, upsertScore } from './evolution-run-helpers.js';
 import { EVOLUTION_GATE_KIND_POLICIES, authorizeEvolutionGateAction, evolutionGateApprovalAssurance } from '../../shared/evolution-gate-policies.js';
 import { computeEvolutionRolePerformance, summarizeEvolutionRolePerformance } from '../../shared/evolution-role-performance.js';
+import {
+  EVOLUTION_TASK_ASSIGNMENT_MANIFEST_RELATIVE_PATH,
+  diffTaskAnnotationsAgainstManifest,
+  validateEvolutionTaskAssignmentManifest,
+} from '../../shared/evolution-task-manifest.js';
+import { parseOpenSpecTasksMarkdown } from '../../shared/openspec-auto-deliver-validators.js';
 import type { EvolutionGateActorType } from '../../shared/evolution-gate-policies.js';
 import { bootstrapGreenfieldFoundation, probeFoundationCapabilities } from './evolution-foundation.js';
 import {
@@ -4479,6 +4485,66 @@ async function verifyGreenfieldFoundationOnPass(entry: RuntimeEntry, nowMs: numb
 }
 
 /**
+ * Task-manifest desync detection (checklist #16 — detection only, never
+ * silent relinking): compare the annotations surviving in tasks.md against
+ * the canonical assignment manifest and record honest evidence for lost or
+ * unknown annotations. Legacy runs without a manifest are skipped silently
+ * (explicitly unattributed mode).
+ */
+async function detectTaskManifestDesyncOnPass(entry: RuntimeEntry, nowMs: number): Promise<void> {
+  const run = entry.run;
+  if (!run.linkedOpenSpecChange) return;
+  try {
+    const paths = getEvolutionRunPaths(entry.projectRoot, run.runId);
+    const manifestRaw = await readFile(join(paths.runDir, EVOLUTION_TASK_ASSIGNMENT_MANIFEST_RELATIVE_PATH), 'utf8').catch(() => null);
+    if (manifestRaw === null) return; // legacy run — no manifest, no attribution claims
+    const manifest = validateEvolutionTaskAssignmentManifest(JSON.parse(manifestRaw) as unknown);
+    if (!manifest.ok) {
+      appendEvidence(run, {
+        source: 'task_manifest',
+        summary: `Task assignment manifest is invalid (${manifest.issues.map((item) => item.code).join(', ')}); task attribution unavailable for this run.`,
+        createdAt: nowMs,
+      });
+      return;
+    }
+    const tasksRaw = await readFile(safeProjectRelativePath(entry.projectRoot, `openspec/changes/${run.linkedOpenSpecChange}/tasks.md`), 'utf8').catch(() => null);
+    if (tasksRaw === null) return;
+    const stats = parseOpenSpecTasksMarkdown(tasksRaw);
+    const diff = diffTaskAnnotationsAgainstManifest(stats.items, manifest.value);
+    if (diff.annotationLostTaskIds.length === 0 && diff.unknownAnnotationTaskIds.length === 0) {
+      appendEvidence(run, {
+        source: 'task_manifest',
+        summary: `Task annotations intact: ${diff.annotatedItemCount}/${manifest.value.assignments.length} manifest tasks present${diff.unannotatedItemCount > 0 ? `; ${diff.unannotatedItemCount} unannotated (unattributed) item(s)` : ''}.`,
+        createdAt: nowMs,
+      });
+      return;
+    }
+    appendEvidence(run, {
+      source: 'task_manifest',
+      summary: [
+        'Task manifest desynchronized:',
+        diff.annotationLostTaskIds.length > 0 ? `annotation_lost=[${diff.annotationLostTaskIds.join(', ')}]` : null,
+        diff.unknownAnnotationTaskIds.length > 0 ? `unknown_annotation=[${diff.unknownAnnotationTaskIds.join(', ')}]` : null,
+        'Affected completions are UNATTRIBUTED — labels are not identity; no silent relinking was performed.',
+      ].filter(Boolean).join(' '),
+      createdAt: nowMs,
+    });
+    appendLiveEvent(run, {
+      source: 'system',
+      kind: 'status',
+      severity: 'warning',
+      roleId: 'loop_supervisor',
+      stage: run.stage,
+      title: 'Task annotations lost or unknown',
+      detail: `lost=${diff.annotationLostTaskIds.length}; unknown=${diff.unknownAnnotationTaskIds.length}. Role attribution for affected tasks is unavailable.`,
+      createdAt: nowMs,
+    });
+  } catch {
+    /* detection is advisory; never break the passed pipeline */
+  }
+}
+
+/**
  * Delivery gate (repair checklist #12): at OpenSpec `passed`, verify with the
  * daemon's own hands. Governed runs fail closed — no pinned policy, mutated
  * governance sources, or failing required commands all mean the run is NOT
@@ -4693,6 +4759,9 @@ export async function recordEvolutionOpenSpecProjection(options: RecordEvolution
       });
     }
 
+    if (projection.status === 'passed') {
+      await detectTaskManifestDesyncOnPass(entry, nowMs);
+    }
     let foundationOk = true;
     if (projection.status === 'passed' && run.developmentMode === 'greenfield_new_system') {
       foundationOk = await verifyGreenfieldFoundationOnPass(entry, nowMs);

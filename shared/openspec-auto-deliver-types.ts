@@ -45,7 +45,10 @@ export interface OpenSpecAutoDeliverStatusRequest {
 export interface OpenSpecAutoDeliverTaskItem {
   line: number;
   checked: boolean;
+  /** Display label with any `<!-- task:... -->` annotation stripped. */
   label: string;
+  /** Opaque task identity from the checkbox annotation, when present. */
+  taskId?: string;
 }
 
 export interface OpenSpecAutoDeliverTaskStats {

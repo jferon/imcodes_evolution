@@ -257,6 +257,7 @@ export const EVOLUTION_ARTIFACT_KINDS = [
   'openspec_proposal',
   'openspec_design',
   'openspec_tasks',
+  'task_assignment_manifest',
   'openspec_spec',
   'implementation_task_matrix',
   'test_plan',
