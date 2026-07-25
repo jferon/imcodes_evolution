@@ -37,6 +37,9 @@ export interface DispatchJournalRecord {
   promptBytes?: number;
   skillHashes?: Array<{ roleId: string; sha256: string }>;
   providerSessionId?: string | null;
+  /** Role-homogeneous batch attribution (#17), when a manifest drove dispatch. */
+  batchMakerRoleId?: string;
+  batchTaskIds?: string[];
   bootId?: string;
 }
 

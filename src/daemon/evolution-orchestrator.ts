@@ -309,6 +309,10 @@ export interface EvolutionAutoDeliverLaunchRequest {
   presetId: EvolutionAutoDeliverPresetId;
   locale?: string;
   autoCommitPush: boolean;
+  /** Daemon-only launch envelope (checklist #17): never client-supplied. */
+  evolutionRunId?: string;
+  /** Immutable reference to the task-assignment manifest bytes at launch. */
+  taskAssignmentManifest?: { absolutePath: string; sha256: string };
 }
 
 export interface EvolutionAutoDeliverLaunchResult {
@@ -6625,6 +6629,17 @@ async function maybeStartAutoDelivery(
   const before = await persistAndProject(entry, nowMs);
   send(serverLink, { type: EVOLUTION_PIPELINE_MSG.PROJECTION, projection: before });
 
+  // Launch envelope (#17): bind the task-assignment manifest bytes by hash so
+  // Auto Deliver executes against exactly what Evolution generated. Absent
+  // manifest → legacy aggregate mode (explicitly unattributed).
+  let manifestEnvelope: { absolutePath: string; sha256: string } | undefined;
+  try {
+    const manifestPath = join(getEvolutionRunPaths(entry.projectRoot, run.runId).runDir, EVOLUTION_TASK_ASSIGNMENT_MANIFEST_RELATIVE_PATH);
+    const manifestBytes = await readFile(manifestPath);
+    manifestEnvelope = { absolutePath: manifestPath, sha256: sha256(manifestBytes) };
+  } catch {
+    /* no manifest — legacy aggregate dispatch */
+  }
   // A crashing launcher degrades to the explicit blocked path — never an
   // unhandled rejection inside projection/autopilot processing.
   const result = await autoDeliverLauncher({
@@ -6634,6 +6649,8 @@ async function maybeStartAutoDelivery(
     changeName: run.linkedOpenSpecChange,
     presetId: run.autoDelivery.presetId,
     autoCommitPush: run.autoDelivery.autoCommitPush,
+    evolutionRunId: run.runId,
+    ...(manifestEnvelope ? { taskAssignmentManifest: manifestEnvelope } : {}),
   }, serverLink).catch((error: unknown): EvolutionAutoDeliverLaunchResult => ({
     ok: false,
     error: `openspec_auto_deliver_launcher_crashed: ${describeUnknownError(error)}`,

@@ -70,6 +70,10 @@ import type { EvolutionRoleId } from '../../shared/evolution-pipeline-constants.
 import { resolveEffectiveRoleSkill } from './evolution-skill-resolution.js';
 import { appendDispatchJournalRecord } from './auto-deliver-dispatch-journal.js';
 import {
+  validateEvolutionTaskAssignmentManifest,
+  type EvolutionTaskAssignmentManifest,
+} from '../../shared/evolution-task-manifest.js';
+import {
   buildP2pExecutionMarker,
   isPostSummaryExecutionGateFailure,
   stringifyP2pExecutionMarker,
@@ -225,6 +229,16 @@ interface AutoDeliverRun {
    * claim that three independent role agents executed.
    */
   implementationRoleSkillSnapshots?: AutoDeliverRoleSkillSnapshot[];
+  /**
+   * Daemon-internal launch envelope (#17): immutable reference to the
+   * Evolution task-assignment manifest. NEVER populated from wire payloads —
+   * only the Evolution launcher binding may set it.
+   */
+  taskAssignmentManifestRef?: { absolutePath: string; sha256: string; evolutionRunId?: string };
+  /** Loaded + hash-verified manifest (lazily; null after a failed verify). */
+  taskAssignmentManifest?: EvolutionTaskAssignmentManifest;
+  /** Current role-homogeneous batch driving the implementation prompt. */
+  activeImplementationBatch?: { makerRoleId: EvolutionRoleId; taskIds: string[]; labels: string[] };
   terminalReason?: string;
   resumeStage?: OpenSpecAutoDeliverStage;
   latestMessage?: string;
@@ -1279,6 +1293,59 @@ function applyExecutionRoutingToImplementationPrompt(_run: AutoDeliverRun, base:
   return base;
 }
 
+/**
+ * Pure batch selection (#17, execution Option B): group the remaining
+ * annotated tasks by their manifest maker role and pick the batch whose
+ * earliest ordinal comes first. Unannotated/unknown remaining tasks form a
+ * final `null` (unattributed) batch handled in legacy aggregate mode.
+ */
+export function selectImplementationBatch(
+  manifest: EvolutionTaskAssignmentManifest,
+  items: Array<{ checked: boolean; label: string; taskId?: string }>,
+): { makerRoleId: EvolutionRoleId; taskIds: string[]; labels: string[] } | null {
+  const assignmentByTaskId = new Map(manifest.assignments.map((assignment) => [assignment.taskId, assignment]));
+  const groups = new Map<EvolutionRoleId, { minOrdinal: number; taskIds: string[]; labels: string[] }>();
+  for (const item of items) {
+    if (item.checked || !item.taskId) continue;
+    const assignment = assignmentByTaskId.get(item.taskId);
+    if (!assignment) continue;
+    const group = groups.get(assignment.makerRoleId) ?? { minOrdinal: assignment.ordinal, taskIds: [], labels: [] };
+    group.minOrdinal = Math.min(group.minOrdinal, assignment.ordinal);
+    group.taskIds.push(item.taskId);
+    group.labels.push(item.label);
+    groups.set(assignment.makerRoleId, group);
+  }
+  let best: { makerRoleId: EvolutionRoleId; minOrdinal: number; taskIds: string[]; labels: string[] } | null = null;
+  for (const [makerRoleId, group] of groups) {
+    if (!best || group.minOrdinal < best.minOrdinal) best = { makerRoleId, ...group };
+  }
+  return best ? { makerRoleId: best.makerRoleId, taskIds: best.taskIds, labels: best.labels } : null;
+}
+
+/**
+ * Load + verify the launch-pinned manifest. Hash mismatch or invalid schema
+ * is FAIL-CLOSED (the envelope asserted governed intent); absent ref means
+ * legacy aggregate mode.
+ */
+export async function ensureTaskAssignmentManifest(run: AutoDeliverRun): Promise<string | null> {
+  if (!run.taskAssignmentManifestRef || run.taskAssignmentManifest) return null;
+  try {
+    const bytes = await readFile(run.taskAssignmentManifestRef.absolutePath);
+    const actual = createHash('sha256').update(bytes).digest('hex');
+    if (actual !== run.taskAssignmentManifestRef.sha256) {
+      return `task_manifest_hash_mismatch:${actual.slice(0, 12)}:${run.taskAssignmentManifestRef.sha256.slice(0, 12)}`;
+    }
+    const validated = validateEvolutionTaskAssignmentManifest(JSON.parse(bytes.toString('utf8')) as unknown);
+    if (!validated.ok) {
+      return `task_manifest_invalid:${validated.issues.map((item) => item.code).join(',')}`;
+    }
+    run.taskAssignmentManifest = validated.value;
+    return null;
+  } catch (error) {
+    return `task_manifest_unreadable:${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
 async function ensureImplementationRoleSkillSnapshots(run: AutoDeliverRun): Promise<string | null> {
   if (run.implementationRoleSkillSnapshots?.length === AUTO_DELIVER_MAKER_ROLE_IDS.length) return null;
   try {
@@ -1318,8 +1385,10 @@ async function ensureImplementationRoleSkillSnapshots(run: AutoDeliverRun): Prom
   }
 }
 
-function buildImplementationRoleSkillBlock(run: AutoDeliverRun): string {
-  const snapshots = run.implementationRoleSkillSnapshots;
+function buildImplementationRoleSkillBlock(run: AutoDeliverRun, roleFilter?: EvolutionRoleId): string {
+  const snapshots = roleFilter
+    ? run.implementationRoleSkillSnapshots?.filter((snapshot) => snapshot.roleId === roleFilter)
+    : run.implementationRoleSkillSnapshots;
   if (!snapshots?.length) {
     return [
       'Expert maker guidance: unavailable.',
@@ -1350,9 +1419,22 @@ function buildImplementationPrompt(run: AutoDeliverRun, repairReason?: string): 
     ? `OpenSpec Auto Deliver implementation repair for ${reference}.`
     : null;
   const validationSummary = validationCommandEvidence(run);
-  const remainingBlock = remaining.length > 0
-    ? remaining.map((label) => `- ${label}`).join('\n')
-    : '- Re-read tasks.md and verify every task remains checked.';
+  // Role-homogeneous batch mode (#17): scope the prompt to ONE role's tasks
+  // with only that role's skill; other roles' tasks are dispatched in later
+  // batches through the same serialized session.
+  const batch = run.activeImplementationBatch;
+  const remainingBlock = batch
+    ? batch.labels.map((label) => `- ${label}`).join('\n')
+    : remaining.length > 0
+      ? remaining.map((label) => `- ${label}`).join('\n')
+      : '- Re-read tasks.md and verify every task remains checked.';
+  const batchScopeLines = batch
+    ? [
+      `ROLE BATCH SCOPE: you are executing as ${batch.makerRoleId} for the ${batch.taskIds.length} task(s) listed below ONLY.`,
+      'Do NOT work on, check off, or modify tasks assigned to other roles — they will be dispatched in later batches. Note: this is the same runtime session across batches, not an independent agent per role.',
+      '',
+    ]
+    : [];
   const body = [
     basePrompt,
     '',
@@ -1365,8 +1447,9 @@ function buildImplementationPrompt(run: AutoDeliverRun, repairReason?: string): 
     `Generation: ${run.generation}`,
     `Implementation prompt: ${run.implementationPromptCount}/${maxImplementationPrompts}`,
     '',
-    buildImplementationRoleSkillBlock(run),
+    buildImplementationRoleSkillBlock(run, batch?.makerRoleId),
     '',
+    ...batchScopeLines,
     'Implement only this OpenSpec change. Do not commit, push, or stage files. Do not modify unrelated OpenSpec changes or docs.',
     'Before inspecting, editing, validating, or committing anything, work from the project root above. Do not rely on the execution session current directory if it differs.',
     'All relative file paths in this prompt are relative to that project root.',
@@ -1453,6 +1536,25 @@ async function dispatchImplementationPrompt(run: AutoDeliverRun, repairReason?: 
   if (baselineFailure) return baselineFailure;
   const roleSkillFailure = await ensureImplementationRoleSkillSnapshots(run);
   if (roleSkillFailure) return terminalize(run, 'needs_human', roleSkillFailure);
+  // Role-homogeneous batching (#17): with a verified manifest, each dispatch
+  // targets ONE maker role's remaining tasks with only that role's skill.
+  const manifestFailure = await ensureTaskAssignmentManifest(run);
+  if (manifestFailure) return terminalize(run, 'needs_human', manifestFailure);
+  if (run.taskAssignmentManifest) {
+    const batch = selectImplementationBatch(run.taskAssignmentManifest, run.taskStats.items);
+    if (batch) {
+      run.activeImplementationBatch = batch;
+      run.evidence = mergeEvidence(run.evidence, [{
+        source: 'task_manifest',
+        summary: `Dispatching role-homogeneous batch: ${batch.makerRoleId} × ${batch.taskIds.length} task(s) [${batch.taskIds.join(', ')}].`,
+        stale: false,
+      }]);
+    } else {
+      // Remaining tasks are unannotated/unknown — fall back to the honest
+      // aggregate mode for the tail; attribution stays explicitly absent.
+      delete run.activeImplementationBatch;
+    }
+  }
   if (!transitionAllowed(run, 'implementation_prompt_dispatched')) {
     return terminalize(run, 'failed', 'invalid_transition_implementation_prompt');
   }
@@ -1485,6 +1587,10 @@ async function dispatchImplementationPrompt(run: AutoDeliverRun, repairReason?: 
     promptSha256: createHash('sha256').update(prompt).digest('hex'),
     promptBytes,
     skillHashes: (run.implementationRoleSkillSnapshots ?? []).map((snapshot) => ({ roleId: snapshot.roleId, sha256: snapshot.sha256 })),
+    ...(run.activeImplementationBatch ? {
+      batchMakerRoleId: run.activeImplementationBatch.makerRoleId,
+      batchTaskIds: [...run.activeImplementationBatch.taskIds],
+    } : {}),
   });
   const sendMode = await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
   await appendDispatchJournalRecord({
@@ -3945,12 +4051,29 @@ export async function handleOpenSpecAutoDeliverCommand(cmd: Record<string, unkno
 export async function launchOpenSpecAutoDeliverFromRequest(
   request: OpenSpecAutoDeliverLaunchRequest,
   serverLink: ServerLink,
+  /**
+   * Daemon-internal launch envelope (#17). Only daemon call sites (the
+   * Evolution launcher binding) may pass this — the wire command handler
+   * never does, so client payloads cannot forge Evolution authority.
+   */
+  internalEnvelope?: { evolutionRunId?: string; taskAssignmentManifest?: { absolutePath: string; sha256: string } },
 ): Promise<LaunchResult> {
   const result = await launch(request, serverLink);
   if (result.ok) {
     send(serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH_ACK, requestId: request.requestId, projection: result.projection });
     send(serverLink, { type: OPENSPEC_AUTO_DELIVER_MSG.PROJECTION, projection: result.projection });
     const run = runsById.get(result.projection.runId);
+    if (run && internalEnvelope?.taskAssignmentManifest) {
+      run.taskAssignmentManifestRef = {
+        ...internalEnvelope.taskAssignmentManifest,
+        ...(internalEnvelope.evolutionRunId ? { evolutionRunId: internalEnvelope.evolutionRunId } : {}),
+      };
+      run.evidence = mergeEvidence(run.evidence, [{
+        source: 'task_manifest',
+        summary: `Launch envelope pinned task-assignment manifest ${internalEnvelope.taskAssignmentManifest.sha256.slice(0, 12)} from Evolution run ${internalEnvelope.evolutionRunId ?? 'unknown'}.`,
+        stale: false,
+      }]);
+    }
     if (run && run.stage === 'proposed' && !isOpenSpecAutoDeliverTerminalStage(run.status)) {
       if (run.materializedLimits.specAuditRepairRounds > 0) {
         await startAuditRepairStageFailClosed(run, 'spec_audit_repair');
@@ -3979,7 +4102,10 @@ setEvolutionAutoDeliverLauncher(async (request, serverLink): Promise<EvolutionAu
     presetId: request.presetId,
     ...(request.locale ? { locale: request.locale } : {}),
     autoCommitPush: request.autoCommitPush,
-  }, serverLink as ServerLink);
+  }, serverLink as ServerLink, {
+    ...(request.evolutionRunId ? { evolutionRunId: request.evolutionRunId } : {}),
+    ...(request.taskAssignmentManifest ? { taskAssignmentManifest: request.taskAssignmentManifest } : {}),
+  });
   return result.ok
     ? { ok: true, projection: result.projection }
     : { ok: false, error: result.error, ...(result.projection ? { projection: result.projection } : {}) };
