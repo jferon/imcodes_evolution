@@ -1,5 +1,15 @@
 import { EVOLUTION_ROLE_IDS, type EvolutionRoleId } from '../../shared/evolution-pipeline-constants.js';
 
+/**
+ * HONEST CLASSIFICATION (discussion 30f25d75-67c, repair checklist #1):
+ * these substring/marker fixtures are a STATIC CONTRACT LINT — they check
+ * output format (required phrases, forbidden claims, machine verdict marker),
+ * not reasoning quality, artifact correctness, or expert behavior. Passing
+ * them must never be presented as evidence that a role is "expert-grade";
+ * behavioral evaluation is a separate, controlled-benchmark concern.
+ */
+export const EVOLUTION_ROLE_EVAL_CLASSIFICATION = 'static_contract_lint' as const;
+
 export interface EvolutionRoleEvalFixture {
   roleId: EvolutionRoleId;
   scenario: string;

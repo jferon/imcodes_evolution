@@ -67,7 +67,7 @@ import {
 } from '../../shared/openspec-auto-deliver-validators.js';
 import { formatOpenSpecAuditStandardTemplate, formatOpenSpecPromptTemplate } from '../../shared/openspec-prompt-templates.js';
 import type { EvolutionRoleId } from '../../shared/evolution-pipeline-constants.js';
-import { resolveApprovedEvolutionRoleSkill } from './evolution-artifact-store.js';
+import { resolveEffectiveRoleSkill } from './evolution-skill-resolution.js';
 import { appendDispatchJournalRecord } from './auto-deliver-dispatch-journal.js';
 import {
   buildP2pExecutionMarker,
@@ -1283,7 +1283,7 @@ async function ensureImplementationRoleSkillSnapshots(run: AutoDeliverRun): Prom
   if (run.implementationRoleSkillSnapshots?.length === AUTO_DELIVER_MAKER_ROLE_IDS.length) return null;
   try {
     const snapshots = await Promise.all(AUTO_DELIVER_MAKER_ROLE_IDS.map(async (roleId) => {
-      const resolved = await resolveApprovedEvolutionRoleSkill(run.projectRoot, roleId);
+      const resolved = await resolveEffectiveRoleSkill(run.projectRoot, roleId, 'auto_deliver_implementation');
       if (resolved.verification === 'quarantined_fallback' && resolved.quarantine) {
         // Post-approval tamper detected: the built-in fallback is used and the
         // mismatch is recorded loudly — never silently.
@@ -1297,7 +1297,7 @@ async function ensureImplementationRoleSkillSnapshots(run: AutoDeliverRun): Prom
         roleId,
         skillName: resolved.skillName,
         sourcePath: resolved.sourcePath,
-        sha256: resolved.sha256,
+        sha256: resolved.contentSha256,
         content: resolved.content,
         verification: resolved.verification,
       } satisfies AutoDeliverRoleSkillSnapshot;
@@ -1328,6 +1328,7 @@ function buildImplementationRoleSkillBlock(run: AutoDeliverRun): string {
   }
   return [
     'Expert maker guidance (pinned for this Auto Deliver run):',
+    '- runtime=aggregate_implementation_runtime — one shared implementation runtime receives ALL of these role methods; per-role attribution from this bundle is model-attested telemetry, never execution proof.',
     '- One implementation runtime receives these role methods. This is not evidence that independent role agents executed.',
     '- Apply only the role guidance relevant to each task. Do not let maker guidance self-authorize QA, security, release, or human gates.',
     '- Report the role and sha256 used for each completed task in the completion evidence.',

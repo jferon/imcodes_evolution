@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "note": "Frozen sha256 of every built-in role skill body (cycle-1 expanded playbooks). Intentional content changes MUST update this manifest consciously in the same commit — silent drift of executable role guidance fails the drift test.",
+  "entries": {
+    "evolution-loop-supervisor": "3f566aa2dc9d2958dc8acea90c2a008908832abc5bafb96f1ed8bb15be67ef2f",
+    "product-prd": "65efe75d0e618580474748138ab994107c9ed9052973cd32503bb5165d78765d",
+    "product-critic": "c97357af1d90e5d37cb5543a4cb462e26249eaa9af4e31962ae759b2aa158a0a",
+    "ux-flow-wireframe": "fd4309d82d9a4f04d06f4ef16368ce3ab2ddc91df25cb3a1de44519c125da440",
+    "visual-hifi": "7e5acd740ea29c125503a8237cec47899a2d9201fdeb2aacbb8624ae036c55ff",
+    "visual-fidelity-check": "be19702704ccab9f0f900030777191a9823e9ae9344c5c15a277ec01c4fb7520",
+    "tech-baseline-adr": "ad6389e3c2dfef9aa3a59abc857b9fa3a9e82133bee9899633962bbdd49a5dec",
+    "backend-implementation": "d251506ac90cced760f56591fcf987226c3adfe18dcaa5322844dfa2af075bc7",
+    "frontend-implementation": "20c33004a5bae36b90ca4d932a16b57d2fe9b19163305bd06eb38b78927289c1",
+    "qa-acceptance": "b0627f32099f5d8a9897ae3f492ebd7e98a95e8ea9bd9381cadd1a6d82d535d2",
+    "security-risk-review": "d6927fb5d9256d5f4fad25e18970a56f1deede2f35e554b1f7e6473cde74bc20",
+    "ops-release": "0d1d346febc2ad43099b5b2c1684021a3082737512b41d6c62c663b66da6f01e"
+  }
+}

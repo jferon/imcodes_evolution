@@ -11,10 +11,8 @@ import logger from '../util/logger.js';
 import { ensureImcDir } from '../util/imc-dir.js';
 import type { AgentType } from '../agent/detect.js';
 import { DISCUSSION_RECONCILE_HIDDEN_MS } from '../../shared/discussion-ui.js';
-import {
-  EVOLUTION_ROLE_SKILL_DEFINITIONS,
-  resolveApprovedEvolutionRoleSkill,
-} from './evolution-artifact-store.js';
+import { EVOLUTION_ROLE_SKILL_DEFINITIONS } from './evolution-artifact-store.js';
+import { resolveEffectiveRoleSkill } from './evolution-skill-resolution.js';
 import type { EvolutionRoleId } from '../../shared/evolution-pipeline-constants.js';
 
 const IDLE_TIMEOUT = 300_000;      // max total wall time per response
@@ -95,14 +93,15 @@ export async function resolveGovernedDiscussionDomainRoleAtProject(
 ): Promise<{ label: string; prompt: string } | null> {
   const base = resolveGovernedDiscussionDomainRole(roleId);
   if (!base || !roleId) return base;
-  const skill = await resolveApprovedEvolutionRoleSkill(projectRoot, roleId as EvolutionRoleId);
+  const skill = await resolveEffectiveRoleSkill(projectRoot, roleId as EvolutionRoleId, 'generic_discussion');
   return {
     label: base.label,
     prompt: [
       base.prompt,
       '',
-      `Governed skill source: ${skill.source} · ${skill.sourcePath}`,
-      `Governed skill sha256: ${skill.sha256}`,
+      `Governed skill source: ${skill.sourceClass} · ${skill.sourcePath}`,
+      `Governed skill sha256: ${skill.contentSha256}`,
+      `Governed skill verification: ${skill.verification}`,
       'The following skill bytes are daemon-resolved. Browser payloads cannot replace them:',
       '<governed-skill>',
       skill.content,
