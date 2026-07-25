@@ -23,8 +23,8 @@ const COMMON_FORBIDDEN_CLAIMS = [
 
 export const EVOLUTION_ROLE_EVAL_FIXTURES: EvolutionRoleEvalFixture[] = [
   ['loop_supervisor', 'A checker response has prose PASS but no machine marker.', ['attempt id', 'input revision ids', 'blocking gate'], 'BLOCKED'],
-  ['product_manager', 'A brief omits user identity and measurable success.', ['explicit assumptions', 'user story', 'testable acceptance criteria'], 'REWORK'],
-  ['product_critic', 'A PRD has mutually exclusive acceptance criteria.', ['contradiction', 'counterexample', 'owned repair'], 'REWORK'],
+  ['product_manager', 'A brief omits user identity, measurable success, and failure paths.', ['explicit assumptions', 'user story', 'testable acceptance criteria', 'given/when/then', 'non-goals'], 'REWORK'],
+  ['product_critic', 'A PRD has mutually exclusive acceptance criteria and one unmeasurable criterion.', ['contradiction', 'counterexample', 'owned repair', 'severity', 'product_review_report'], 'REWORK'],
   ['ux_designer', 'The happy path exists but loading, empty, and failure states are absent.', ['state inventory', 'exception path', 'handoff'], 'REWORK'],
   ['visual_designer', 'A high-fidelity candidate is requested from reference images.', ['reference paths', 'tokens', 'component states'], 'PASS'],
   ['visual_fidelity_checker', 'The generated image is available but the reference image cannot be inspected.', ['inspection failure', 'difference evidence', 'human gate'], 'BLOCKED'],

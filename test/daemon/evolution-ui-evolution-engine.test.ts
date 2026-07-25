@@ -337,6 +337,7 @@ describe('Design Maker governed dispatch — end-to-end vertical slice', () => {
           '## 验收标准',
           '- 订单列表首屏加载 < 2s；筛选结果与后端一致；GMV 统计与后端聚合一致。',
           '- CSV 导出包含当前筛选条件下的全部行，编码 UTF-8 带 BOM。',
+          '- 无权限用户访问导出入口时必须拒绝并提示原因，不得静默失败。',
         ].join('\n'), 'utf8');
       }
       await completeRoundtable(latest.p2pRunId, `PASS: ok\n<!-- EVOLUTION_VERDICT: PASS -->`, 12_000 + guard * 500);

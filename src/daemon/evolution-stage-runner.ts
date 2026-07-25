@@ -27,6 +27,18 @@ import {
   type UiSpecDocument,
   type UiVisualReport,
 } from '../../shared/ui-spec.js';
+import {
+  PRODUCT_MAKER_ACCEPTANCE_RELATIVE_PATH,
+  PRODUCT_MAKER_PRD_RELATIVE_PATH,
+  PRODUCT_MAKER_USER_STORIES_RELATIVE_PATH,
+  PRD_QUALITY_MIN_SCORE,
+  PRODUCT_REVIEW_PASS_THRESHOLD,
+  PRODUCT_REVIEW_REPORT_RELATIVE_PATH,
+  assessPrdQuality,
+  summarizePrdQualityFailure,
+  type PrdQualityAssessment,
+  type ProductReviewReport,
+} from '../../shared/product-spec.js';
 import { getEvolutionRunPaths, writeEvolutionRun } from './evolution-artifact-store.js';
 import { runEvolutionTasteHifiGeneration, runEvolutionUiScreenshots } from './evolution-design-runner.js';
 import {
@@ -954,6 +966,8 @@ export interface DesignMakerPromotionResult {
   ok: boolean;
   reason?: string;
   uiSpec?: UiSpecDocument;
+  /** Product Maker only: deterministic PRD quality contract result. */
+  prdQuality?: PrdQualityAssessment;
   revisionIds: string[];
 }
 
@@ -1030,18 +1044,34 @@ export async function registerDesignMakerOutputArtifacts(options: {
   return { ok: true, uiSpec: validated.value, revisionIds };
 }
 
-export const PRODUCT_MAKER_PRD_RELATIVE_PATH = 'artifacts/prd.md' as const;
-export const PRODUCT_MAKER_USER_STORIES_RELATIVE_PATH = 'artifacts/user-stories.md' as const;
-export const PRODUCT_MAKER_ACCEPTANCE_RELATIVE_PATH = 'artifacts/acceptance-criteria.md' as const;
-const PRODUCT_MAKER_PRD_MIN_CHARS = 300;
+// Re-exported so existing daemon/test imports keep a single definition site:
+// the canonical paths live in `shared/product-spec.ts` next to the PRD quality
+// contract that validates what gets written to them.
+export {
+  PRODUCT_MAKER_PRD_RELATIVE_PATH,
+  PRODUCT_MAKER_USER_STORIES_RELATIVE_PATH,
+  PRODUCT_MAKER_ACCEPTANCE_RELATIVE_PATH,
+};
+
+async function readOptionalRunFile(runDir: string, relativePath: string): Promise<string | null> {
+  try {
+    return await readFile(safeJoin(runDir, relativePath), 'utf8');
+  } catch {
+    return null;
+  }
+}
 
 /**
  * UI Evolution Engine — validate and promote the Product Maker attempt's
  * outputs. The maker agent authors `artifacts/prd.md` (required — a real
  * PRD, not the deterministic template) plus optional user-stories and
- * acceptance-criteria documents. Promotion registers them as
- * `agent_attested` candidates bound to the producer attempt; a PASS claim
- * without a substantive PRD fails promotion.
+ * acceptance-criteria documents.
+ *
+ * Promotion runs the deterministic PRD quality contract
+ * (`assessPrdQuality`) rather than a length check: a PASS claim over a PRD
+ * with no testable acceptance criteria, no well-formed user stories, or
+ * leftover placeholders is rejected, and the rejection reason is the
+ * actionable finding list the retry consumes.
  */
 export async function registerProductMakerOutputArtifacts(options: {
   projectRoot: string;
@@ -1050,15 +1080,17 @@ export async function registerProductMakerOutputArtifacts(options: {
   nowMs: number;
 }): Promise<DesignMakerPromotionResult> {
   const paths = getEvolutionRunPaths(options.projectRoot, options.run.runId);
-  let prd: string;
-  try {
-    prd = await readFile(safeJoin(paths.runDir, PRODUCT_MAKER_PRD_RELATIVE_PATH), 'utf8');
-  } catch {
+  const prd = await readOptionalRunFile(paths.runDir, PRODUCT_MAKER_PRD_RELATIVE_PATH);
+  if (prd === null) {
     return { ok: false, reason: `missing required output: ${PRODUCT_MAKER_PRD_RELATIVE_PATH}`, revisionIds: [] };
   }
-  const trimmed = prd.trim();
-  if (trimmed.length < PRODUCT_MAKER_PRD_MIN_CHARS || !trimmed.startsWith('#')) {
-    return { ok: false, reason: `${PRODUCT_MAKER_PRD_RELATIVE_PATH} is not a substantive PRD (needs a heading and >= ${PRODUCT_MAKER_PRD_MIN_CHARS} chars)`, revisionIds: [] };
+  const quality = assessPrdQuality({
+    prd,
+    userStories: await readOptionalRunFile(paths.runDir, PRODUCT_MAKER_USER_STORIES_RELATIVE_PATH),
+    acceptanceCriteria: await readOptionalRunFile(paths.runDir, PRODUCT_MAKER_ACCEPTANCE_RELATIVE_PATH),
+  });
+  if (!quality.ok) {
+    return { ok: false, reason: summarizePrdQualityFailure(quality), prdQuality: quality, revisionIds: [] };
   }
 
   const revisionIds: string[] = [];
@@ -1089,8 +1121,58 @@ export async function registerProductMakerOutputArtifacts(options: {
       }
     }
   }
+  // The maker's own attestation is not a checker verdict, so this score stays
+  // `agent` sourced — the Product Critic's structured report overwrites it
+  // with a `checker` score at product_discussion.
+  upsertScore(options.run, {
+    module: 'product',
+    score: Math.max(0, Math.min(10, Math.round(quality.score / 10))),
+    maxScore: 10,
+    summary: `PRD quality ${quality.score}/100 — ${quality.stats.wellFormedUserStories}/${quality.stats.userStories} well-formed stories, ${quality.stats.testableAcceptanceCriteria}/${quality.stats.acceptanceCriteria} testable acceptance criteria.`,
+    source: 'agent',
+    ...(options.producerAttemptId ? { attemptId: options.producerAttemptId } : {}),
+  });
   await writeEvolutionRun(options.projectRoot, options.run);
-  return { ok: true, revisionIds };
+  return { ok: true, prdQuality: quality, revisionIds };
+}
+
+/**
+ * Persist the Product Critic's structured review report as a governed run
+ * artifact. The prose review (`artifacts/prd-review.md`) stays human-readable;
+ * this JSON is what the retry loop, the score ledger, and the War Room consume.
+ */
+export async function registerProductReviewReportArtifact(options: {
+  projectRoot: string;
+  run: EvolutionRun;
+  report: ProductReviewReport;
+  producerAttemptId?: string;
+  nowMs: number;
+}): Promise<void> {
+  await writeRunArtifact({
+    projectRoot: options.projectRoot,
+    run: options.run,
+    kind: 'product_review_report',
+    path: PRODUCT_REVIEW_REPORT_RELATIVE_PATH,
+    title: 'Product Review Report',
+    roleId: 'product_critic',
+    stage: 'product_discussion',
+    content: `${JSON.stringify(options.report, null, 2)}\n`,
+    nowMs: options.nowMs,
+  });
+  const artifact = options.run.artifacts.find((entry) => entry.path === PRODUCT_REVIEW_REPORT_RELATIVE_PATH);
+  if (artifact) {
+    artifact.assurance = 'checker_verified';
+    if (options.producerAttemptId) artifact.producerAttemptId = options.producerAttemptId;
+  }
+  const blockers = options.report.issues.filter((entry) => entry.severity === 'blocker').length;
+  upsertScore(options.run, {
+    module: 'product',
+    score: Math.max(0, Math.min(10, Math.round(options.report.score / 10))),
+    maxScore: 10,
+    summary: `Product review ${options.report.score}/100 (pass ${PRODUCT_REVIEW_PASS_THRESHOLD}, basis: ${options.report.basis}); ${options.report.issues.length} issue(s), ${blockers} blocker(s).`,
+    source: 'checker',
+    ...(options.producerAttemptId ? { attemptId: options.producerAttemptId } : {}),
+  });
 }
 
 /**
@@ -1282,18 +1364,38 @@ function renderEvolutionWarRoomPrd(digest: RequirementDigest, instructions: WarR
     '- 首期不绕过测试、审查或安全门禁。',
     '- 首期不处理需求文档之外的无边界扩展。',
     '',
+    '## Target Users',
+    '- 产品负责人：把需求投递进 inbox 并对交付范围负责。',
+    '- 技术负责人：控制架构边界与实现风险。',
+    '- QA / 运维：验证验收标准并守住发布门禁。',
+    '',
     '## User Stories',
-    '- 作为产品负责人，我希望把需求文档放入 inbox 后自动得到 PRD、设计、技术方案和任务清单。',
-    '- 作为技术负责人，我希望看到架构基线、风险项和可执行任务，以便控制实现范围。',
-    '- 作为 QA，我希望任务自带验收标准和测试计划，以便自动交付后可验证。',
-    '- 作为用户，我希望在 War Room 中看到角色状态并能直接给指定角色补充指令。',
+    '- US-1 作为产品负责人，我希望把需求文档放入 inbox 后自动得到 PRD、设计、技术方案和任务清单，以便不必人工搬运每个阶段的产物。',
+    '- US-2 作为技术负责人，我希望看到架构基线、风险项和可执行任务，以便控制实现范围。',
+    '- US-3 作为 QA，我希望任务自带验收标准和测试计划，以便自动交付后可验证。',
+    '- US-4 作为运维负责人，我希望在 War Room 中看到角色状态并能直接给指定角色补充指令，以便在不中断流水线的情况下解除阻塞。',
+    '',
+    '## Success Metrics',
+    '- 北极星：投递需求到 `prd_ready` 的人工干预次数为 0。',
+    '- 质量护栏：每个阶段的产物都绑定 revision id 与 attempt id，覆盖率 100%。',
+    '- 风险护栏：生产发布的人工门禁通过率统计中，自动越过次数为 0。',
     '',
     '## Acceptance Criteria',
-    '- 系统能读取 `.imcodes/inbox/requirements/` 下的需求文档并创建 Evolution Run。',
-    '- Run 必须生成 PRD、设计说明、架构基线、OpenSpec proposal/design/tasks、测试计划和部署计划。',
-    '- War Room 必须展示当前阶段、角色状态、产物、证据和阻塞问题。',
-    '- `tasks.md` 必须包含可被 OpenSpec Auto Deliver 解析的 checkbox 任务。',
-    '- 生产发布必须停在人工门禁。',
+    '- US-1 给定 `.imcodes/inbox/requirements/` 下存在需求文档，当 watcher 扫描时，则必须创建 Evolution Run 并写入 run.json。',
+    '- US-1 给定 run 进入规划阶段，当阶段推进时，则必须生成 PRD、设计说明、架构基线、OpenSpec proposal/design/tasks、测试计划和部署计划各 1 份。',
+    '- US-2 给定 `tasks.md` 已生成，当 OpenSpec Auto Deliver 解析时，则必须解析出至少 1 条 checkbox 任务且解析失败数为 0。',
+    '- US-3 给定 QA 阶段开始，当测试执行时，则必须给出可复现命令与退出码，缺少证据时判定失败。',
+    '- US-4 给定 War Room 打开，当查看 run 时，则必须展示当前阶段、角色状态、产物、证据和阻塞问题。',
+    '- US-4 给定 run 进入生产发布，当没有人工批准记录时，则必须停在 human gate，不得自动发布。',
+    '',
+    '## Assumptions / Open Questions',
+    '- 假设 A1：需求文档为唯一需求源；文档之外的口头约定不进入本次范围。',
+    '- 假设 A2：staging 环境可自动化验证，production 只接受人工批准。',
+    '- 开放问题 Q1：需求文档缺失业务口径时，由谁在 War Room 内确认？',
+    '',
+    '## Risks / Dependencies',
+    '- 风险：需求文档信息不足会把假设固化为实现；缓解方式是把假设显式写入本章并在审查阶段确认。',
+    '- 依赖：OpenSpec Auto Deliver、P2P 圆桌与人工门禁必须可用，否则 run 停在 needs_human。',
     '',
     '## Source Signals',
     ...digest.bullets.map((entry) => `- ${entry}`),
@@ -1335,10 +1437,15 @@ function renderBusinessPrd(digest: RequirementDigest, uiModel: ProductUiModel, i
     ...extractNonGoalLines(digest),
     '',
     '## User Stories',
-    `- 作为${uiModel.audience}，我希望在 ${screens[0]?.name ?? uiModel.primarySurface} 中快速理解 ${primaryEntity} 的状态和可执行动作。`,
-    `- 作为${uiModel.audience}，我希望完成 ${primaryAction}、${secondaryAction} 等操作时看到明确的权限、校验、成功和失败反馈。`,
-    `- 作为${uiModel.audience}，我希望围绕 ${secondaryEntity} 查看详情、关联关系、库存/配额或业务流水，避免在多个旧页面之间来回切换。`,
-    '- 作为技术/测试负责人，我希望 PRD 的对象、页面、状态和验收标准都能追溯到原始 MD 和参考图。',
+    `- US-1 作为${uiModel.audience}，我希望在 ${screens[0]?.name ?? uiModel.primarySurface} 中查看 ${primaryEntity} 的状态和可执行动作，以便不必逐个旧页面确认当前情况。`,
+    `- US-2 作为${uiModel.audience}，我希望在完成 ${primaryAction}、${secondaryAction} 时看到权限、校验、成功和失败反馈，以便在操作失败时知道下一步怎么处理。`,
+    `- US-3 作为${uiModel.audience}，我希望围绕 ${secondaryEntity} 查看详情、关联关系和业务流水，以便在一个页面内完成核对。`,
+    '- US-4 作为技术/测试负责人，我希望 PRD 的对象、页面、状态和验收标准都能追溯到原始 MD 和参考图，以便实现和测试有唯一事实来源。',
+    '',
+    '## Success Metrics',
+    `- 北极星：${uiModel.audience}完成 ${primaryAction} 的一次任务耗时相比现状下降，且成功率不低于现状。`,
+    '- 质量护栏：核心流程的失败场景 100% 有明确提示文案与恢复路径。',
+    '- 范围护栏：交付页面数量与本 PRD 的 Screen Requirements 一致，偏差为 0。',
     '',
     '## Functional Scope',
     ...sourceExcerptLines(digest, 24),
@@ -1347,15 +1454,23 @@ function renderBusinessPrd(digest: RequirementDigest, uiModel: ProductUiModel, i
     ...screens.map((screen) => `- ${screen.name}: ${screen.purpose} 必须覆盖状态 ${screen.states.join(' / ')}。`),
     '',
     '## Acceptance Criteria',
-    `- 页面和接口必须使用需求文档中的领域术语，例如 ${primaryEntities.slice(0, 5).join('、') || digest.title}，不得替换成通用模板文案。`,
-    `- ${primaryEntities.slice(0, 5).join('、') || '核心对象'} 的列表、详情、状态、权限和异常场景必须可验证。`,
-    `- ${primaryActions.slice(0, 6).join('、') || '核心动作'} 必须有明确入口、前置校验、结果反馈和失败处理。`,
-    '- H5/PC/后台等多端要求必须按源文档拆分页面和验收，不得只产出单一无关页面。',
-    '- 如果参考图存在，高保真必须逐张映射信息架构、布局、颜色、组件和状态；如果参考图缺失，必须显式记录 MD 推导假设。',
-    '- 生产发布、账号权限、库存/配额、数据迁移和破坏性变更必须保留人工门禁。',
+    `- US-1 给定 ${screens[0]?.name ?? uiModel.primarySurface} 已打开，当页面渲染时，则页面和接口必须使用需求文档中的领域术语（例如 ${primaryEntities.slice(0, 5).join('、') || digest.title}），通用模板文案数量为 0。`,
+    `- US-1 给定 ${primaryEntities.slice(0, 5).join('、') || '核心对象'} 存在数据，当查看列表和详情时，则状态、权限和异常场景必须各有 1 个可验证的展示结果。`,
+    `- US-2 给定用户具备操作权限，当执行 ${primaryActions.slice(0, 6).join('、') || '核心动作'} 时，则必须有明确入口、前置校验、成功反馈和失败提示。`,
+    '- US-2 给定用户不具备操作权限，当尝试执行同一动作时，则必须拒绝并给出原因，不得静默失败。',
+    '- US-3 给定源文档要求 H5/PC/后台多端，当交付页面时，则必须按源文档拆分页面和验收，不得只产出单一无关页面。',
+    '- US-4 给定参考图存在，当产出高保真时，则必须逐张映射信息架构、布局、颜色、组件和状态；参考图缺失时必须显式记录 MD 推导假设。',
+    '- US-4 给定变更涉及生产发布、账号权限、库存/配额、数据迁移或破坏性操作，当流水线推进到该步骤时，则必须停在人工门禁。',
     '',
-    '## Open Questions / Assumptions',
-    ...extractNonGoalLines(digest).slice(0, 6),
+    '## Assumptions / Open Questions',
+    '- 假设 A1：需求文档与参考图是唯一事实来源；文档未覆盖的行为按现有项目约定保持不变。',
+    `- 假设 A2：目标用户为${uiModel.audience}；若实际使用者不同，范围与验收需要重新确认。`,
+    '- 开放问题 Q1：以下从源文档提取的边界项需要业务确认口径：',
+    ...extractNonGoalLines(digest).slice(0, 6).map((line) => `  ${line}`),
+    '',
+    '## Risks / Dependencies',
+    '- 风险：源文档缺失的业务口径若按常识补齐，会把错误假设固化为实现；缓解方式是把它们保留在“假设/开放问题”并在产品审查阶段关闭。',
+    '- 依赖：领域术语、权限模型和现有页面风格依赖既有系统，跨系统改动需要单独评估。',
     '',
     '## War Room User Instructions',
     ...warRoomInstructionLines(instructions),
@@ -1368,21 +1483,56 @@ function renderPrd(digest: RequirementDigest, uiModel: ProductUiModel, instructi
     : renderBusinessPrd(digest, uiModel, instructions);
 }
 
-function renderPrdReview(): string {
+/**
+ * Deterministic PRD preflight. This is NOT the Product Critic's review — it is
+ * the mechanical part of it, so the pipeline never claims a clean review it did
+ * not perform. Every finding here comes from `assessPrdQuality` running over
+ * the PRD that was actually written, and the governed Product Critic roundtable
+ * still owns the judgment (contradictions, counterexamples, business risk).
+ */
+function renderPrdReview(prd: string): string {
+  const quality = assessPrdQuality({ prd });
+  const blockers = quality.findings.filter((finding) => finding.severity === 'blocker');
+  const majors = quality.findings.filter((finding) => finding.severity === 'major');
+  const minors = quality.findings.filter((finding) => finding.severity === 'minor');
   return [
-    '# PRD Review',
+    '# PRD Review (Deterministic Preflight)',
     '',
-    '## Verdict',
-    'PASS_WITH_ASSUMPTIONS',
+    '## Scope',
+    '- 本文件只覆盖可机器判定的 PRD 结构、用户故事格式、验收标准可测性和占位内容。',
+    '- 矛盾、反例、业务风险和不可测需求由受治理的产品审查圆桌判定，本文件不代表审查结论。',
     '',
-    '## Findings',
-    '- PRD 已包含目标、非目标、用户故事和验收标准。',
-    '- 原始需求若缺少业务细节，已转为显式假设。',
-    '- 后续实现不得跳过 maker/checker 分离和 QA 验收。',
+    '## Quality Contract',
+    `- 分数：${quality.score}/100（放行下限 ${PRD_QUALITY_MIN_SCORE}）。`,
+    `- 章节：${quality.stats.presentSections.length}/${quality.stats.presentSections.length + quality.stats.missingSections.length} 到位${quality.stats.missingSections.length > 0 ? `，缺失 ${quality.stats.missingSections.join('、')}` : ''}。`,
+    `- 用户故事：${quality.stats.wellFormedUserStories}/${quality.stats.userStories} 条写明了角色、能力和价值。`,
+    `- 验收标准：${quality.stats.testableAcceptanceCriteria}/${quality.stats.acceptanceCriteria} 条可被测试验证。`,
+    `- 故事追溯：${quality.stats.tracedStoryIds.length}/${quality.stats.storyIds.length} 个故事编号被验收标准引用。`,
     '',
-    '## Required Follow-ups',
-    '- 若涉及账号、支付、隐私或生产配置，需要人工确认。',
-    '- 若设计稿需要像素级视觉稿，应在 design_hifi 后接入 Figma/图片生成工具。',
+    '## Preflight Verdict',
+    quality.ok
+      ? 'PASS_WITH_ASSUMPTIONS — 结构达标，缺失项已转为显式假设或待审查项。'
+      : 'REWORK — 结构未达标，必须先修复下列 blocker 再进入产品审查。',
+    '',
+    '## Blockers',
+    ...(blockers.length > 0
+      ? blockers.map((finding) => `- ${finding.message} → ${finding.fix}`)
+      : ['- 无。']),
+    '',
+    '## Must Fix Before Design',
+    ...(majors.length > 0
+      ? majors.map((finding) => `- ${finding.message} → ${finding.fix}`)
+      : ['- 无。']),
+    '',
+    '## Nice To Have',
+    ...(minors.length > 0
+      ? minors.map((finding) => `- ${finding.message} → ${finding.fix}`)
+      : ['- 无。']),
+    '',
+    '## Standing Follow-ups',
+    '- 涉及账号、支付、隐私、库存/配额或生产配置的需求必须保留人工门禁。',
+    '- 实现阶段不得跳过 maker/checker 分离和 QA 独立验收。',
+    '- 若需要像素级视觉稿，在 design_hifi 后接入参考图或图片生成工具，不得凭空生成界面。',
   ].join('\n');
 }
 
@@ -2506,18 +2656,24 @@ export async function runEvolutionPlanningStages(options: RunEvolutionPlanningSt
     // (governed policy), the deterministic template must NOT overwrite it —
     // the template is the draft fallback, never a replacement for real work.
     const agentPrd = run.artifacts.find((artifact) => artifact.kind === 'prd' && artifact.assurance === 'agent_attested');
+    const templatePrd = renderPrd(digest, uiModel, instructions);
     if (!agentPrd) await writeRunArtifact({
       projectRoot,
       run,
       kind: 'prd',
-      path: 'artifacts/prd.md',
+      path: PRODUCT_MAKER_PRD_RELATIVE_PATH,
       title: 'PRD Candidate',
       roleId: 'product_manager',
       stage: 'product_discussion',
-      content: renderPrd(digest, uiModel, instructions),
+      content: templatePrd,
       nowMs,
     });
     if (!(await hasReusableRunArtifact(projectRoot, run, 'artifacts/prd-review.md'))) {
+      // The preflight must judge the PRD that actually exists on disk — an
+      // agent-authored one when the Product Maker already promoted it.
+      const reviewedPrd = agentPrd
+        ? (await readOptionalRunFile(getEvolutionRunPaths(projectRoot, run.runId).runDir, PRODUCT_MAKER_PRD_RELATIVE_PATH)) ?? templatePrd
+        : templatePrd;
       await writeRunArtifact({
         projectRoot,
         run,
@@ -2526,7 +2682,7 @@ export async function runEvolutionPlanningStages(options: RunEvolutionPlanningSt
         title: 'Deterministic PRD Preflight',
         roleId: 'product_critic',
         stage: 'product_discussion',
-        content: renderPrdReview(),
+        content: renderPrdReview(reviewedPrd),
         nowMs,
       });
     }
@@ -2579,7 +2735,29 @@ export async function runEvolutionPlanningStages(options: RunEvolutionPlanningSt
       prdReviewArtifact.title = 'PRD Review';
       prdReviewArtifact.stage = 'prd_ready';
     }
-    upsertScore(run, { module: 'product', score: 8, maxScore: 10, summary: 'PRD includes goals, non-goals, user stories, acceptance criteria, and explicit assumptions.' });
+    // Score the PRD that exists, not the PRD we hoped for: a fixed 8/10 here
+    // told the War Room the product stage was strong even when the document
+    // had no testable acceptance criteria.
+    const prdPaths = getEvolutionRunPaths(projectRoot, run.runId);
+    const prdOnDisk = await readOptionalRunFile(prdPaths.runDir, PRODUCT_MAKER_PRD_RELATIVE_PATH);
+    const prdQuality = assessPrdQuality({
+      prd: prdOnDisk ?? '',
+      userStories: await readOptionalRunFile(prdPaths.runDir, PRODUCT_MAKER_USER_STORIES_RELATIVE_PATH),
+      acceptanceCriteria: await readOptionalRunFile(prdPaths.runDir, PRODUCT_MAKER_ACCEPTANCE_RELATIVE_PATH),
+    });
+    // Never let this regex-level check overwrite a real Product Critic (or
+    // human) score that already exists for the same module.
+    const verifiedProductScore = run.scores.some((score) => (
+      score.module === 'product' && (score.source === 'checker' || score.source === 'human')
+    ));
+    if (!verifiedProductScore) {
+      upsertScore(run, {
+        module: 'product',
+        score: Math.max(0, Math.min(10, Math.round(prdQuality.score / 10))),
+        maxScore: 10,
+        summary: `PRD quality ${prdQuality.score}/100 — ${prdQuality.stats.wellFormedUserStories}/${prdQuality.stats.userStories} well-formed user stories, ${prdQuality.stats.testableAcceptanceCriteria}/${prdQuality.stats.acceptanceCriteria} testable acceptance criteria${prdQuality.stats.missingSections.length > 0 ? `, missing ${prdQuality.stats.missingSections.join('/')}` : ''}.`,
+      });
+    }
     appendDiscussion(run, {
       kind: 'artifact_summary',
       stage: 'prd_ready',

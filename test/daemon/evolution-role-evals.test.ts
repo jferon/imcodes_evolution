@@ -4,12 +4,25 @@ import {
   evaluateEvolutionRoleOutput,
   validateEvolutionRoleEvalCoverage,
 } from '../../src/daemon/evolution-role-evals.js';
+import { EVOLUTION_ROLE_SKILL_DEFINITIONS } from '../../src/daemon/evolution-artifact-store.js';
 
 describe('Evolution role evaluation fixtures', () => {
   it('covers every governed role exactly once', () => {
     expect(validateEvolutionRoleEvalCoverage()).toEqual([]);
     expect(new Set(EVOLUTION_ROLE_EVAL_FIXTURES.map((fixture) => fixture.roleId)).size)
       .toBe(EVOLUTION_ROLE_EVAL_FIXTURES.length);
+  });
+
+  it('gives every governed role a substantive role-specific expert playbook', () => {
+    expect(EVOLUTION_ROLE_SKILL_DEFINITIONS).toHaveLength(EVOLUTION_ROLE_EVAL_FIXTURES.length);
+    for (const definition of EVOLUTION_ROLE_SKILL_DEFINITIONS) {
+      expect(definition.playbook?.length, definition.roleId).toBeGreaterThanOrEqual(3);
+      const lines = definition.playbook?.flatMap((section) => section.lines) ?? [];
+      expect(lines.length, definition.roleId).toBeGreaterThanOrEqual(12);
+      expect(new Set(definition.playbook?.map((section) => section.title)).size, definition.roleId)
+        .toBe(definition.playbook?.length);
+      expect(lines.some((line) => /失败|风险|blocked|rework|rollback/i.test(line)), definition.roleId).toBe(true);
+    }
   });
 
   it('fails closed when evidence or the machine verdict is missing', () => {

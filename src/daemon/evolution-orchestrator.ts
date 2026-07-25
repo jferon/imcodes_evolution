@@ -79,14 +79,23 @@ import { checkEvolutionStagingDeliveryConfig, runEvolutionStagingDelivery } from
 import { runEvolutionTasteHifiGeneration } from './evolution-design-runner.js';
 import {
   EvolutionPlanningPausedError,
-  PRODUCT_MAKER_ACCEPTANCE_RELATIVE_PATH,
-  PRODUCT_MAKER_PRD_RELATIVE_PATH,
-  PRODUCT_MAKER_USER_STORIES_RELATIVE_PATH,
   registerDesignMakerOutputArtifacts,
   registerProductMakerOutputArtifacts,
+  registerProductReviewReportArtifact,
   registerVisualReportArtifact,
   runEvolutionPlanningStages,
 } from './evolution-stage-runner.js';
+import {
+  PRD_MIN_ACCEPTANCE_CRITERIA,
+  PRD_MIN_USER_STORIES,
+  PRD_SECTION_REQUIREMENTS,
+  PRODUCT_MAKER_ACCEPTANCE_RELATIVE_PATH,
+  PRODUCT_MAKER_PRD_RELATIVE_PATH,
+  PRODUCT_MAKER_USER_STORIES_RELATIVE_PATH,
+  PRODUCT_REVIEW_PASS_THRESHOLD,
+  parseProductReviewReportMarker,
+  renderProductReviewFeedback,
+} from '../../shared/product-spec.js';
 import {
   DESIGN_SYSTEM_TOKENS_RELATIVE_PATH,
   UI_PREVIEW_HTML_RELATIVE_PATH,
@@ -5069,7 +5078,7 @@ async function finalizeRoundtableAttemptOutputs(
         stage: roundtable.stage,
         title: `${makerLabel} · outputs promoted`,
         detail: roundtable.id === EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID
-          ? `agent-authored PRD promoted as agent_attested candidate (${promotion.revisionIds.length} revision(s)).`
+          ? `agent-authored PRD promoted as agent_attested candidate (${promotion.revisionIds.length} revision(s)); PRD quality ${promotion.prdQuality?.score ?? 0}/100, ${promotion.prdQuality?.stats.testableAcceptanceCriteria ?? 0}/${promotion.prdQuality?.stats.acceptanceCriteria ?? 0} testable acceptance criteria.`
           : `ui-spec + preview promoted as agent_attested candidates (${promotion.uiSpec?.screens.length ?? 0} screen(s)).`,
         createdAt: nowMs,
       });
@@ -5084,6 +5093,45 @@ async function finalizeRoundtableAttemptOutputs(
         summary: `Maker PASS claim rejected: ${promotion.reason ?? 'unknown'}.`,
         createdAt: nowMs,
       });
+    }
+  }
+
+  if (roundtable.id === 'product-review' && machineVerdict !== 'unknown') {
+    const report = parseProductReviewReportMarker(summary);
+    if (report) {
+      await registerProductReviewReportArtifact({
+        projectRoot: entry.projectRoot,
+        run,
+        report,
+        producerAttemptId: attemptId,
+        nowMs,
+      });
+      const blockers = report.issues.filter((issue) => issue.severity === 'blocker').length;
+      appendLiveEvent(run, {
+        source: 'p2p_roundtable',
+        kind: 'score',
+        severity: report.score >= PRODUCT_REVIEW_PASS_THRESHOLD && blockers === 0 ? 'success' : 'warning',
+        roleId: 'product_critic',
+        stage: roundtable.stage,
+        title: `Product review · ${report.score}/100`,
+        detail: `${report.issues.length} issue(s), ${blockers} blocker(s), basis: ${report.basis}.`,
+        progress: { current: Math.round(report.score), total: 100, label: `${report.score}/100` },
+        createdAt: nowMs,
+      });
+      // A PASS token next to a blocker-carrying report is self-contradictory.
+      // The report is the evidence; the token is only a claim about it.
+      if (effectiveVerdict === 'pass' && (blockers > 0 || report.score < PRODUCT_REVIEW_PASS_THRESHOLD)) {
+        effectiveVerdict = 'rework';
+        effectiveSummary = [
+          `REWORK: product review reported ${report.score}/100 with ${blockers} blocker(s) — a PASS token cannot override its own report.`,
+          effectiveSummary.replace(/<!--\s*EVOLUTION_VERDICT:\s*PASS\s*-->/gi, '<!-- EVOLUTION_VERDICT: REWORK -->'),
+        ].join('\n');
+        appendEvidence(run, {
+          source: 'product_review_report',
+          summary: `Product Critic PASS claim rejected: score ${report.score}/100 (pass ${PRODUCT_REVIEW_PASS_THRESHOLD}), ${blockers} blocker(s).`,
+          createdAt: nowMs,
+        });
+      }
     }
   }
 
@@ -5480,17 +5528,56 @@ async function markStrictRoundtableGateBlocked(
 }
 
 function renderProductRoundtablePrompt(run: EvolutionRun): string {
+  const runDirRelative = `${EVOLUTION_RUN_ROOT_DIR}/${run.runId}`;
+  const reviewInputs = run.artifacts
+    .filter((artifact) => (
+      artifact.kind === 'prd'
+      || artifact.kind === 'user_stories'
+      || artifact.kind === 'acceptance_criteria'
+      || artifact.kind === 'prd_review'
+      || artifact.kind === 'normalized_requirement'
+    ))
+    .map((artifact) => `${runDirRelative}/${artifact.path}`);
+  const basis = run.artifacts.some((artifact) => artifact.kind === 'acceptance_criteria')
+    ? 'full_set'
+    : run.artifacts.some((artifact) => artifact.kind === 'user_stories')
+      ? 'prd_with_stories'
+      : 'prd_only';
   return [
-    `请以 IM.codes Evolution Factory 产品圆桌方式复核 run ${run.runId}。`,
+    `请以 IM.codes Evolution Factory 产品圆桌方式复核 run ${run.runId}。这是进入设计前的产品质量门禁：结论必须基于真实读取的文档，不允许凭讨论印象下判断。`,
     '',
-    '目标：在 PRD 生成前复核需求标准化与产品讨论，找出用户、目标、非目标、验收标准、风险假设中的遗漏。',
+    '## 第一步（必须执行）：用 Read 工具真实读取输入',
+    ...(reviewInputs.length > 0
+      ? reviewInputs.map((path) => `- ${path}`)
+      : ['- （未登记产品产物 — 请给出 BLOCKED 并说明缺失）']),
+    `- 原始需求：\`${run.source.relativePath}\`（用于核对 PRD 是否偏离真实诉求）`,
+    '',
+    '## 第二步：逐维度审查（每一项都要给出结论）',
+    '- user：目标用户是否具体到岗位/身份；是否遗漏管理员、审核者、下游系统等受影响角色。',
+    '- goal / scope：目标是否可判定达成；范围与非目标是否互斥且穷尽；有无隐性扩张。',
+    '- story：故事是否独立、可估算、含价值；有无孤儿故事或无法验收的故事。',
+    '- acceptance / testability：每条验收标准能否设计出确定的通过/失败判定；阈值、错误路径、权限与空数据场景是否缺失。',
+    '- metric：成功指标是否可测量，是否有护栏指标。',
+    '- assumption：未确认信息是否被显式标注为编号假设；有无把假设当作事实。',
+    '- risk / dependency：账号、支付、隐私、库存/配额、数据迁移、外部依赖是否识别并给出门禁。',
+    '- consistency / traceability：章节之间是否矛盾；验收标准与故事编号是否互相覆盖。',
+    '',
+    '## 第三步：反例法（本轮的硬性动作）',
+    '- 对至少 3 条验收标准，各构造一个“满足字面描述但违背意图”的实现；能构造出来就必须记为 issue。',
+    '- 对至少 2 条用户故事，各构造一个会让它失败的真实场景（空数据、并发、权限不足、失败重试、跨端差异）；PRD 未覆盖即为遗漏。',
     '',
     '角色视角：',
-    '- 产品经理：MVP 边界、用户故事、验收标准。',
-    '- 产品审查：矛盾、不可测需求、边界和高风险假设。',
-    '- Loop Supervisor：是否需要人工澄清，是否可以继续 PRD。',
+    '- 产品经理：MVP 边界是否正确、故事与验收是否覆盖真实诉求。',
+    '- 产品审查：矛盾、不可测需求、边界和高风险假设（本轮结论由该角色签署）。',
+    '- Loop Supervisor：是否需要人工澄清，是否可以进入设计阶段。',
     '',
-    '输出要求：先给 PASS / REWORK，再列出最多 8 个必须处理的问题；本轮只讨论，不修改代码。',
+    '## 输出要求（顺序不可颠倒）',
+    '1. 先给自然语言评审：矛盾清单 / 遗漏清单 / 边界问题 / 必须修复项（最多 8 条，每条带定位与可执行修复建议）。',
+    '2. 再输出结构化评审报告（JSON 单行）：',
+    `<!-- PRODUCT_REVIEW_REPORT: {"score":<0-100>,"basis":"${basis}","issues":[{"type":"user|problem|goal|scope|story|acceptance|metric|assumption|risk|dependency|testability|consistency|traceability","severity":"blocker|major|minor","issue":"...","fix":"...","location":"章节或 US-1"}],"summary":"..."} -->`,
+    '3. 最后一行必须是机器可读结论 `<!-- EVOLUTION_VERDICT: PASS|REWORK|BLOCKED -->`；它之后不得再有任何内容，否则受治理结论作废。',
+    `存在任何 blocker 时结论必须是 REWORK 且分数不得高于 ${PRODUCT_REVIEW_PASS_THRESHOLD - 1}；score >= ${PRODUCT_REVIEW_PASS_THRESHOLD} 才可给 PASS，分数必须与你列出的问题一致。`,
+    '无法读取必需输入或需要人工业务决策时给 BLOCKED，并说明需要谁来决策。本轮只审查文档，不修改代码。',
   ].join('\n');
 }
 
@@ -5605,7 +5692,29 @@ function latestProductReviewReworkFeedback(run: EvolutionRun): string | null {
     && entry.checkerRoleId === 'product_critic'
     && entry.verdict === 'REWORK'
   ));
-  return verdict?.summary?.trim().slice(0, 8_000) || null;
+  if (!verdict?.summary) return null;
+  // A structured report is strictly better retry input than the prose tail:
+  // typed issues with fixes and locations instead of "improve the PRD".
+  const report = parseProductReviewReportMarker(verdict.summary);
+  const feedback = report ? renderProductReviewFeedback(report) : verdict.summary;
+  return feedback.trim().slice(0, 8_000) || null;
+}
+
+/**
+ * The deterministic PRD quality contract rejected the previous PASS claim.
+ * That rejection is the most actionable feedback the retry can get, so it is
+ * surfaced verbatim instead of leaving the maker to guess what "not
+ * substantive" meant.
+ */
+function latestProductMakerPromotionRejection(run: EvolutionRun): string | null {
+  // Only the most recent product-promotion outcome matters: a rejection that
+  // a later attempt already fixed must not be replayed as pending work.
+  const latest = [...(run.evidence ?? [])].reverse().find((entry) => (
+    entry.source === 'maker_promotion'
+    && (entry.summary.includes(PRODUCT_MAKER_PRD_RELATIVE_PATH) || entry.summary.includes('Product Maker outputs promoted'))
+  ));
+  if (!latest || !latest.summary.includes(PRODUCT_MAKER_PRD_RELATIVE_PATH)) return null;
+  return latest.summary.trim().slice(0, 4_000) || null;
 }
 
 function renderProductMakerPrompt(run: EvolutionRun): string {
@@ -5616,8 +5725,10 @@ function renderProductMakerPrompt(run: EvolutionRun): string {
   const normalizedPath = run.artifacts.find((artifact) => artifact.kind === 'normalized_requirement')?.path;
   const existingPrd = run.artifacts.find((artifact) => artifact.kind === 'prd');
   const reworkFeedback = latestProductReviewReworkFeedback(run);
+  const promotionRejection = latestProductMakerPromotionRejection(run);
   return [
     `你是本次自我进化 run ${run.runId} 的产品经理 Maker。你的任务不是讨论，而是真实撰写可交付的 PRD 文档。`,
+    '交付物会被机器复核：章节、用户故事格式、验收标准可测性和占位内容都会被自动检查，不达标的 PASS 会被驳回并要求重做。',
     '',
     '## 第一步：真实阅读输入',
     `- 原始需求：\`${run.source.relativePath}\`（用 Read 工具打开）`,
@@ -5627,6 +5738,21 @@ function renderProductMakerPrompt(run: EvolutionRun): string {
       : []),
     ...(referenceImagePaths.length > 0
       ? ['- 参考图（必须逐张用 Read 工具真实查看）：', ...referenceImagePaths.map((path) => `  - ${path}`)]
+      : []),
+    '',
+    '## 第二步：需求分析（写入 PRD 之前先完成）',
+    '- 逐条抽取需求事实，并区分“文档写了的 / 图里画了的 / 你推断的”；第三类必须标记为编号假设。',
+    '- 对每个诉求追问：谁在什么场景下、因为什么触发、期望什么结果、现在为什么做不到、不做会怎样。',
+    '- 列出隐含角色（管理员、审核者、下游系统、运维）及其可能冲突的诉求。',
+    '- 缺失信息分级：阻塞型写成开放问题 Q1/Q2（含决策人），非阻塞型写成假设 A1/A2（含“假设不成立时受影响的章节”）。',
+    ...(promotionRejection
+      ? [
+          '',
+          '## 上一次交付被质量门禁驳回（必须先修复）',
+          '这是机器复核的结论，不是主观意见。逐条修复后再声明 PASS：',
+          '',
+          promotionRejection,
+        ]
       : []),
     ...(reworkFeedback
       ? [
@@ -5638,13 +5764,24 @@ function renderProductMakerPrompt(run: EvolutionRun): string {
         ]
       : []),
     '',
-    '## 第二步：写出以下文件（路径相对项目根目录）',
-    `1. \`${runDirRelative}/${PRODUCT_MAKER_PRD_RELATIVE_PATH}\`（必需）— 完整 PRD：业务目标、目标用户与分层、范围/非目标、用户故事、可度量的成功指标、显式假设与开放问题、验收标准。必须基于真实输入，不得输出通用模板。`,
-    `2. \`${runDirRelative}/${PRODUCT_MAKER_USER_STORIES_RELATIVE_PATH}\`（可选）— 展开的用户故事清单。`,
-    `3. \`${runDirRelative}/${PRODUCT_MAKER_ACCEPTANCE_RELATIVE_PATH}\`（可选）— 可测试的验收标准清单。`,
+    '## 第三步：写出以下文件（路径相对项目根目录）',
+    `1. \`${runDirRelative}/${PRODUCT_MAKER_PRD_RELATIVE_PATH}\`（必需）— 完整 PRD，章节契约如下（标题可中可英，语义必须一一对应）：`,
+    ...PRD_SECTION_REQUIREMENTS.map((entry) => `   - \`## ${entry.label}\`${entry.severity === 'blocker' ? '（必需，缺失直接判失败）' : entry.severity === 'major' ? '（必需，缺失显著扣分）' : '（建议）'}`),
+    `2. \`${runDirRelative}/${PRODUCT_MAKER_USER_STORIES_RELATIVE_PATH}\`（强烈建议）— 展开的用户故事清单，每条含编号、优先级、前置条件和异常分支。`,
+    `3. \`${runDirRelative}/${PRODUCT_MAKER_ACCEPTANCE_RELATIVE_PATH}\`（强烈建议）— 验收标准清单，每条绑定用户故事编号。`,
+    '   注：故事与验收标准的数量和格式按 PRD 章节 + 这两个文件的并集计算，PRD 内已完整展开时可不再重复成文件。',
+    '',
+    '## 硬性格式要求（机器会逐项复核）',
+    `- 用户故事 ≥ ${PRD_MIN_USER_STORIES} 条，格式 \`US-1 作为<具体角色>，我希望<可执行能力>，以便<可验证价值>\`；缺少“以便…”视为不合格。`,
+    `- 验收标准 ≥ ${PRD_MIN_ACCEPTANCE_CRITERIA} 条，格式 \`US-1 给定<前置状态>，当<触发操作>，则<可观测结果>\`，每条必须含阈值、状态、错误码或数据一致性等可断言事实。`,
+    '- 每条验收标准回指一个用户故事编号；覆盖成功路径、边界/空数据、失败提示和权限场景；不可逆动作必须有确认或人工门禁验收项。',
+    '- 禁用不可度量的形容词：良好、友好、易用、美观、流畅、尽量、适当、合理、优化体验、更好。',
+    '- 成功指标至少一条北极星 + 一条护栏指标，且都能用现有数据或新增埋点计算。',
+    '- 不得留下 TODO / 待补充 / 占位 / 示例文本；不确定的内容写成假设或开放问题。',
+    '- 必须基于真实输入撰写，不得输出通用模板，也不得照抄本提示词中的示例句式。',
     '',
     '## 输出要求',
-    '完成写入后，最后一条消息列出写入的文件与关键产品决策/假设，并以下面一行结束：',
+    '完成写入后，最后一条消息列出写入的文件、关键产品决策、编号假设与开放问题，并以下面一行结束：',
     '<!-- EVOLUTION_VERDICT: PASS -->',
     '如因输入缺失无法完成，说明缺什么并以 <!-- EVOLUTION_VERDICT: BLOCKED --> 结束；绝不允许在未写文件的情况下输出 PASS。',
   ].join('\n');

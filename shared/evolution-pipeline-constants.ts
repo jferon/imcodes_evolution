@@ -224,6 +224,7 @@ export const EVOLUTION_ARTIFACT_KINDS = [
   'user_stories',
   'acceptance_criteria',
   'prd_review',
+  'product_review_report',
   'ux_flow',
   'wireframe',
   'lofi_mockup',
