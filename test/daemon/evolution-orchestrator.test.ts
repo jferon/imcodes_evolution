@@ -563,7 +563,7 @@ describe('evolution orchestrator', () => {
     expect(validateEvolutionProjection(failed.value).ok).toBe(true);
   });
 
-  it('updates role skill playbooks from War Room and records a revision backup', async () => {
+  it('saves War Room skill edits as candidates ONLY — active executable bytes never change (containment #2)', async () => {
     const root = await makeRoot();
     const sourceRelativePath = await writeRequirement(root, 'skills.md');
     const launched = await launchEvolutionRun({
@@ -580,6 +580,7 @@ describe('evolution orchestrator', () => {
 
     const skillPath = join(root, '.imc/skills/evolution/visual-hifi.md');
     const original = await readFile(skillPath, 'utf8');
+    const snapshotsBefore = launched.value.skillSnapshots?.length ?? 0;
     const edited = `${original}\n## Team Overrides\n- Use taste-skill SVG references instead of Figma by default.\n`;
     const updated = await updateEvolutionRoleSkill({
       runId: launched.value.runId,
@@ -590,27 +591,22 @@ describe('evolution orchestrator', () => {
 
     expect(updated.ok).toBe(true);
     if (!updated.ok) return;
-    expect(await readFile(skillPath, 'utf8')).toContain('Use taste-skill SVG references');
-    expect(updated.value.artifacts.find((artifact) => artifact.kind === 'role_skill' && artifact.roleId === 'visual_designer')?.preview?.content)
-      .toContain('Team Overrides');
-    expect(updated.value.artifacts.find((artifact) => artifact.kind === 'role_skill_revision' && artifact.roleId === 'visual_designer')?.path)
-      .toContain('skills/revisions/');
-    expect(updated.value.artifacts.find((artifact) => artifact.kind === 'role_skill_release_candidate' && artifact.roleId === 'visual_designer')?.path)
-      .toContain('skills/release-candidates/');
-    expect(updated.value.discussion.at(-1)?.text).toContain('角色 skill 已从 War Room 更新');
-    expect(updated.value.evidence.some((entry) => entry.source === 'role_skill_editor')).toBe(true);
-    expect(updated.value.evidence.at(-1)?.source).toBe('role_skill_release_candidate');
-    expect(validateEvolutionProjection(updated.value).ok).toBe(true);
-    const updatedSnapshot = [...(updated.value.skillSnapshots ?? [])].reverse()
-      .find((snapshot) => snapshot.roleId === 'visual_designer');
-    expect(updatedSnapshot).toEqual(expect.objectContaining({
-      source: 'custom_user',
-      sha256: expect.any(String),
+    // CONTAINMENT: the active skill file is byte-for-byte unchanged.
+    expect(await readFile(skillPath, 'utf8')).toBe(original);
+    // No new snapshot was captured — governed attempts keep executing the
+    // exact bytes they were launched with.
+    expect(updated.value.skillSnapshots?.length ?? 0).toBe(snapshotsBefore);
+    expect([...(updated.value.skillSnapshots ?? [])].some((snapshot) => snapshot.source === 'custom_user')).toBe(false);
+    // The edit exists as an immutable release candidate only.
+    const candidate = updated.value.artifacts.find((artifact) => artifact.kind === 'role_skill_release_candidate' && artifact.roleId === 'visual_designer');
+    expect(candidate?.path).toContain('skills/release-candidates/');
+    expect(updated.value.discussion.at(-1)?.text).toContain('发布候选');
+    expect(updated.value.discussion.at(-1)?.text).toContain('未改变');
+    expect(updated.value.evidence.at(-1)).toEqual(expect.objectContaining({
+      source: 'role_skill_release_candidate',
+      summary: expect.stringContaining('UNCHANGED'),
     }));
-    await expect(readFile(
-      join(root, '.imc/evolution', launched.value.runId, 'skill-snapshots', `${updatedSnapshot?.id}.md`),
-      'utf8',
-    )).resolves.toBe(await readFile(skillPath, 'utf8'));
+    expect(validateEvolutionProjection(updated.value).ok).toBe(true);
     const releaseCandidate = updated.value.artifacts.find((artifact) => artifact.kind === 'role_skill_release_candidate' && artifact.roleId === 'visual_designer');
     await expect(readFile(join(root, '.imc/evolution', launched.value.runId, releaseCandidate!.path), 'utf8')).resolves.toContain('Release Candidate Governance');
     await expect(readFile(join(root, '.imc/evolution', launched.value.runId, releaseCandidate!.path), 'utf8')).resolves.toContain('config/evolution/role-skills/approved/visual-hifi.md');
@@ -658,7 +654,8 @@ describe('evolution orchestrator', () => {
 
     const ack = sent.find((message) => message.type === EVOLUTION_PIPELINE_MSG.UPDATE_ROLE_SKILL_ACK) as { projection?: { runId?: string; artifacts?: Array<{ id?: string; kind?: string; roleId?: string; preview?: { content?: string } }> } } | undefined;
     expect(ack?.projection?.runId).toBe(launched.value.runId);
-    expect(await readFile(qaSkillPath, 'utf8')).toContain('hostile acceptance cases');
+    // Containment holds through the WS command path too: active bytes untouched.
+    expect(await readFile(qaSkillPath, 'utf8')).toBe(qaOriginal);
     expect(ack?.projection?.artifacts?.some((artifact) => artifact.kind === 'role_skill_release_candidate' && artifact.roleId === 'qa_engineer')).toBe(true);
 
     const qaCandidate = ack?.projection?.artifacts?.find((artifact) => artifact.kind === 'role_skill_release_candidate' && artifact.roleId === 'qa_engineer');

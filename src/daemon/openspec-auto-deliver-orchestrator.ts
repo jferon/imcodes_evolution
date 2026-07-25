@@ -68,6 +68,7 @@ import {
 import { formatOpenSpecAuditStandardTemplate, formatOpenSpecPromptTemplate } from '../../shared/openspec-prompt-templates.js';
 import type { EvolutionRoleId } from '../../shared/evolution-pipeline-constants.js';
 import { resolveApprovedEvolutionRoleSkill } from './evolution-artifact-store.js';
+import { appendDispatchJournalRecord } from './auto-deliver-dispatch-journal.js';
 import {
   buildP2pExecutionMarker,
   isPostSummaryExecutionGateFailure,
@@ -318,6 +319,18 @@ const AUTO_DELIVER_MAKER_ROLE_IDS = [
   'frontend_developer',
 ] as const satisfies readonly EvolutionRoleId[];
 const AUTO_DELIVER_MAKER_SKILL_BUNDLE_MAX_BYTES = 96 * 1024;
+/**
+ * Preflight ceiling for the FINAL composed implementation prompt (checklist
+ * #9): oversized payloads fail visibly at needs_human instead of being sent
+ * blind into provider/transport limits where truncation would be silent.
+ */
+const AUTO_DELIVER_TOTAL_PROMPT_MAX_BYTES = 512 * 1024;
+
+/** Measure the FINAL composed payload against the dispatch ceiling. */
+export function preflightImplementationPromptBytes(prompt: string): { bytes: number; limit: number; exceeded: boolean } {
+  const bytes = Buffer.byteLength(prompt);
+  return { bytes, limit: AUTO_DELIVER_TOTAL_PROMPT_MAX_BYTES, exceeded: bytes > AUTO_DELIVER_TOTAL_PROMPT_MAX_BYTES };
+}
 
 type ImplementationMarkerContract = NonNullable<AutoDeliverRun['activeImplementationMarker']>;
 
@@ -1451,7 +1464,34 @@ async function dispatchImplementationPrompt(run: AutoDeliverRun, repairReason?: 
   run.activeImplementationPromptAwaitingDispatch = true;
   run.activeImplementationMarker = await buildImplementationMarkerContract(run, run.implementationPromptCount);
   const prompt = buildImplementationPrompt(run, repairReason);
+  // Preflight the FINAL payload (checklist #9): fail visibly, never send blind.
+  const preflight = preflightImplementationPromptBytes(prompt);
+  if (preflight.exceeded) {
+    return terminalize(run, 'needs_human', `implementation_prompt_too_large:${preflight.bytes}:${preflight.limit}`);
+  }
+  const promptBytes = preflight.bytes;
+  // Durable dispatch journal (checklist #10): hash-only record BEFORE send so
+  // a crash in the send window becomes an explicit reconciled record.
+  const journalEntryId = run.activeCommandId;
+  await appendDispatchJournalRecord({
+    entryId: journalEntryId,
+    ts: Date.now(),
+    state: 'pending_send',
+    runId: run.runId,
+    commandId: run.activeCommandId,
+    sessionName: run.targetImplementationSessionName,
+    promptSha256: createHash('sha256').update(prompt).digest('hex'),
+    promptBytes,
+    skillHashes: (run.implementationRoleSkillSnapshots ?? []).map((snapshot) => ({ roleId: snapshot.roleId, sha256: snapshot.sha256 })),
+  });
   const sendMode = await sendAutoDeliverPromptToImplementationSession(run, prompt, run.activeCommandId);
+  await appendDispatchJournalRecord({
+    entryId: journalEntryId,
+    ts: Date.now(),
+    state: sendMode === 'sent' ? 'local_transport_accepted' : sendMode === 'queued' ? 'queued' : sendMode === 'resend_queued' ? 'resend_queued' : 'skipped_terminal',
+    runId: run.runId,
+    commandId: run.activeCommandId,
+  });
   if (sendMode === 'skipped_terminal') return buildProjection(run);
   if (sendMode === 'sent') {
     run.activeImplementationPromptAwaitingDispatch = false;

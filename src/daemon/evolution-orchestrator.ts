@@ -28,6 +28,7 @@ import {
   type EvolutionDevelopmentMode,
   type EvolutionDesignTargetSurface,
   type EvolutionExecutionPolicy,
+  EVOLUTION_APPROVAL_ACTOR_ASSURANCE_UNVERIFIED_LOCAL,
   type EvolutionGateAction,
   type EvolutionGateKind,
   type EvolutionGreenfieldTopology,
@@ -72,7 +73,6 @@ import {
   EVOLUTION_ROLE_SKILL_CATEGORY,
   getEvolutionRunPaths,
   readEvolutionRun,
-  updateEvolutionRoleSkillFile,
   writeEvolutionRun,
 } from './evolution-artifact-store.js';
 import { checkEvolutionStagingDeliveryConfig, runEvolutionStagingDelivery } from './evolution-delivery-runner.js';
@@ -126,7 +126,6 @@ import type { EvolutionInboxCandidate, EvolutionInboxCandidateFile, EvolutionInb
 import { parseSkillMarkdown } from '../../shared/skill-store.js';
 import { getSession } from '../store/session-store.js';
 import {
-  captureEvolutionSkillSnapshot,
   completeEvolutionAttempt,
   createEvolutionAttempt,
   initializeEvolutionControlState,
@@ -134,7 +133,6 @@ import {
   persistEvolutionGate,
   persistEvolutionReviewSet,
   recordEvolutionVerdict,
-  registerEvolutionArtifactRevision,
   requireAuthorizedEvolutionRevision,
 } from './evolution-control-plane.js';
 import { withEvolutionMutationCommit } from './evolution-mutation-controller.js';
@@ -3105,78 +3103,47 @@ export async function updateEvolutionRoleSkill(options: UpdateEvolutionRoleSkill
   }
   const nowMs = options.nowMs ?? Date.now();
   try {
-    const updated = await updateEvolutionRoleSkillFile({
-      projectRoot: entry.projectRoot,
-      roleId: options.roleId,
-      markdown: options.markdown,
-      nowMs,
+    // CONTAINMENT (discussion 30f25d75-67c, repair checklist #2): a War Room
+    // save creates an immutable RELEASE CANDIDATE only. It must never write
+    // the active skill file, register human_approved bytes, or capture a new
+    // snapshot — any of those would silently change what governed attempts in
+    // this run execute. Activation is a separate, explicit approval flow.
+    const definition = roleSkillDefinitionForRole(options.roleId);
+    if (!definition) return fail('invalid_role_id', `Unknown role: ${options.roleId}`, 'roleId');
+    // Validate the candidate parses as a canonical skill before persisting.
+    const parsed = parseSkillMarkdown(options.markdown, {
+      name: definition.skillName,
+      category: EVOLUTION_ROLE_SKILL_CATEGORY,
     });
-    if (updated.previousContent && updated.previousContent !== options.markdown) {
-      const revision = await writeRoleSkillRevisionArtifact(
-        entry,
-        options.roleId,
-        updated.skillName,
-        updated.previousContent,
-        updated.previousSha256,
-        nowMs,
-      );
-      upsertArtifact(entry.run, revision);
+    if (parsed.metadata.name !== definition.skillName) {
+      return fail('role_skill_candidate_name_mismatch', `Candidate name ${parsed.metadata.name} does not match ${definition.skillName}.`, 'markdown');
     }
     const releaseCandidate = await writeRoleSkillReleaseCandidateArtifact(
       entry,
       options.roleId,
-      updated.skillName,
+      definition.skillName,
       options.markdown,
       nowMs,
     );
-    upsertArtifact(entry.run, updated.artifact);
     upsertArtifact(entry.run, releaseCandidate);
-    const updatedSkillContent = await readFile(
-      safeProjectRelativePath(entry.projectRoot, updated.relativePath),
-      'utf8',
-    );
-    await registerEvolutionArtifactRevision({
-      projectRoot: entry.projectRoot,
-      run: entry.run,
-      artifact: updated.artifact,
-      content: updatedSkillContent,
-      status: 'approved',
-      assurance: 'human_approved',
-    });
-    await captureEvolutionSkillSnapshot({
-      projectRoot: entry.projectRoot,
-      run: entry.run,
-      roleId: options.roleId,
-      skillName: updated.skillName,
-      sourcePath: updated.relativePath,
-      source: 'custom_user',
-      content: updatedSkillContent,
-      nowMs,
-    });
     const role = entry.run.roles.find((item) => item.roleId === options.roleId);
     if (role) {
-      role.currentAction = `Skill playbook updated in War Room: ${updated.skillName}`;
+      role.currentAction = `Skill candidate saved (active unchanged): ${definition.skillName}`;
       role.updatedAt = nowMs;
     }
-    entry.run.latestMessage = `Role skill updated: ${updated.skillName}`;
+    entry.run.latestMessage = `Role skill candidate saved: ${definition.skillName} (active skill unchanged)`;
     appendDiscussion(entry.run, {
       kind: 'role_update',
       stage: entry.run.stage,
       roleId: options.roleId,
       author: role?.label ?? options.roleId,
-      text: `角色 skill 已从 War Room 更新并落盘到 ${updated.relativePath}；同时生成共享发布候选 ${releaseCandidate.path}，经团队审批后可复制到 ${EVOLUTION_ROLE_SKILL_APPROVED_LIBRARY_DIR}/${updated.skillName}.md 供后续项目/run 复用。`,
-      artifactIds: [updated.artifact.id, releaseCandidate.id],
-      createdAt: nowMs,
-    });
-    appendEvidence(entry.run, {
-      source: 'role_skill_editor',
-      summary: `Updated ${updated.skillName} at ${updated.relativePath}.`,
-      artifactId: updated.artifact.id,
+      text: `角色 skill 草稿已保存为发布候选 ${releaseCandidate.path}（当前运行使用的技能字节未改变）。经审批流程通过后才会写入 ${EVOLUTION_ROLE_SKILL_APPROVED_LIBRARY_DIR}/${definition.skillName}.md 并在后续 run 生效。`,
+      artifactIds: [releaseCandidate.id],
       createdAt: nowMs,
     });
     appendEvidence(entry.run, {
       source: 'role_skill_release_candidate',
-      summary: `Created release candidate for ${updated.skillName}; approve by copying to ${EVOLUTION_ROLE_SKILL_APPROVED_LIBRARY_DIR}/${updated.skillName}.md.`,
+      summary: `Saved candidate for ${definition.skillName}; active executable bytes UNCHANGED. Approve via the candidate flow to promote.`,
       artifactId: releaseCandidate.id,
       createdAt: nowMs,
     });
@@ -3231,6 +3198,12 @@ interface RoleSkillApprovalVote {
   approvalMessage?: string;
   /** Honest snapshot of what the role observably did in the voting run. */
   rolePerformanceSummary?: string;
+  /**
+   * Identity assurance of the approver. `unverified_local` = client-supplied
+   * string with no authenticated principal — a local acknowledgement, not
+   * proof of independent approval (discussion 30f25d75-67c checklist #3).
+   */
+  actorAssurance?: typeof EVOLUTION_APPROVAL_ACTOR_ASSURANCE_UNVERIFIED_LOCAL;
 }
 
 interface RoleSkillApprovalRecord {
@@ -3536,6 +3509,9 @@ export async function approveEvolutionRoleSkillCandidate(
         approvedAt,
         runId: entry.run.runId,
         rolePerformanceSummary,
+        // No authenticated identity provider exists in this deployment path:
+        // the approver string comes from the client. Record that honestly.
+        actorAssurance: EVOLUTION_APPROVAL_ACTOR_ASSURANCE_UNVERIFIED_LOCAL,
         ...(options.approvalMessage?.trim() ? { approvalMessage: options.approvalMessage.trim() } : {}),
       }];
     const thresholdMet = nextVotes.length >= policy.requiredApprovals;

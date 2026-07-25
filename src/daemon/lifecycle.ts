@@ -521,6 +521,18 @@ export async function startup(): Promise<DaemonContext> {
   await initOnStartup();
   logger.info('Startup cleanup done');
 
+  // Reconcile the Auto Deliver dispatch journal: prior-boot dispatches stuck
+  // at pending_send become explicit reconciled_interrupted records (no
+  // auto-resume — an ambiguous crash window must never silently pass).
+  void import('./auto-deliver-dispatch-journal.js')
+    .then(({ reconcileDispatchJournalOnStartup }) => reconcileDispatchJournalOnStartup())
+    .then((result) => {
+      if (result.interruptedEntryIds.length > 0) {
+        logger.warn(`Auto Deliver dispatch journal: ${result.interruptedEntryIds.length} prior-boot dispatch(es) marked reconciled_interrupted`);
+      }
+    })
+    .catch(() => { /* journal reconciliation is best-effort */ });
+
   // Initialize file transfer: create upload dir + clean expired files
   await initFileTransfer();
   startCleanupTimer();

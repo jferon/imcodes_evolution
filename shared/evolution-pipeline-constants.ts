@@ -85,6 +85,14 @@ export const EVOLUTION_DESIGN_MAKER_ROUNDTABLE_ID = 'design-maker' as const;
  * acceptance criteria) instead of the deterministic template.
  */
 export const EVOLUTION_PRODUCT_MAKER_ROUNDTABLE_ID = 'product-maker' as const;
+
+/**
+ * Honest assurance label for approval actors in deployments without an
+ * authenticated identity provider: the actor string is client-supplied and
+ * NOT independently verified. Votes carrying this label are local
+ * acknowledgements, never proof of independent multi-party approval.
+ */
+export const EVOLUTION_APPROVAL_ACTOR_ASSURANCE_UNVERIFIED_LOCAL = 'unverified_local' as const;
 /**
  * Versioned per-project policy consumed by unattended (watcher/API) launches.
  * Without a policy file, watcher launches keep the safe defaults: governed
