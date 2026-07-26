@@ -2564,6 +2564,14 @@
     "blocking_open_war_room": "War Room を開く",
     "blocking_confirm": "確認して続行",
     "blocking_continuing": "続行中…",
-    "blocking_continue_message": "ブロックダイアログで確認済みです。続行してください。"
+    "blocking_continue_message": "ブロックダイアログで確認済みです。続行してください。",
+    "verification_title": "デリバリー検証（デーモン実測）",
+    "verification_pinned": "起動時に固定済み",
+    "verification_pinned_detail": "必須 {{required}} / 全 {{total}} コマンド · ポリシー {{sha}}",
+    "verification_unconfigured": "未設定",
+    "verification_unconfigured_detail": "検証ポリシーが固定されていません — governed 配信はブロック、draft 配信は未検証と表示されます。",
+    "verification_all_passed": "必須チェックすべて合格",
+    "verification_failed": "必須チェック失敗",
+    "verification_workspace": "ワークスペース {{digest}}"
   }
 }

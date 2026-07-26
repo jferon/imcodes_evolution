@@ -2564,6 +2564,14 @@
     "blocking_open_war_room": "Открыть War Room",
     "blocking_confirm": "Подтвердить и продолжить",
     "blocking_continuing": "Продолжение…",
-    "blocking_continue_message": "Подтверждено в диалоге блокировки; продолжайте."
+    "blocking_continue_message": "Подтверждено в диалоге блокировки; продолжайте.",
+    "verification_title": "Проверка поставки (выполнено демоном)",
+    "verification_pinned": "Зафиксировано при запуске",
+    "verification_pinned_detail": "{{required}} обязательных / всего {{total}} команд · политика {{sha}}",
+    "verification_unconfigured": "Не настроено",
+    "verification_unconfigured_detail": "Политика проверки не зафиксирована — governed-поставка блокируется; draft-поставка помечается как непроверенная.",
+    "verification_all_passed": "Все обязательные проверки пройдены",
+    "verification_failed": "Обязательные проверки ПРОВАЛЕНЫ",
+    "verification_workspace": "рабочая область {{digest}}"
   }
 }

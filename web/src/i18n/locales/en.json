@@ -2566,6 +2566,14 @@
     "blocking_open_war_room": "Open War Room",
     "blocking_confirm": "Confirm & continue",
     "blocking_continuing": "Continuing…",
-    "blocking_continue_message": "Confirmed from the blocking dialog; please continue."
+    "blocking_continue_message": "Confirmed from the blocking dialog; please continue.",
+    "verification_title": "Delivery verification (daemon-observed)",
+    "verification_pinned": "Pinned at launch",
+    "verification_pinned_detail": "{{required}} required / {{total}} command(s) · policy {{sha}}",
+    "verification_unconfigured": "Not configured",
+    "verification_unconfigured_detail": "No verification policy was pinned — governed delivery blocks; draft delivery is UNVERIFIED.",
+    "verification_all_passed": "All required checks passed",
+    "verification_failed": "Required checks FAILED",
+    "verification_workspace": "workspace {{digest}}"
   }
 }

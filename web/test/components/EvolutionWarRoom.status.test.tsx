@@ -522,3 +522,57 @@ describe('EvolutionWarRoomPanel status feedback', () => {
     expect(onStartAutoDeliver).toHaveBeenCalledWith('evo-change');
   });
 });
+
+describe('delivery verification truth panel (#6)', () => {
+  it('renders pinned policy + daemon-observed results with pass/fail truth', () => {
+    render(<EvolutionWarRoomPanel {...props({
+      projection: makeProjection({
+        pinnedVerification: {
+          policy: { version: 1, commands: [
+            { id: 'typecheck', command: 'npm', args: ['run', 'typecheck'], tier: 'required' },
+            { id: 'unit', command: 'npm', args: ['test'], tier: 'optional' },
+          ] },
+          policySha256: 'a'.repeat(64),
+          pinnedAt: 1,
+        },
+        verificationState: {
+          results: [
+            { id: 'typecheck', command: 'npm', exitCode: 0, durationMs: 1200, stdoutSha256: 'b'.repeat(64), stderrTail: '', status: 'passed', tier: 'required' },
+            { id: 'unit', command: 'npm', exitCode: 1, durationMs: 900, stdoutSha256: 'c'.repeat(64), stderrTail: 'boom', status: 'failed', tier: 'optional' },
+          ],
+          workspaceDigest: 'd'.repeat(64),
+          allRequiredPassed: true,
+          completedAt: 2,
+        },
+      } as never),
+    })} />);
+    const panel = screen.getByTestId('evolution-verification-truth');
+    expect(panel.textContent).toContain('evolution.verification_title');
+    expect(panel.textContent).toContain('evolution.verification_pinned');
+    expect(panel.textContent).toContain('evolution.verification_all_passed');
+    expect(panel.textContent).toContain('✓ typecheck');
+    expect(panel.textContent).toContain('✗ unit');
+    expect(panel.textContent).toContain('exit=1');
+  });
+
+  it('states honestly when no policy was pinned', () => {
+    render(<EvolutionWarRoomPanel {...props({
+      projection: makeProjection({
+        verificationState: {
+          results: [],
+          workspaceDigest: 'no_git_workspace',
+          allRequiredPassed: false,
+          completedAt: 2,
+        },
+      } as never),
+    })} />);
+    const panel = screen.getByTestId('evolution-verification-truth');
+    expect(panel.textContent).toContain('evolution.verification_unconfigured');
+    expect(panel.textContent).toContain('evolution.verification_failed');
+  });
+
+  it('renders no panel when neither pinning nor results exist', () => {
+    render(<EvolutionWarRoomPanel {...props({ projection: makeProjection() })} />);
+    expect(screen.queryByTestId('evolution-verification-truth')).toBeNull();
+  });
+});

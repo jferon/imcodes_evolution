@@ -2566,6 +2566,14 @@
     "blocking_open_war_room": "打开 War Room",
     "blocking_confirm": "确认继续",
     "blocking_continuing": "继续中…",
-    "blocking_continue_message": "已在阻塞弹窗确认，请继续。"
+    "blocking_continue_message": "已在阻塞弹窗确认，请继续。",
+    "verification_title": "交付验证（daemon 亲测）",
+    "verification_pinned": "启动时已固定",
+    "verification_pinned_detail": "{{required}} 个必需 / 共 {{total}} 条命令 · 策略 {{sha}}",
+    "verification_unconfigured": "未配置",
+    "verification_unconfigured_detail": "未固定验证策略——governed 交付将阻塞；draft 交付标记为未验证。",
+    "verification_all_passed": "全部必需检查通过",
+    "verification_failed": "必需检查失败",
+    "verification_workspace": "工作区 {{digest}}"
   }
 }

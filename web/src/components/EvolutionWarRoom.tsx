@@ -1687,6 +1687,51 @@ export function EvolutionWarRoomPanel({
                 ))}
               </section>
             )}
+
+            {(projection.pinnedVerification || projection.verificationState) && (
+              <section class="evolution-war-room-blockers" data-testid="evolution-verification-truth">
+                <h3>{t('evolution.verification_title', { defaultValue: 'Delivery verification (daemon-observed)' })}</h3>
+                {projection.pinnedVerification ? (
+                  <div class="evolution-list-row">
+                    <strong>{t('evolution.verification_pinned', { defaultValue: 'Pinned at launch' })}</strong>
+                    <span>
+                      {t('evolution.verification_pinned_detail', {
+                        defaultValue: '{{required}} required / {{total}} command(s) · policy {{sha}}',
+                        required: projection.pinnedVerification.policy.commands.filter((command) => command.tier === 'required').length,
+                        total: projection.pinnedVerification.policy.commands.length,
+                        sha: projection.pinnedVerification.policySha256.slice(0, 12),
+                      })}
+                    </span>
+                  </div>
+                ) : (
+                  <div class="evolution-list-row">
+                    <strong>{t('evolution.verification_unconfigured', { defaultValue: 'Not configured' })}</strong>
+                    <span>{t('evolution.verification_unconfigured_detail', { defaultValue: 'No verification policy was pinned — governed delivery blocks; draft delivery is UNVERIFIED.' })}</span>
+                  </div>
+                )}
+                {projection.verificationState && (
+                  <>
+                    <div class="evolution-list-row">
+                      <strong>{projection.verificationState.allRequiredPassed
+                        ? t('evolution.verification_all_passed', { defaultValue: 'All required checks passed' })
+                        : t('evolution.verification_failed', { defaultValue: 'Required checks FAILED' })}</strong>
+                      <span>
+                        {t('evolution.verification_workspace', {
+                          defaultValue: 'workspace {{digest}}',
+                          digest: projection.verificationState.workspaceDigest.slice(0, 12),
+                        })}
+                      </span>
+                    </div>
+                    {projection.verificationState.results.map((result) => (
+                      <div key={result.id} class="evolution-list-row">
+                        <strong>{result.status === 'passed' ? '✓' : '✗'} {result.id}</strong>
+                        <span>{result.command} · exit={result.exitCode ?? 'n/a'} · {result.durationMs}ms · {result.tier}</span>
+                      </div>
+                    ))}
+                  </>
+                )}
+              </section>
+            )}
           </>
         ) : (
           <div class="evolution-war-room-empty">

@@ -2566,6 +2566,14 @@
     "blocking_open_war_room": "開啟 War Room",
     "blocking_confirm": "確認繼續",
     "blocking_continuing": "繼續中…",
-    "blocking_continue_message": "已在阻塞彈窗確認，請繼續。"
+    "blocking_continue_message": "已在阻塞彈窗確認，請繼續。",
+    "verification_title": "交付驗證（daemon 親測）",
+    "verification_pinned": "啟動時已固定",
+    "verification_pinned_detail": "{{required}} 個必需 / 共 {{total}} 條命令 · 策略 {{sha}}",
+    "verification_unconfigured": "未配置",
+    "verification_unconfigured_detail": "未固定驗證策略——governed 交付將阻塞；draft 交付標記為未驗證。",
+    "verification_all_passed": "全部必需檢查通過",
+    "verification_failed": "必需檢查失敗",
+    "verification_workspace": "工作區 {{digest}}"
   }
 }

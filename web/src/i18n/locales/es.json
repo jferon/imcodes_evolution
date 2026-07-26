@@ -2565,6 +2565,14 @@
     "blocking_open_war_room": "Abrir War Room",
     "blocking_confirm": "Confirmar y continuar",
     "blocking_continuing": "Continuando…",
-    "blocking_continue_message": "Confirmado desde el diálogo de bloqueo; continúa."
+    "blocking_continue_message": "Confirmado desde el diálogo de bloqueo; continúa.",
+    "verification_title": "Verificación de entrega (observada por el daemon)",
+    "verification_pinned": "Fijada en el lanzamiento",
+    "verification_pinned_detail": "{{required}} requeridas / {{total}} comando(s) · política {{sha}}",
+    "verification_unconfigured": "Sin configurar",
+    "verification_unconfigured_detail": "No se fijó ninguna política de verificación: la entrega governed se bloquea; la entrega draft se marca como NO VERIFICADA.",
+    "verification_all_passed": "Todas las comprobaciones requeridas pasaron",
+    "verification_failed": "Comprobaciones requeridas FALLIDAS",
+    "verification_workspace": "espacio de trabajo {{digest}}"
   }
 }

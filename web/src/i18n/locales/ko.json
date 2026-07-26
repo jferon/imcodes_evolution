@@ -2564,6 +2564,14 @@
     "blocking_open_war_room": "War Room 열기",
     "blocking_confirm": "확인 후 계속",
     "blocking_continuing": "계속 중…",
-    "blocking_continue_message": "차단 대화상자에서 확인했습니다. 계속 진행해 주세요."
+    "blocking_continue_message": "차단 대화상자에서 확인했습니다. 계속 진행해 주세요.",
+    "verification_title": "딜리버리 검증(데몬 실측)",
+    "verification_pinned": "시작 시 고정됨",
+    "verification_pinned_detail": "필수 {{required}} / 전체 {{total}}개 명령 · 정책 {{sha}}",
+    "verification_unconfigured": "미설정",
+    "verification_unconfigured_detail": "검증 정책이 고정되지 않았습니다 — governed 딜리버리는 차단되고 draft 딜리버리는 미검증으로 표시됩니다.",
+    "verification_all_passed": "모든 필수 검사 통과",
+    "verification_failed": "필수 검사 실패",
+    "verification_workspace": "워크스페이스 {{digest}}"
   }
 }
