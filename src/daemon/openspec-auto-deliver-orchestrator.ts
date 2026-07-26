@@ -73,6 +73,7 @@ import {
   validateEvolutionTaskAssignmentManifest,
   type EvolutionTaskAssignmentManifest,
 } from '../../shared/evolution-task-manifest.js';
+import { ROLE_SKILL_BLOCK_PREFIX, ROLE_SKILL_BLOCK_END_PREFIX } from '../../shared/instruction-payload.js';
 import {
   buildP2pExecutionMarker,
   isPostSummaryExecutionGateFailure,
@@ -1403,9 +1404,9 @@ function buildImplementationRoleSkillBlock(run: AutoDeliverRun, roleFilter?: Evo
     '- Report the role and sha256 used for each completed task in the completion evidence.',
     ...snapshots.flatMap((snapshot) => [
       '',
-      `<<< ROLE_SKILL role=${snapshot.roleId} name=${snapshot.skillName} sha256=${snapshot.sha256} source=${snapshot.sourcePath} >>>`,
+      `${ROLE_SKILL_BLOCK_PREFIX} role=${snapshot.roleId} name=${snapshot.skillName} sha256=${snapshot.sha256} source=${snapshot.sourcePath} >>>`,
       snapshot.content,
-      `<<< END_ROLE_SKILL role=${snapshot.roleId} sha256=${snapshot.sha256} >>>`,
+      `${ROLE_SKILL_BLOCK_END_PREFIX} role=${snapshot.roleId} sha256=${snapshot.sha256} >>>`,
     ]),
   ].join('\n');
 }

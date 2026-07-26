@@ -13,6 +13,7 @@ import type { AgentType } from '../agent/detect.js';
 import { DISCUSSION_RECONCILE_HIDDEN_MS } from '../../shared/discussion-ui.js';
 import { EVOLUTION_ROLE_SKILL_DEFINITIONS } from './evolution-artifact-store.js';
 import { resolveEffectiveRoleSkill } from './evolution-skill-resolution.js';
+import { GOVERNED_SKILL_OPEN_TAG, GOVERNED_SKILL_CLOSE_TAG } from '../../shared/instruction-payload.js';
 import type { EvolutionRoleId } from '../../shared/evolution-pipeline-constants.js';
 
 const IDLE_TIMEOUT = 300_000;      // max total wall time per response
@@ -103,9 +104,9 @@ export async function resolveGovernedDiscussionDomainRoleAtProject(
       `Governed skill sha256: ${skill.contentSha256}`,
       `Governed skill verification: ${skill.verification}`,
       'The following skill bytes are daemon-resolved. Browser payloads cannot replace them:',
-      '<governed-skill>',
+      GOVERNED_SKILL_OPEN_TAG,
       skill.content,
-      '</governed-skill>',
+      GOVERNED_SKILL_CLOSE_TAG,
     ].join('\n'),
   };
 }
