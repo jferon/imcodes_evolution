@@ -227,3 +227,35 @@ describe('P6.3 — governed self-test scaffolder', () => {
     expect(await readFile(join(root, EVOLUTION_PROJECT_POLICY_RELATIVE_PATH), 'utf8')).toContain('draft_preview');
   });
 });
+
+describe('P6.3+ — scaffolder generates a real verification policy from package.json scripts', () => {
+  it('creates verification.json with detected commands, and honestly skips it when no scripts exist', async () => {
+    const root = await makeRoot();
+    // No package.json → no fabricated always-green policy.
+    const bare = await runEvolutionSelftestSetup(root);
+    expect(bare.files.some((file) => file.relativePath.includes('verification.json'))).toBe(false);
+    expect(bare.runbook.some((line) => line.includes('verification_policy_missing'))).toBe(true);
+
+    const root2 = await mkdtemp(join(tmpdir(), `imcodes-evolution-resil-${randomUUID().slice(0, 8)}-`));
+    try {
+      await writeFile(join(root2, 'package.json'), JSON.stringify({
+        name: 'target', scripts: { typecheck: 'tsc --noEmit', test: 'vitest run', build: 'vite build' },
+      }), 'utf8');
+      const scaffolded = await runEvolutionSelftestSetup(root2);
+      const verification = scaffolded.files.find((file) => file.relativePath.includes('verification.json'));
+      expect(verification?.status).toBe('created');
+      const { validateEvolutionVerificationPolicy } = await import('../../shared/evolution-verification.js');
+      const parsed = validateEvolutionVerificationPolicy(
+        JSON.parse(await readFile(join(root2, verification!.relativePath), 'utf8')) as unknown,
+      );
+      expect(parsed.ok).toBe(true);
+      if (parsed.ok) {
+        expect(parsed.value.commands.map((command) => command.id).sort()).toEqual(['build', 'typecheck', 'unit']);
+        expect(parsed.value.commands.filter((command) => command.tier === 'required').map((command) => command.id).sort()).toEqual(['typecheck', 'unit']);
+      }
+      expect(scaffolded.runbook.some((line) => line.includes('daemon 亲测'))).toBe(true);
+    } finally {
+      await rm(root2, { recursive: true, force: true });
+    }
+  });
+});

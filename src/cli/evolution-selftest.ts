@@ -19,6 +19,13 @@ import {
   EVOLUTION_REQUIREMENT_INBOX_DIR,
 } from '../../shared/evolution-pipeline-constants.js';
 import type { EvolutionProjectPolicy } from '../../shared/evolution-pipeline-types.js';
+import {
+  EVOLUTION_VERIFICATION_POLICY_RELATIVE_PATH,
+  EVOLUTION_VERIFICATION_POLICY_VERSION,
+  validateEvolutionVerificationPolicy,
+  type EvolutionVerificationPolicy,
+} from '../../shared/evolution-verification.js';
+import { readFile } from 'node:fs/promises';
 
 export const EVOLUTION_DESIGN_CONFIG_RELATIVE_PATH = '.imc/evolution/design.json';
 export const EVOLUTION_SELFTEST_REQUIREMENT_RELATIVE_PATH = `${EVOLUTION_REQUIREMENT_INBOX_DIR}/selftest-order-dashboard.md`;
@@ -94,6 +101,28 @@ async function writeIfAbsent(projectRoot: string, relativePath: string, content:
   }
 }
 
+/**
+ * Detect real, runnable verification commands from the target project's
+ * package.json scripts. Honest by construction: when no scripts exist, no
+ * policy is generated and the runbook says governed delivery will BLOCK
+ * until the operator configures one — never a fabricated always-green check.
+ */
+async function detectVerificationPolicy(projectRoot: string): Promise<EvolutionVerificationPolicy | null> {
+  try {
+    const raw = await readFile(join(projectRoot, 'package.json'), 'utf8');
+    const scripts = (JSON.parse(raw) as { scripts?: Record<string, string> }).scripts ?? {};
+    const commands: EvolutionVerificationPolicy['commands'] = [];
+    if (scripts.typecheck) commands.push({ id: 'typecheck', command: 'npm', args: ['run', 'typecheck'], tier: 'required' });
+    if (scripts.test) commands.push({ id: 'unit', command: 'npm', args: ['test'], tier: 'required' });
+    if (scripts.build) commands.push({ id: 'build', command: 'npm', args: ['run', 'build'], tier: commands.length > 0 ? 'optional' : 'required' });
+    if (commands.length === 0) return null;
+    const validated = validateEvolutionVerificationPolicy({ version: EVOLUTION_VERIFICATION_POLICY_VERSION, commands });
+    return validated.ok ? validated.value : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function runEvolutionSelftestSetup(projectRootInput: string): Promise<EvolutionSelftestSetupResult> {
   const projectRoot = resolve(projectRootInput);
   const files: EvolutionSelftestFileResult[] = [
@@ -101,12 +130,23 @@ export async function runEvolutionSelftestSetup(projectRootInput: string): Promi
     await writeIfAbsent(projectRoot, EVOLUTION_DESIGN_CONFIG_RELATIVE_PATH, `${JSON.stringify(SELFTEST_DESIGN_CONFIG, null, 2)}\n`),
     await writeIfAbsent(projectRoot, EVOLUTION_SELFTEST_REQUIREMENT_RELATIVE_PATH, SELFTEST_REQUIREMENT),
   ];
+  const verificationPolicy = await detectVerificationPolicy(projectRoot);
+  if (verificationPolicy) {
+    files.push(await writeIfAbsent(
+      projectRoot,
+      EVOLUTION_VERIFICATION_POLICY_RELATIVE_PATH,
+      `${JSON.stringify(verificationPolicy, null, 2)}\n`,
+    ));
+  }
   const runbook = [
     '1. （可选，启用真实截图）npm i -D playwright && npx playwright install chromium',
-    '2. 启动 daemon 并确保该项目有一个运行中的主 session（deck_<project>_brain）。',
-    `3. inbox watcher 会拾取 ${EVOLUTION_SELFTEST_REQUIREMENT_RELATIVE_PATH}（governed + strict 由 ${EVOLUTION_PROJECT_POLICY_RELATIVE_PATH} 强制）。`,
-    '4. 在 War Room 观察：product-maker → PRD 晋升 → product/design 圆桌 → design-maker → 截图 → 视觉门禁（≥90）→ hifi 人工批准 → auto-deliver → QA 证据。',
-    '5. 验证治理红线：任一 maker 空口 PASS 必须被降级 REWORK 并 needs_human；未证实的 greenfield 地基不允许完成。',
+    verificationPolicy
+      ? `2. 交付验证策略已按 package.json scripts 生成到 ${EVOLUTION_VERIFICATION_POLICY_RELATIVE_PATH}（${verificationPolicy.commands.map((command) => command.id).join(' / ')}）；策略在启动时被固定，agent 的“完成”声明必须通过这些 daemon 亲测检查。`
+      : `2. ⚠️ 未检测到 package.json 可用 scripts —— 请手动配置 ${EVOLUTION_VERIFICATION_POLICY_RELATIVE_PATH}，否则 governed 交付将在 passed 时阻塞（verification_policy_missing，故意 fail-closed）。`,
+    '3. 启动 daemon 并确保该项目有一个运行中的主 session（deck_<project>_brain）。',
+    `4. inbox watcher 会拾取 ${EVOLUTION_SELFTEST_REQUIREMENT_RELATIVE_PATH}（governed + strict 由 ${EVOLUTION_PROJECT_POLICY_RELATIVE_PATH} 强制）。`,
+    '5. 在 War Room 观察：product-maker → PRD 晋升 → product/design 圆桌 → design-maker → 截图 → 视觉门禁（≥90）→ hifi 人工批准 → 角色批次实现 → daemon 验证门禁 → 交付真相面板。',
+    '6. 验证治理红线：maker 空口 PASS 必须降级 REWORK；实现 agent 声称完成但 daemon 检查失败时，运行必须停在 needs_human 且真相面板显示 FAILED。',
   ];
   return { files, runbook };
 }
